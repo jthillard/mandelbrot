@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>Fractal Explorer</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #0b0b0f;
+        }
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        #loading_text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #cccccc;
+            font-family: system-ui, sans-serif;
+            font-size: 1rem;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="the_canvas_id"></canvas>
+    <div id="loading_text">Loading…</div>
+    <script type="module">
+        import init from './mandelbrot.js';
+        init().catch((err) => {
+            // Ignore the benign control-flow exception eframe throws to unwind
+            // the winit event loop on the web; report anything else.
+            const msg = (err && err.message) || String(err);
+            if (!msg.includes("Using exceptions for control flow")) {
+                document.getElementById("loading_text").innerHTML =
+                    "<p>Failed to start. This app needs a WebGPU-capable browser " +
+                    "(recent Chrome/Edge, Firefox, or Safari 26+).</p>";
+                console.error(err);
+            }
+        });
+    </script>
+</body>
+</html>

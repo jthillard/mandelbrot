@@ -1,0 +1,37 @@
+[package]
+name = "mandelbrot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+dashu-float = "0.6.0"
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "accesskit"] }
+egui = "0.36.2"
+futures-channel = { version = "0.3.34", default-features = false, features = ["alloc", "std"] }
+log = "0.4.34"
+png = "0.18.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env_logger = "0.11.11"
+pollster = "1.0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1.7"
+console_log = "1.1.0"
+js-sys = "0.3.105"
+wasm-bindgen = "0.2.128"
+wasm-bindgen-futures = "0.4.78"
+web-sys = { version = "0.3.105", features = ["Window", "Location", "Url", "UrlSearchParams", "Document", "HtmlCanvasElement", "Blob", "BlobPropertyBag", "HtmlAnchorElement", "Element", "Navigator", "History"] }
+
+# Release: optimize hard (fractal math is hot).
+[profile.release]
+opt-level = 3
+
+# Dev: keep our own crate debuggable, but optimize dependencies (dashu, wgpu,
+# egui) so the explorer is actually interactive during development.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
