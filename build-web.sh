@@ -20,6 +20,7 @@ wasm-bindgen \
     target/wasm32-unknown-unknown/release/mandelbrot.wasm
 
 cp index.html "$OUT/index.html"
+cp favicon.ico "$OUT/favicon.ico"
 
 echo "==> done: $OUT/ (index.html, mandelbrot.js, mandelbrot_bg.wasm)"
 echo "    serve:  python3 -m http.server -d $OUT 8080"
