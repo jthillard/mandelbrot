@@ -13,7 +13,7 @@ use crate::view::{
 
 const BAILOUT_SQ: f32 = 1.0e6;
 /// Cap on exported image dimension (px), to stay within GPU texture limits.
-const MAX_EXPORT_DIM: u32 = 8192;
+const MAX_EXPORT_DIM: u32 = 8192 * 16;
 /// Palette names; index maps to `palette_id` in the shader.
 const PALETTE_NAMES: &[&str] = &["Rainbow", "Amber", "Ember", "Lime", "Grayscale"];
 
@@ -511,8 +511,8 @@ impl FractalApp {
             ui.label("export scale");
             ui.add(
                 egui::DragValue::new(&mut self.export_scale)
-                    .range(1.0..=4.0)
-                    .speed(0.1),
+                    .range(1.0..=16.0)
+                    .speed(0.5),
             );
             ui.label(format!(
                 "→ {}×{}",
