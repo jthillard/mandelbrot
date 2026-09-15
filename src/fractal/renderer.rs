@@ -30,7 +30,8 @@ pub struct Uniforms {
     /// 0 = Mandelbrot, 1 = Julia.
     pub is_julia: u32,
     pub palette_id: u32,
-    pub _pad0: u32,
+    /// Supersampling factor per axis: 1 = off, 2 = 2×2 (4 samples).
+    pub aa_level: u32,
     /// Complex offset of the view center from the reference center, so a stale
     /// or reused reference (computed at a slightly different center) still maps
     /// correctly. Added to every pixel's per-pixel offset.

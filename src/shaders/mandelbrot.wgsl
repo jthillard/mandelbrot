@@ -21,7 +21,7 @@ struct Uniforms {
     bailout_sq: f32,
     is_julia: u32,
     palette_id: u32,
-    _pad0: u32,
+    aa_level: u32,
     dc_offset: vec2<f32>,
 };
 
@@ -74,12 +74,12 @@ fn palette(id: u32, t: f32) -> vec3<f32> {
     return a + b * cos(6.28318530718 * (c * t + d));
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Per-pixel offset. For Mandelbrot this is the c-plane offset added every
-    // step (delta starts at 0). For Julia it is the z-plane offset that seeds
-    // the initial delta (c is fixed, so nothing is added per step).
-    let offset = in.centered * u.span + u.dc_offset;
+// Perturbation iterate + color a single sample. `offset` is the per-pixel
+// offset in complex units. For Mandelbrot it is the c-plane offset added every
+// step (delta starts at 0); for Julia it is the z-plane offset that seeds the
+// initial delta (c is fixed, so nothing is added per step). Interior pixels
+// return black.
+fn shade(offset: vec2<f32>) -> vec3<f32> {
     let z0 = ref_orbit[0]; // reference start (0 for Mandelbrot, center for Julia)
 
     var step_add = offset;
@@ -130,7 +130,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     if (!escaped) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0); // interior of the set
+        return vec3<f32>(0.0, 0.0, 0.0); // interior of the set
     }
 
     // Continuous (smooth) iteration count.
@@ -142,5 +142,32 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // varies smoothly instead of aliasing into speckle.
     let ci = sqrt(max(smooth_i, 0.0));
     let t = fract(ci * u.color_scale + u.color_offset);
-    return vec4<f32>(palette(u.palette_id, t), 1.0);
+    return palette(u.palette_id, t);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let base = in.centered * u.span + u.dc_offset;
+
+    let aa = max(u.aa_level, 1u);
+    if (aa <= 1u) {
+        return vec4<f32>(shade(base), 1.0);
+    }
+
+    // Screen-space complex-units-per-pixel, used to place sub-pixel samples.
+    // Derivatives must be evaluated in uniform control flow, so take them here.
+    let dx = dpdx(base);
+    let dy = dpdy(base);
+
+    var acc = vec3<f32>(0.0, 0.0, 0.0);
+    let inv = 1.0 / f32(aa);
+    for (var sy: u32 = 0u; sy < aa; sy = sy + 1u) {
+        for (var sx: u32 = 0u; sx < aa; sx = sx + 1u) {
+            // Sample centers evenly spread across the pixel, jitter in (-0.5, 0.5).
+            let jx = (f32(sx) + 0.5) * inv - 0.5;
+            let jy = (f32(sy) + 0.5) * inv - 0.5;
+            acc = acc + shade(base + jx * dx + jy * dy);
+        }
+    }
+    return vec4<f32>(acc / f32(aa * aa), 1.0);
 }

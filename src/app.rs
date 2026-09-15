@@ -52,6 +52,8 @@ pub struct FractalApp {
     color_scale: f32,
     color_offset: f32,
     palette: u32,
+    /// Supersample each pixel 2×2 for smoother edges (costs ~4× fragment work).
+    antialias: bool,
 
     /// Reference orbit (`Z_n` as f32 pairs) for the current view.
     reference: Arc<Vec<[f32; 2]>>,
@@ -107,6 +109,7 @@ impl FractalApp {
             color_scale: 0.15,
             color_offset: 0.0,
             palette: 0,
+            antialias: false,
             reference: Arc::new(Vec::new()),
             generation: 0,
             ref_center_re,
@@ -377,7 +380,7 @@ impl FractalApp {
             bailout_sq: BAILOUT_SQ,
             is_julia: matches!(self.mode, FractalMode::Julia) as u32,
             palette_id: self.palette,
-            _pad0: 0,
+            aa_level: if self.antialias { 2 } else { 1 },
             dc_offset: self.dc_offset(),
         }
     }
@@ -484,6 +487,8 @@ impl FractalApp {
                     ui.selectable_value(&mut self.palette, i as u32, *name);
                 }
             });
+        ui.checkbox(&mut self.antialias, "Antialiasing (2×2)")
+            .on_hover_text("Supersample each pixel for smoother edges (~4× slower).");
 
         ui.separator();
         let (cre, cim) = self.view.center_f64();
