@@ -18,6 +18,15 @@ use crate::view::{
 const BAILOUT_SQ: f32 = 1.0e6;
 /// Cap on exported image dimension (px), to stay within GPU texture limits.
 const MAX_EXPORT_DIM: u32 = 8192 * 16;
+/// While the user is actively panning/zooming, the fractal is rendered into a
+/// cache texture downscaled by this factor per axis (and with AA forced off), so
+/// each interacting frame is cheap; the linear blit upsamples it to the widget.
+/// A full-resolution render replaces it once input settles. 2 → quarter the
+/// pixels (~4× faster); raise for more speed at the cost of more blur in motion.
+const INTERACT_DOWNSCALE: u32 = 2;
+/// Seconds without pan/zoom input after which the view counts as settled and is
+/// re-rendered at full resolution.
+const INTERACT_SETTLE: f64 = 0.12;
 /// Palette names; index maps to `palette_id` in the shader.
 const PALETTE_NAMES: &[&str] = &["Amber", "Rainbow", "Ember", "Lime", "Grayscale"];
 
@@ -142,6 +151,9 @@ pub struct FractalApp {
     export_scale: f32,
     /// Last on-screen fractal size in physical pixels (for export sizing).
     last_size_px: egui::Vec2,
+    /// egui time (seconds) of the most recent pan/zoom. While recent (within
+    /// `INTERACT_SETTLE`) the fractal renders downscaled for smooth interaction.
+    last_interact_time: f64,
     /// Set when the user requests a PNG export (handled after the panels draw).
     export_requested: bool,
     /// Progress/handle for an in-flight PNG export, if any.
@@ -225,6 +237,7 @@ impl FractalApp {
             pending: false,
             export_scale: 2.0,
             last_size_px: egui::vec2(1280.0, 720.0),
+            last_interact_time: -1.0e9,
             export_requested: false,
             export: None,
             status: None,
@@ -948,6 +961,10 @@ impl FractalApp {
         let aspect = (rect.width() / rect.height()) as f64;
         self.last_size_px = rect.size();
 
+        // Tracks whether the view actually moved this frame, so progressive
+        // rendering can drop to a cheap low-res pass only while interacting.
+        let mut interacted = false;
+
         // Touch: pinch to zoom (toward the gesture center) and two-finger pan.
         // Takes precedence over single-finger drag while two fingers are down.
         let multi_touch = ui.input(|i| i.multi_touch());
@@ -955,6 +972,7 @@ impl FractalApp {
             let t = mt.translation_delta;
             if t.x != 0.0 || t.y != 0.0 {
                 self.view.pan_pixels(t.x as f64, t.y as f64, height_px);
+                interacted = true;
             }
             if mt.zoom_delta != 1.0 {
                 let off = mt.center_pos - rect.center();
@@ -962,6 +980,7 @@ impl FractalApp {
                 let factor = 1.0 / mt.zoom_delta as f64;
                 self.view
                     .zoom_at_pixel(off.x as f64, off.y as f64, height_px, factor);
+                interacted = true;
             }
             ui.ctx().request_repaint();
         } else if response.dragged() {
@@ -969,6 +988,7 @@ impl FractalApp {
             let d = response.drag_delta();
             if d.x != 0.0 || d.y != 0.0 {
                 self.view.pan_pixels(d.x as f64, d.y as f64, height_px);
+                interacted = true;
             }
         }
 
@@ -982,6 +1002,7 @@ impl FractalApp {
             let factor = (-scroll_y as f64 * 0.0015).exp();
             self.view
                 .zoom_at_pixel(off.x as f64, off.y as f64, height_px, factor);
+            interacted = true;
             ui.ctx().request_repaint();
         }
 
@@ -1000,14 +1021,36 @@ impl FractalApp {
             ui.ctx().request_repaint_after(poll);
         }
 
-        // Cache-texture resolution: the widget size in physical pixels.
+        // Progressive rendering: while the user is actively panning/zooming (an
+        // interaction within the last `INTERACT_SETTLE` seconds), render at a
+        // fraction of the resolution with AA off so each frame is cheap, then let
+        // it snap to full resolution once input settles. `i.time` is monotonic on
+        // both native and web (avoids `Instant`, which isn't available on wasm).
+        let now = ui.input(|i| i.time);
+        if interacted {
+            self.last_interact_time = now;
+        }
+        let interacting = now - self.last_interact_time < INTERACT_SETTLE;
+        if interacting {
+            // Ensure a frame fires once the settle window elapses, so the view
+            // is re-rendered at full resolution even if no further input arrives.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(INTERACT_SETTLE));
+        }
+
+        // Cache-texture resolution: the widget size in physical pixels, divided
+        // down while interacting (the linear blit upsamples it to the widget).
         let ppp = ui.ctx().pixels_per_point();
+        let downscale = if interacting { INTERACT_DOWNSCALE } else { 1 };
         let size_px = [
-            ((rect.width() * ppp).round() as u32).max(1),
-            ((rect.height() * ppp).round() as u32).max(1),
+            (((rect.width() * ppp).round() as u32) / downscale).max(1),
+            (((rect.height() * ppp).round() as u32) / downscale).max(1),
         ];
 
-        let uniforms = self.make_uniforms(aspect);
+        let mut uniforms = self.make_uniforms(aspect);
+        if interacting {
+            uniforms.aa_level = 1; // supersampling is wasted on the low-res pass
+        }
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
             FractalCallback {
