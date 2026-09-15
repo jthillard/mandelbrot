@@ -547,15 +547,31 @@ impl FractalApp {
         let aspect = (rect.width() / rect.height()) as f64;
         self.last_size_px = rect.size();
 
-        // Pan by dragging.
-        if response.dragged() {
+        // Touch: pinch to zoom (toward the gesture center) and two-finger pan.
+        // Takes precedence over single-finger drag while two fingers are down.
+        let multi_touch = ui.input(|i| i.multi_touch());
+        if let Some(mt) = multi_touch {
+            let t = mt.translation_delta;
+            if t.x != 0.0 || t.y != 0.0 {
+                self.view.pan_pixels(t.x as f64, t.y as f64, height_px);
+            }
+            if mt.zoom_delta != 1.0 {
+                let off = mt.center_pos - rect.center();
+                // zoom_delta > 1 = fingers spreading = zoom in (smaller span).
+                let factor = 1.0 / mt.zoom_delta as f64;
+                self.view
+                    .zoom_at_pixel(off.x as f64, off.y as f64, height_px, factor);
+            }
+            ui.ctx().request_repaint();
+        } else if response.dragged() {
+            // Single-finger / mouse drag pans.
             let d = response.drag_delta();
             if d.x != 0.0 || d.y != 0.0 {
                 self.view.pan_pixels(d.x as f64, d.y as f64, height_px);
             }
         }
 
-        // Zoom toward the cursor on scroll.
+        // Mouse wheel / trackpad: zoom toward the cursor.
         let (scroll_y, hover) = ui.input(|i| (i.smooth_scroll_delta.y, i.pointer.hover_pos()));
         if scroll_y != 0.0
             && let Some(pos) = hover
