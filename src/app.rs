@@ -119,6 +119,61 @@ struct ExportShared {
     result: Option<Result<String, String>>,
 }
 
+/// Time-based animation of a few view/coloring parameters. Each toggle drives
+/// continuous repaints while on; orbit-affecting ones (Julia c, Phoenix p, zoom)
+/// recompute the reference each frame and render the cheap low-res pass so they
+/// stay smooth.
+#[derive(Clone)]
+struct AnimState {
+    /// Cycle the palette offset (colours flow through the fractal).
+    color: bool,
+    /// Palette cycles per second.
+    color_speed: f32,
+
+    /// Drift the Julia constant `c` around a circle to morph the Julia set.
+    julia: bool,
+    /// Revolutions per second.
+    julia_speed: f32,
+    /// Circle radius in the c-plane.
+    julia_radius: f64,
+    /// Circle center, captured when the animation is enabled.
+    julia_base: (f64, f64),
+    julia_angle: f64,
+
+    /// Drift the Phoenix distortion `p` around a circle.
+    phoenix: bool,
+    phoenix_speed: f32,
+    phoenix_radius: f64,
+    phoenix_base: (f64, f64),
+    phoenix_angle: f64,
+
+    /// Continuously zoom toward the current center.
+    zoom: bool,
+    /// e-folds per second; positive zooms in, negative zooms out.
+    zoom_speed: f32,
+}
+
+impl Default for AnimState {
+    fn default() -> Self {
+        Self {
+            color: false,
+            color_speed: 0.15,
+            julia: false,
+            julia_speed: 0.05,
+            julia_radius: 0.08,
+            julia_base: (0.0, 0.0),
+            julia_angle: 0.0,
+            phoenix: false,
+            phoenix_speed: 0.05,
+            phoenix_radius: 0.08,
+            phoenix_base: (0.0, 0.0),
+            phoenix_angle: 0.0,
+            zoom: false,
+            zoom_speed: 0.5,
+        }
+    }
+}
+
 /// Top-level egui application.
 pub struct FractalApp {
     view: ViewState,
@@ -149,6 +204,8 @@ pub struct FractalApp {
     /// Whether the app is in fullscreen (browser Fullscreen API on web, viewport
     /// fullscreen on native). Kept in sync with the real state each frame.
     fullscreen: bool,
+    /// Time-based animation of colours / Julia c / Phoenix p / zoom.
+    anim: AnimState,
 
     /// Reference orbit (`Z_n` as f32 pairs) for the current view.
     reference: Arc<Vec<[f32; 2]>>,
@@ -251,6 +308,7 @@ impl FractalApp {
             de_coloring: false,
             controls_open: true,
             fullscreen: false,
+            anim: AnimState::default(),
             reference: Arc::new(Vec::new()),
             generation: 0,
             ref_center_re,
@@ -890,6 +948,55 @@ impl FractalApp {
         }
     }
 
+    /// Advance any enabled animations by the frame's elapsed time, and request a
+    /// repaint while active. Animations render at full resolution/AA (they do not
+    /// trigger the interaction low-res pass).
+    fn tick_animations(&mut self, ui: &egui::Ui) {
+        // Julia c only matters in Julia mode; Phoenix p only for the Phoenix kind.
+        let julia_on = self.anim.julia && self.mode == FractalMode::Julia;
+        let phoenix_on = self.anim.phoenix && self.kind == FractalKind::Phoenix;
+        if !(self.anim.color || self.anim.zoom || julia_on || phoenix_on) {
+            return;
+        }
+
+        // Clamp dt so a stall (tab hidden, first frame) can't jump the animation.
+        let dt = ui.input(|i| i.stable_dt as f64).clamp(0.0, 0.1);
+
+        if self.anim.color {
+            self.color_offset =
+                (self.color_offset + self.anim.color_speed * dt as f32).rem_euclid(1.0);
+        }
+        if julia_on {
+            self.anim.julia_angle += std::f64::consts::TAU * self.anim.julia_speed as f64 * dt;
+            let (s, c) = self.anim.julia_angle.sin_cos();
+            self.julia_c = (
+                self.anim.julia_base.0 + self.anim.julia_radius * c,
+                self.anim.julia_base.1 + self.anim.julia_radius * s,
+            );
+        }
+        if phoenix_on {
+            self.anim.phoenix_angle += std::f64::consts::TAU * self.anim.phoenix_speed as f64 * dt;
+            let (s, c) = self.anim.phoenix_angle.sin_cos();
+            self.phoenix_p = (
+                self.anim.phoenix_base.0 + self.anim.phoenix_radius * c,
+                self.anim.phoenix_base.1 + self.anim.phoenix_radius * s,
+            );
+        }
+        if self.anim.zoom && self.anim.zoom_speed != 0.0 {
+            let min_hh = DEFAULT_HALF_HEIGHT * 1.0e-26; // practical f32-perturbation depth
+            let max_hh = DEFAULT_HALF_HEIGHT * 4.0;
+            let factor = (-(self.anim.zoom_speed as f64) * dt).exp();
+            let target = (self.view.half_height * factor).clamp(min_hh, max_hh);
+            let f = target / self.view.half_height;
+            if (f - 1.0).abs() > 1.0e-9 {
+                self.view
+                    .zoom_at_pixel(0.0, 0.0, self.last_size_px.y.max(1.0) as f64, f);
+            }
+        }
+
+        ui.ctx().request_repaint();
+    }
+
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Fractal Explorer");
         ui.separator();
@@ -1001,6 +1108,64 @@ impl FractalApp {
                  (Mandelbrot/Multibrot/Phoenix), approximate for the abs-based kinds \
                  (Burning Ship/Tricorn/Celtic/Perpendicular/Buffalo).",
             );
+
+        ui.collapsing("Animation", |ui| {
+            ui.checkbox(&mut self.anim.color, "Cycle colours")
+                .on_hover_text("Scroll the palette offset over time.");
+            if self.anim.color {
+                ui.add(
+                    egui::Slider::new(&mut self.anim.color_speed, 0.01..=2.0)
+                        .text("cycles/s")
+                        .logarithmic(true),
+                );
+            }
+
+            ui.checkbox(&mut self.anim.zoom, "Auto-zoom")
+                .on_hover_text("Continuously zoom toward the current center.");
+            if self.anim.zoom {
+                ui.add(
+                    egui::Slider::new(&mut self.anim.zoom_speed, -2.0..=2.0).text("rate (+ = in)"),
+                );
+            }
+
+            // Julia c only affects Julia mode; Phoenix p only the Phoenix kind.
+            if self.mode == FractalMode::Julia {
+                if ui.checkbox(&mut self.anim.julia, "Morph c").changed() && self.anim.julia {
+                    self.anim.julia_base = self.julia_c; // orbit around the current c
+                    self.anim.julia_angle = 0.0;
+                }
+                if self.anim.julia {
+                    ui.add(
+                        egui::Slider::new(&mut self.anim.julia_speed, 0.005..=0.5)
+                            .text("c rev/s")
+                            .logarithmic(true),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.anim.julia_radius, 0.005..=0.5)
+                            .text("c radius")
+                            .logarithmic(true),
+                    );
+                }
+            }
+            if self.kind == FractalKind::Phoenix {
+                if ui.checkbox(&mut self.anim.phoenix, "Morph p").changed() && self.anim.phoenix {
+                    self.anim.phoenix_base = self.phoenix_p;
+                    self.anim.phoenix_angle = 0.0;
+                }
+                if self.anim.phoenix {
+                    ui.add(
+                        egui::Slider::new(&mut self.anim.phoenix_speed, 0.005..=0.5)
+                            .text("p rev/s")
+                            .logarithmic(true),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.anim.phoenix_radius, 0.005..=0.5)
+                            .text("p radius")
+                            .logarithmic(true),
+                    );
+                }
+            }
+        });
 
         ui.separator();
         // Editable center coordinates. Shown at full precision; parsed
@@ -1141,6 +1306,11 @@ impl FractalApp {
         // Tracks whether the view actually moved this frame, so progressive
         // rendering can drop to a cheap low-res pass only while interacting.
         let mut interacted = false;
+
+        // Advance time-based animations (colours / Julia c / Phoenix p / zoom).
+        // These render at full resolution/AA — only real pan/zoom drops to the
+        // cheap low-res pass, so `interacted` is left untouched here.
+        self.tick_animations(ui);
 
         // Touch: pinch to zoom (toward the gesture center) and two-finger pan.
         // Takes precedence over single-finger drag while two fingers are down.
