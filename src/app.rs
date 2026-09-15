@@ -42,6 +42,10 @@ const KINDS: &[(FractalKind, &str)] = &[
     (FractalKind::BurningShip, "Burning Ship"),
     (FractalKind::Tricorn, "Tricorn"),
     (FractalKind::Multibrot, "Multibrot"),
+    (FractalKind::Celtic, "Celtic"),
+    (FractalKind::Perpendicular, "Perpendicular"),
+    (FractalKind::Buffalo, "Buffalo"),
+    (FractalKind::Phoenix, "Phoenix"),
 ];
 
 /// UI label for a fractal kind.
@@ -99,6 +103,7 @@ struct RequestKey {
     half_height: f64,
     julia: bool,
     julia_c: (f64, f64),
+    phoenix_p: (f64, f64),
     iter: u32,
     kind: FractalKind,
     power: u32,
@@ -123,6 +128,8 @@ pub struct FractalApp {
     /// Exponent for the Multibrot kind.
     power: u32,
     julia_c: (f64, f64),
+    /// Distortion constant `p` for the Phoenix kind (`z^2 + c + p·z_{n-1}`).
+    phoenix_p: (f64, f64),
     max_iterations: u32,
     /// When set, `max_iterations` tracks the zoom depth automatically (so deep
     /// zooms stay sharp without hand-tuning); the manual slider takes over when
@@ -228,6 +235,7 @@ impl FractalApp {
             kind: FractalKind::Mandelbrot,
             power: 3,
             julia_c: (-0.8, 0.156),
+            phoenix_p: (-0.5, 0.0),
             max_iterations: 512,
             auto_iterations: true,
             color_scale: 0.15,
@@ -272,6 +280,10 @@ impl FractalApp {
                     "burningship" | "burning_ship" | "ship" => FractalKind::BurningShip,
                     "tricorn" | "mandelbar" => FractalKind::Tricorn,
                     "multibrot" | "multi" => FractalKind::Multibrot,
+                    "celtic" => FractalKind::Celtic,
+                    "perpendicular" | "perp" => FractalKind::Perpendicular,
+                    "buffalo" => FractalKind::Buffalo,
+                    "phoenix" => FractalKind::Phoenix,
                     _ => FractalKind::Mandelbrot,
                 };
                 if let Ok(p) = std::env::var("MANDEL_POWER")
@@ -377,6 +389,7 @@ impl FractalApp {
             half_height: self.view.half_height,
             iterations: self.max_iterations,
             julia_c: self.julia_c,
+            phoenix_p: self.phoenix_p,
             color_scale: self.color_scale,
             color_offset: self.color_offset,
             palette: self.palette,
@@ -393,6 +406,7 @@ impl FractalApp {
         self.kind = s.kind;
         self.power = s.power.clamp(2, 8);
         self.julia_c = s.julia_c;
+        self.phoenix_p = s.phoenix_p;
         self.color_scale = s.color_scale;
         self.color_offset = s.color_offset;
         self.palette = (s.palette as usize).min(PALETTE_NAMES.len() - 1) as u32;
@@ -437,6 +451,10 @@ impl FractalApp {
             FractalKind::BurningShip => (-0.5, -0.5, 1.3),
             FractalKind::Tricorn => (-0.25, 0.0, 1.6),
             FractalKind::Multibrot => (0.0, 0.0, 1.5),
+            FractalKind::Celtic => (-0.5, 0.0, 1.6),
+            FractalKind::Perpendicular => (-0.5, 0.0, 1.5),
+            FractalKind::Buffalo => (-0.5, -0.5, 1.5),
+            FractalKind::Phoenix => (0.0, 0.0, 1.6),
         };
         ViewState::with_center(big_from_f64(cr, 53), big_from_f64(ci, 53), hh)
     }
@@ -448,6 +466,7 @@ impl FractalApp {
             half_height: self.view.half_height,
             julia: matches!(self.mode, FractalMode::Julia),
             julia_c: self.julia_c,
+            phoenix_p: self.phoenix_p,
             iter: self.max_iterations,
             kind: self.kind,
             power: self.power,
@@ -470,6 +489,7 @@ impl FractalApp {
         };
         if key.julia != matches!(self.mode, FractalMode::Julia)
             || key.julia_c != self.julia_c
+            || key.phoenix_p != self.phoenix_p
             || key.iter != self.max_iterations
             || key.kind != self.kind
             || key.power != self.power
@@ -519,6 +539,7 @@ impl FractalApp {
                     precision,
                     kind: key.kind,
                     power: key.power,
+                    phoenix_p: key.phoenix_p,
                 });
                 self.pending = true;
             }
@@ -536,6 +557,7 @@ impl FractalApp {
                         precision,
                         key.kind,
                         key.power,
+                        key.phoenix_p,
                     )
                 } else {
                     compute_set_reference(
@@ -545,6 +567,7 @@ impl FractalApp {
                         precision,
                         key.kind,
                         key.power,
+                        key.phoenix_p,
                     )
                 };
                 self.apply_reference(
@@ -580,8 +603,9 @@ impl FractalApp {
             kind: self.kind.shader_id(),
             power: self.power,
             dc_offset: self.dc_offset(),
+            phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             de_coloring: self.de_coloring as u32,
-            _pad: 0,
+            _pad: [0, 0, 0],
         }
     }
 
@@ -794,6 +818,22 @@ impl FractalApp {
         if self.kind == FractalKind::Multibrot {
             ui.add(egui::Slider::new(&mut self.power, 2..=8).text("power"));
         }
+        if self.kind == FractalKind::Phoenix {
+            ui.horizontal(|ui| {
+                ui.label("p =");
+                ui.add(
+                    egui::DragValue::new(&mut self.phoenix_p.0)
+                        .speed(0.001)
+                        .range(-2.0..=2.0),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.phoenix_p.1)
+                        .speed(0.001)
+                        .range(-2.0..=2.0),
+                );
+                ui.label("i");
+            });
+        }
         if self.kind != prev_kind {
             self.view = Self::default_view_for(self.mode, self.kind);
         }
@@ -868,8 +908,9 @@ impl FractalApp {
         ui.checkbox(&mut self.de_coloring, "Distance shading")
             .on_hover_text(
                 "Shade by distance to the set boundary (from the orbit derivative) \
-                 for crisp filaments at deep zoom. Exact for Mandelbrot/Multibrot, \
-                 approximate for Burning Ship/Tricorn.",
+                 for crisp filaments at deep zoom. Exact for the holomorphic kinds \
+                 (Mandelbrot/Multibrot/Phoenix), approximate for the abs-based kinds \
+                 (Burning Ship/Tricorn/Celtic/Perpendicular/Buffalo).",
             );
 
         ui.separator();

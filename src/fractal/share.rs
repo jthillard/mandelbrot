@@ -21,6 +21,8 @@ pub struct ShareState {
     pub half_height: f64,
     pub iterations: u32,
     pub julia_c: (f64, f64),
+    /// Distortion constant for the Phoenix kind (ignored by others).
+    pub phoenix_p: (f64, f64),
     pub color_scale: f32,
     pub color_offset: f32,
     /// Palette index (`palette_id` in the shader).
@@ -36,6 +38,10 @@ impl ShareState {
             FractalKind::BurningShip => "burning",
             FractalKind::Multibrot => "multi",
             FractalKind::Tricorn => "tricorn",
+            FractalKind::Celtic => "celtic",
+            FractalKind::Perpendicular => "perp",
+            FractalKind::Buffalo => "buffalo",
+            FractalKind::Phoenix => "phoenix",
         }));
         s.push_str(&format!("&pw={}", self.power));
         s.push_str(&format!(
@@ -43,6 +49,7 @@ impl ShareState {
             self.center_re, self.center_im, self.half_height, self.iterations
         ));
         s.push_str(&format!("&jr={}&ji={}", self.julia_c.0, self.julia_c.1));
+        s.push_str(&format!("&px={}&py={}", self.phoenix_p.0, self.phoenix_p.1));
         s.push_str(&format!(
             "&cs={}&co={}&pal={}",
             self.color_scale, self.color_offset, self.palette
@@ -68,6 +75,10 @@ impl ShareState {
                     "multi" => FractalKind::Multibrot,
                     "burning" => FractalKind::BurningShip,
                     "tricorn" => FractalKind::Tricorn,
+                    "celtic" => FractalKind::Celtic,
+                    "perp" => FractalKind::Perpendicular,
+                    "buffalo" => FractalKind::Buffalo,
+                    "phoenix" => FractalKind::Phoenix,
                     _ => FractalKind::Mandelbrot
                 })
                 .unwrap_or(FractalKind::Mandelbrot),
@@ -79,6 +90,10 @@ impl ShareState {
             julia_c: (
                 map.get("jr").and_then(|s| s.parse().ok()).unwrap_or(-0.8),
                 map.get("ji").and_then(|s| s.parse().ok()).unwrap_or(0.156),
+            ),
+            phoenix_p: (
+                map.get("px").and_then(|s| s.parse().ok()).unwrap_or(-0.5),
+                map.get("py").and_then(|s| s.parse().ok()).unwrap_or(0.0),
             ),
             color_scale: map.get("cs").and_then(|s| s.parse().ok()).unwrap_or(0.02),
             color_offset: map.get("co").and_then(|s| s.parse().ok()).unwrap_or(0.0),
@@ -95,13 +110,14 @@ mod tests {
     fn round_trip() {
         let s = ShareState {
             julia: true,
-            kind: FractalKind::Multibrot,
+            kind: FractalKind::Phoenix,
             power: 5,
             center_re: "-0.743643887037158704752191506114774".into(),
             center_im: "0.131825904205311970493132056385139".into(),
             half_height: 1.5e-20,
             iterations: 4000,
             julia_c: (-0.123, 0.745),
+            phoenix_p: (-0.5, 0.1),
             color_scale: 0.02,
             color_offset: 0.25,
             palette: 3,
@@ -115,6 +131,7 @@ mod tests {
         assert_eq!(d.half_height, s.half_height);
         assert_eq!(d.iterations, s.iterations);
         assert_eq!(d.julia_c, s.julia_c);
+        assert_eq!(d.phoenix_p, s.phoenix_p);
         assert_eq!(d.palette, s.palette);
     }
 

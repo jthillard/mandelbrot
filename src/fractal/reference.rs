@@ -10,7 +10,7 @@
 //! * Mandelbrot-set: `z0 = 0`, `c = view center` (the c-plane point per pixel).
 //! * Julia-set:      `z0 = view center`, `c = fractal constant` (fixed per view).
 
-use crate::view::Big;
+use crate::view::{Big, big_from_f64};
 
 /// The iteration formula. Must be kept in sync with `advance_delta` and the
 /// `KIND_*` constants in the shader.
@@ -24,6 +24,14 @@ pub enum FractalKind {
     Tricorn,
     /// `z -> z^power + c` (power >= 2).
     Multibrot,
+    /// `z -> |Re(z^2)| + i·Im(z^2) + c` (abs on the real output of the square).
+    Celtic,
+    /// `z -> (x^2 - y^2) - 2·x·|y|·i + c` (abs on the imaginary input).
+    Perpendicular,
+    /// `z -> |Re(z^2)| - |Im(z^2)|·i + c` (abs on both outputs).
+    Buffalo,
+    /// `z -> z^2 + c + p·z_{n-1}` (two-term recurrence; `p` is `phoenix_p`).
+    Phoenix,
 }
 
 impl FractalKind {
@@ -34,6 +42,10 @@ impl FractalKind {
             FractalKind::BurningShip => 1,
             FractalKind::Tricorn => 2,
             FractalKind::Multibrot => 3,
+            FractalKind::Celtic => 4,
+            FractalKind::Perpendicular => 5,
+            FractalKind::Buffalo => 6,
+            FractalKind::Phoenix => 7,
         }
     }
 }
@@ -55,12 +67,19 @@ pub fn compute_reference(
     precision: usize,
     kind: FractalKind,
     power: u32,
+    phoenix_p: (f64, f64),
 ) -> Vec<[f32; 2]> {
     let cr = c_re.clone().with_precision(precision).value();
     let ci = c_im.clone().with_precision(precision).value();
 
     let mut zr = z0_re.clone().with_precision(precision).value();
     let mut zi = z0_im.clone().with_precision(precision).value();
+    // Previous iterate, for the Phoenix two-term recurrence (Y_{-1} = 0).
+    let mut zr_prev = big_zero(precision);
+    let mut zi_prev = big_zero(precision);
+    // Phoenix distortion constant `p` (a small fixed complex number).
+    let pr = big_from_f64(phoenix_p.0, precision);
+    let pi = big_from_f64(phoenix_p.1, precision);
 
     let mut points: Vec<[f32; 2]> = Vec::with_capacity(max_iter as usize + 1);
 
@@ -97,8 +116,37 @@ pub fn compute_reference(
                 let (pr, pi) = complex_pow(&zr, &zi, power.max(2), precision);
                 (pr + &cr, pi + &ci)
             }
+            FractalKind::Celtic => {
+                // |Re(z^2)| + i·Im(z^2): abs the real output of the square.
+                let re = big_abs(&zr.sqr() - &zi.sqr()) + &cr;
+                let im = ((&zr * &zi) << 1) + &ci;
+                (re, im)
+            }
+            FractalKind::Perpendicular => {
+                // (x^2 - y^2) - 2·x·|y| i: abs the imaginary input.
+                let re = &zr.sqr() - &zi.sqr() + &cr;
+                let im = &ci - ((&zr * &big_abs(zi.clone())) << 1);
+                (re, im)
+            }
+            FractalKind::Buffalo => {
+                // |Re(z^2)| - |Im(z^2)| i: abs both outputs.
+                let re = big_abs(&zr.sqr() - &zi.sqr()) + &cr;
+                let im = &ci - big_abs((&zr * &zi) << 1);
+                (re, im)
+            }
+            FractalKind::Phoenix => {
+                // z^2 + c + p·z_{n-1}.
+                let re2 = &zr.sqr() - &zi.sqr();
+                let im2 = (&zr * &zi) << 1;
+                let pzr = &pr * &zr_prev - &pi * &zi_prev;
+                let pzi = &pr * &zi_prev + &pi * &zr_prev;
+                (re2 + &cr + pzr, im2 + &ci + pzi)
+            }
         };
 
+        // Shift the previous iterate (only the Phoenix arm reads it).
+        zr_prev = zr;
+        zi_prev = zi;
         zr = new_zr.with_precision(precision).value();
         zi = new_zi.with_precision(precision).value();
     }
@@ -139,10 +187,11 @@ pub fn compute_set_reference(
     precision: usize,
     kind: FractalKind,
     power: u32,
+    phoenix_p: (f64, f64),
 ) -> Vec<[f32; 2]> {
     let zero = big_zero(precision);
     compute_reference(
-        &zero, &zero, center_re, center_im, max_iter, precision, kind, power,
+        &zero, &zero, center_re, center_im, max_iter, precision, kind, power, phoenix_p,
     )
 }
 
@@ -156,7 +205,7 @@ mod tests {
     fn reference_matches_naive_f64() {
         let cr = Big::try_from(-0.75_f64).unwrap();
         let ci = Big::try_from(0.1_f64).unwrap();
-        let points = compute_set_reference(&cr, &ci, 60, 200, FractalKind::Mandelbrot, 2);
+        let points = compute_set_reference(&cr, &ci, 60, 200, FractalKind::Mandelbrot, 2, (0.0, 0.0));
 
         // Independent naive f64 orbit.
         let (c_re, c_im) = (-0.75_f64, 0.1_f64);
@@ -180,7 +229,8 @@ mod tests {
     fn interior_orbit_runs_full_length() {
         let cr = Big::try_from(-0.2_f64).unwrap();
         let ci = Big::try_from(0.0_f64).unwrap();
-        let points = compute_set_reference(&cr, &ci, 500, 120, FractalKind::Mandelbrot, 2);
+        let points =
+            compute_set_reference(&cr, &ci, 500, 120, FractalKind::Mandelbrot, 2, (0.0, 0.0));
         assert_eq!(points.len(), 501, "interior orbit should not escape");
     }
 
@@ -189,7 +239,8 @@ mod tests {
     fn burning_ship_reference_matches_naive_f64() {
         let cr = Big::try_from(-1.75_f64).unwrap();
         let ci = Big::try_from(-0.03_f64).unwrap();
-        let points = compute_set_reference(&cr, &ci, 60, 200, FractalKind::BurningShip, 2);
+        let points =
+            compute_set_reference(&cr, &ci, 60, 200, FractalKind::BurningShip, 2, (0.0, 0.0));
 
         let (c_re, c_im) = (-1.75_f64, -0.03_f64);
         let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
@@ -209,7 +260,8 @@ mod tests {
     fn multibrot3_reference_matches_naive_f64() {
         let cr = Big::try_from(0.3_f64).unwrap();
         let ci = Big::try_from(0.2_f64).unwrap();
-        let points = compute_set_reference(&cr, &ci, 60, 200, FractalKind::Multibrot, 3);
+        let points =
+            compute_set_reference(&cr, &ci, 60, 200, FractalKind::Multibrot, 3, (0.0, 0.0));
 
         let (c_re, c_im) = (0.3_f64, 0.2_f64);
         let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
@@ -242,6 +294,7 @@ mod tests {
             200,
             FractalKind::Mandelbrot,
             2,
+            (0.0, 0.0),
         );
 
         let (mut zr, mut zi) = (0.15_f64, -0.1_f64);
@@ -252,6 +305,97 @@ mod tests {
             assert!((point[1] as f64 - zi).abs() < tol);
             let nzr = zr * zr - zi * zi + cr;
             let nzi = 2.0 * zr * zi + ci;
+            zr = nzr;
+            zi = nzi;
+        }
+    }
+
+    /// Celtic reference matches a naive f64 iteration: real = |x^2 - y^2| + cr.
+    #[test]
+    fn celtic_reference_matches_naive_f64() {
+        let cr = Big::try_from(-0.6_f64).unwrap();
+        let ci = Big::try_from(0.4_f64).unwrap();
+        let points = compute_set_reference(&cr, &ci, 60, 200, FractalKind::Celtic, 2, (0.0, 0.0));
+
+        let (c_re, c_im) = (-0.6_f64, 0.4_f64);
+        let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
+        for point in &points {
+            let tol = 1e-4 * (1.0 + zr.abs().max(zi.abs()));
+            assert!((point[0] as f64 - zr).abs() < tol, "re: {point:?} vs {zr}");
+            assert!((point[1] as f64 - zi).abs() < tol, "im: {point:?} vs {zi}");
+            let nzr = (zr * zr - zi * zi).abs() + c_re;
+            let nzi = 2.0 * zr * zi + c_im;
+            zr = nzr;
+            zi = nzi;
+        }
+    }
+
+    /// Perpendicular reference matches a naive f64 iteration:
+    /// real = x^2 - y^2 + cr, imag = -2·x·|y| + ci.
+    #[test]
+    fn perpendicular_reference_matches_naive_f64() {
+        let cr = Big::try_from(-0.7_f64).unwrap();
+        let ci = Big::try_from(-0.2_f64).unwrap();
+        let points =
+            compute_set_reference(&cr, &ci, 60, 200, FractalKind::Perpendicular, 2, (0.0, 0.0));
+
+        let (c_re, c_im) = (-0.7_f64, -0.2_f64);
+        let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
+        for point in &points {
+            let tol = 1e-4 * (1.0 + zr.abs().max(zi.abs()));
+            assert!((point[0] as f64 - zr).abs() < tol, "re: {point:?} vs {zr}");
+            assert!((point[1] as f64 - zi).abs() < tol, "im: {point:?} vs {zi}");
+            let nzr = zr * zr - zi * zi + c_re;
+            let nzi = -2.0 * zr * zi.abs() + c_im;
+            zr = nzr;
+            zi = nzi;
+        }
+    }
+
+    /// Buffalo reference matches a naive f64 iteration:
+    /// real = |x^2 - y^2| + cr, imag = -|2·x·y| + ci.
+    #[test]
+    fn buffalo_reference_matches_naive_f64() {
+        let cr = Big::try_from(-1.2_f64).unwrap();
+        let ci = Big::try_from(-0.35_f64).unwrap();
+        let points = compute_set_reference(&cr, &ci, 60, 200, FractalKind::Buffalo, 2, (0.0, 0.0));
+
+        let (c_re, c_im) = (-1.2_f64, -0.35_f64);
+        let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
+        for point in &points {
+            let tol = 1e-4 * (1.0 + zr.abs().max(zi.abs()));
+            assert!((point[0] as f64 - zr).abs() < tol, "re: {point:?} vs {zr}");
+            assert!((point[1] as f64 - zi).abs() < tol, "im: {point:?} vs {zi}");
+            let nzr = (zr * zr - zi * zi).abs() + c_re;
+            let nzi = -(2.0 * zr * zi).abs() + c_im;
+            zr = nzr;
+            zi = nzi;
+        }
+    }
+
+    /// Phoenix reference matches a naive f64 two-term iteration
+    /// `z_{n+1} = z_n^2 + c + p·z_{n-1}` (z_0 = 0, z_{-1} = 0).
+    #[test]
+    fn phoenix_reference_matches_naive_f64() {
+        let cr = Big::try_from(0.5667_f64).unwrap();
+        let ci = Big::try_from(0.0_f64).unwrap();
+        let p = (-0.5_f64, 0.0_f64);
+        let points = compute_set_reference(&cr, &ci, 60, 200, FractalKind::Phoenix, 2, p);
+
+        let (c_re, c_im) = (0.5667_f64, 0.0_f64);
+        let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
+        let (mut pr, mut pi) = (0.0_f64, 0.0_f64); // previous iterate
+        for point in &points {
+            let tol = 1e-4 * (1.0 + zr.abs().max(zi.abs()));
+            assert!((point[0] as f64 - zr).abs() < tol, "re: {point:?} vs {zr}");
+            assert!((point[1] as f64 - zi).abs() < tol, "im: {point:?} vs {zi}");
+            // p·z_{n-1} = (p.0 + i p.1)(pr + i pi).
+            let pzr = p.0 * pr - p.1 * pi;
+            let pzi = p.0 * pi + p.1 * pr;
+            let nzr = zr * zr - zi * zi + c_re + pzr;
+            let nzi = 2.0 * zr * zi + c_im + pzi;
+            pr = zr;
+            pi = zi;
             zr = nzr;
             zi = nzi;
         }

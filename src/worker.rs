@@ -22,6 +22,8 @@ pub struct RefRequest {
     pub precision: usize,
     pub kind: FractalKind,
     pub power: u32,
+    /// Distortion constant for the Phoenix map (ignored by other kinds).
+    pub phoenix_p: (f64, f64),
 }
 
 pub struct RefResult {
@@ -101,6 +103,7 @@ fn compute(req: &RefRequest) -> Vec<[f32; 2]> {
             req.precision,
             req.kind,
             req.power,
+            req.phoenix_p,
         )
     } else {
         compute_set_reference(
@@ -110,6 +113,7 @@ fn compute(req: &RefRequest) -> Vec<[f32; 2]> {
             req.precision,
             req.kind,
             req.power,
+            req.phoenix_p,
         )
     }
 }

@@ -43,10 +43,14 @@ pub struct Uniforms {
     /// or reused reference (computed at a slightly different center) still maps
     /// correctly. Added to every pixel's per-pixel offset.
     pub dc_offset: [f32; 2],
+    /// Distortion constant `p` for the Phoenix map (`z^2 + c + p·z_{n-1}`);
+    /// ignored by other kinds. Kept next to `dc_offset` so both `vec2`s land on
+    /// 8-byte boundaries, matching the shader's layout.
+    pub phoenix_p: [f32; 2],
     /// 0 = escape-time coloring, 1 = distance-estimation shading.
     pub de_coloring: u32,
     /// Padding to a 16-byte multiple (uniform buffer requirement).
-    pub _pad: u32,
+    pub _pad: [u32; 3],
 }
 
 /// Offscreen texture the fractal is rendered into, plus the bind group used to

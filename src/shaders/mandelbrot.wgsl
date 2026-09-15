@@ -22,11 +22,14 @@ struct Uniforms {
     is_julia: u32,
     palette_id: u32,
     aa_level: u32,
-    // Iteration formula: 0 Mandelbrot, 1 Burning Ship, 2 Tricorn, 3 Multibrot.
+    // Iteration formula (see the KIND_* constants below).
     kind: u32,
     // Exponent for the Multibrot kind.
     power: u32,
     dc_offset: vec2<f32>,
+    // Distortion constant p for the Phoenix map (z^2 + c + p*z_{n-1}); unused
+    // by other kinds. Placed by dc_offset so both vec2s stay 8-byte aligned.
+    phoenix_p: vec2<f32>,
     // 0 = escape-time coloring, 1 = distance-estimation shading.
     de_coloring: u32,
 };
@@ -35,6 +38,10 @@ const KIND_MANDELBROT: u32 = 0u;
 const KIND_BURNING_SHIP: u32 = 1u;
 const KIND_TRICORN: u32 = 2u;
 const KIND_MULTIBROT: u32 = 3u;
+const KIND_CELTIC: u32 = 4u;
+const KIND_PERPENDICULAR: u32 = 5u;
+const KIND_BUFFALO: u32 = 6u;
+const KIND_PHOENIX: u32 = 7u;
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> ref_orbit: array<vec2<f32>>;
@@ -128,8 +135,25 @@ fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
         return 2.0 * cmul(cz, ce) + cmul(ce, ce);
     } else if (u.kind == KIND_MULTIBROT) {
         return multibrot_delta(z, e, clamp(u.power, 2u, 8u));
+    } else if (u.kind == KIND_CELTIC) {
+        // z^2 delta split: sq.x = delta of Re(z^2), sq.y = delta of Im(z^2).
+        // Celtic abs the real output, so |Re(z^2)| delta = diffabs(Re(Z^2), sq.x).
+        let sq = 2.0 * cmul(z, e) + cmul(e, e);
+        return vec2<f32>(diffabs(z.x * z.x - z.y * z.y, sq.x), sq.y);
+    } else if (u.kind == KIND_BUFFALO) {
+        // Abs both outputs: real |Re(z^2)|, imag -|Im(z^2)| (Im(Z^2) = 2 X Y).
+        let sq = 2.0 * cmul(z, e) + cmul(e, e);
+        return vec2<f32>(diffabs(z.x * z.x - z.y * z.y, sq.x),
+                         -diffabs(2.0 * z.x * z.y, sq.y));
+    } else if (u.kind == KIND_PERPENDICULAR) {
+        // real x^2 - y^2 (ordinary square delta), imag -2 x |y|.
+        // d(-2 x |y|) = -2[ X·(|Y+ey|-|Y|) + ex·|Y+ey| ]; diffabs gives |Y+ey|-|Y|.
+        let sq = 2.0 * cmul(z, e) + cmul(e, e);
+        let da = diffabs(z.y, e.y);        // |Y + ey| - |Y|
+        let abs_yf = abs(z.y) + da;        // |Y + ey|
+        return vec2<f32>(sq.x, -2.0 * (z.x * da + e.x * abs_yf));
     }
-    return 2.0 * cmul(z, e) + cmul(e, e); // Mandelbrot
+    return 2.0 * cmul(z, e) + cmul(e, e); // Mandelbrot (and Phoenix square part)
 }
 
 // Derivative f'(Z) of the iteration map at the full value Z, used to propagate
@@ -183,6 +207,10 @@ fn shade(offset: vec2<f32>, px: f32) -> vec3<f32> {
     // (starts at 0, gains +1 each step); for Julia it is d/dz0 (starts at 1).
     var dz = vec2<f32>(0.0, 0.0);
     var dz_seed = vec2<f32>(1.0, 0.0);
+    // Previous-iterate state for the Phoenix two-term recurrence (delta of
+    // y_{n-1}, and its derivative for DE). Both start at 0 (y_{-1} = 0).
+    var e_prev = vec2<f32>(0.0, 0.0);
+    var dz_prev = vec2<f32>(0.0, 0.0);
     if (u.is_julia != 0u) {
         step_add = vec2<f32>(0.0, 0.0);
         e = offset;
@@ -210,12 +238,24 @@ fn shade(offset: vec2<f32>, px: f32) -> vec3<f32> {
 
         // Propagate the derivative of the full orbit (unaffected by rebasing,
         // which only re-expresses the same value). Only when DE is enabled.
+        // Phoenix's two-term map adds p·dz_{n-1} and carries the previous dz.
         if (u.de_coloring != 0u) {
-            dz = cmul(fprime(z), dz) + dz_seed;
+            var dz_new = cmul(fprime(z), dz) + dz_seed;
+            if (u.kind == KIND_PHOENIX) {
+                dz_new = dz_new + cmul(u.phoenix_p, dz_prev);
+                dz_prev = dz;
+            }
+            dz = dz_new;
         }
 
         // Advance the delta by this fractal's formula (+ dc for the set plane).
+        // Phoenix additionally adds p·e_{n-1} and carries the previous delta.
+        let e_old = e;
         e = advance_delta(xm, e) + step_add;
+        if (u.kind == KIND_PHOENIX) {
+            e = e + cmul(u.phoenix_p, e_prev);
+            e_prev = e_old;
+        }
         m = m + 1u;
         n = n + 1u;
 
@@ -231,6 +271,11 @@ fn shade(offset: vec2<f32>, px: f32) -> vec3<f32> {
         if (dot(y, y) < dot(e, e)) {
             // Rebase to index 0: carry the full value as the new delta. Valid
             // because y_n = X[0] + (y_n - X[0]); for Mandelbrot X[0]=0.
+            // Phoenix: after rebasing the implied previous reference is Y[-1]=0,
+            // so the previous delta becomes the full previous value y_n (= z).
+            if (u.kind == KIND_PHOENIX) {
+                e_prev = z;
+            }
             e = y - z0;
             m = 0u;
         }
