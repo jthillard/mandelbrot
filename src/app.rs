@@ -8,7 +8,8 @@ use crate::fractal::{FractalCallback, FractalRenderer, MAX_REF_POINTS, ShareStat
 #[cfg(target_arch = "wasm32")]
 use crate::fractal::{compute_mandelbrot_reference, compute_reference};
 use crate::view::{
-    Big, ViewState, big_from_decimal_str, big_from_f64, big_to_decimal_str, precision_for,
+    Big, DEFAULT_HALF_HEIGHT, ViewState, big_from_decimal_str, big_from_f64, big_to_decimal_str,
+    precision_for,
 };
 
 const BAILOUT_SQ: f32 = 1.0e6;
@@ -80,6 +81,36 @@ pub struct FractalApp {
     export_requested: bool,
     /// Short status line (saved path, "link copied", errors).
     status: Option<String>,
+
+    /// Editable text buffers for the center coordinates (decimal, full
+    /// precision). Kept in sync with the live view except while the field is
+    /// focused, so the user's in-progress typing is not clobbered by pan/zoom.
+    center_re_edit: String,
+    center_im_edit: String,
+    /// Editable magnification (×). Its display is lossy, so `zoom_edited` guards
+    /// applying it: without that, clicking in and out would round-trip the value
+    /// through the display format and drift the zoom.
+    zoom_edit: String,
+    zoom_edited: bool,
+}
+
+/// Significant decimal digits to show for a center at the given precision (bits).
+fn sig_digits_for(bits: usize) -> usize {
+    ((bits as f64) * std::f64::consts::LOG10_2).ceil() as usize + 3
+}
+
+/// Format a magnification for the editable field (compact scientific).
+fn format_magnification(m: f64) -> String {
+    format!("{m:.4e}")
+}
+
+/// Precision (bits) to parse a typed center at: at least what the current zoom
+/// needs, but enough to preserve every digit the user pasted, so a deep
+/// coordinate entered while zoomed out is not truncated. Capped like `view`.
+fn parse_bits_for(s: &str, min_bits: usize) -> usize {
+    let digits = s.chars().filter(char::is_ascii_digit).count();
+    let from_input = (digits as f64 * std::f64::consts::LOG2_10).ceil() as usize + 16;
+    min_bits.max(from_input).min(2048)
 }
 
 impl FractalApp {
@@ -100,6 +131,10 @@ impl FractalApp {
         let ref_center_re = view.center_re.clone();
         let ref_center_im = view.center_im.clone();
         let ref_half_height = view.half_height;
+        let sig = sig_digits_for(view.precision_bits());
+        let center_re_edit = big_to_decimal_str(&view.center_re, sig);
+        let center_im_edit = big_to_decimal_str(&view.center_im, sig);
+        let zoom_edit = format_magnification(view.magnification());
 
         let mut app = Self {
             view,
@@ -123,6 +158,10 @@ impl FractalApp {
             last_size_px: egui::vec2(1280.0, 720.0),
             export_requested: false,
             status: None,
+            center_re_edit,
+            center_im_edit,
+            zoom_edit,
+            zoom_edited: false,
         };
 
         // On the web, restore a shared view from the URL fragment (#...).
@@ -195,8 +234,7 @@ impl FractalApp {
 
     /// Snapshot the current view as a shareable state.
     fn share_state(&self) -> ShareState {
-        let bits = self.view.precision_bits();
-        let sig_digits = ((bits as f64) * std::f64::consts::LOG10_2).ceil() as usize + 3;
+        let sig_digits = sig_digits_for(self.view.precision_bits());
         ShareState {
             julia: matches!(self.mode, FractalMode::Julia),
             center_re: big_to_decimal_str(&self.view.center_re, sig_digits),
@@ -491,10 +529,71 @@ impl FractalApp {
             .on_hover_text("Supersample each pixel for smoother edges (~4× slower).");
 
         ui.separator();
-        let (cre, cim) = self.view.center_f64();
-        ui.label(format!("center re:\n  {cre:+.17}"));
-        ui.label(format!("center im:\n  {cim:+.17}"));
-        ui.label(format!("magnification: {:.3e}×", self.view.magnification()));
+        // Editable center coordinates. Shown at full precision; parsed
+        // losslessly on commit (Enter or focus loss). While a field is focused
+        // we leave the user's text alone; otherwise we refresh it from the live
+        // view, which panning and zooming keep changing.
+        let bits = self.view.precision_bits();
+        let sig = sig_digits_for(bits);
+
+        ui.label("center re:");
+        let re_resp = ui.add(
+            egui::TextEdit::singleline(&mut self.center_re_edit)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        if re_resp.lost_focus()
+            && let Some(v) =
+                big_from_decimal_str(&self.center_re_edit, parse_bits_for(&self.center_re_edit, bits))
+        {
+            self.view.center_re = v;
+            self.view.sync_precision();
+        }
+        if !re_resp.has_focus() {
+            self.center_re_edit = big_to_decimal_str(&self.view.center_re, sig);
+        }
+
+        ui.label("center im:");
+        let im_resp = ui.add(
+            egui::TextEdit::singleline(&mut self.center_im_edit)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        if im_resp.lost_focus()
+            && let Some(v) =
+                big_from_decimal_str(&self.center_im_edit, parse_bits_for(&self.center_im_edit, bits))
+        {
+            self.view.center_im = v;
+            self.view.sync_precision();
+        }
+        if !im_resp.has_focus() {
+            self.center_im_edit = big_to_decimal_str(&self.view.center_im, sig);
+        }
+
+        ui.label("magnification (×):");
+        let zoom_resp = ui.add(
+            egui::TextEdit::singleline(&mut self.zoom_edit)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        if zoom_resp.changed() {
+            self.zoom_edited = true;
+        }
+        if zoom_resp.lost_focus() {
+            if self.zoom_edited
+                && let Ok(m) = self.zoom_edit.trim().parse::<f64>()
+            {
+                let hh = DEFAULT_HALF_HEIGHT / m;
+                if m > 0.0 && hh > 0.0 && hh.is_finite() {
+                    self.view.half_height = hh;
+                    self.view.sync_precision();
+                }
+            }
+            self.zoom_edited = false;
+        }
+        if !zoom_resp.has_focus() {
+            self.zoom_edit = format_magnification(self.view.magnification());
+        }
         ui.label(format!("reference: {} pts", self.reference.len()));
         ui.label(format!("precision: {} bits", self.view.precision_bits()));
         if self.pending {

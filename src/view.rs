@@ -101,11 +101,6 @@ impl ViewState {
         self.half_height *= factor;
     }
 
-    /// f64 approximation of the center, for display.
-    pub fn center_f64(&self) -> (f64, f64) {
-        (self.center_re.to_f64().value(), self.center_im.to_f64().value())
-    }
-
     /// Build a view from full-precision center coordinates and a half-height.
     pub fn with_center(center_re: Big, center_im: Big, half_height: f64) -> Self {
         let mut v = Self {
