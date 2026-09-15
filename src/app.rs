@@ -33,6 +33,35 @@ const JULIA_PRESETS: &[(&str, f64, f64)] = &[
     ("siegel", -0.391, -0.587),
 ];
 
+/// Curated beautiful Mandelbrot locations offered as one-click presets.
+/// Each is `(name, center_re, center_im, half_height, iterations)`; the centers
+/// are decimals parsed at full precision so deep places stay sharp.
+const MANDEL_PLACES: &[(&str, &str, &str, f64, u32)] = &[
+    (
+        "Seahorse Valley",
+        "-0.743643887037158704752191506114774",
+        "0.131825904205311970493132056385139",
+        4.0e-6,
+        1500,
+    ),
+    (
+        "Elephant Valley",
+        "0.2549870375144766",
+        "0.0005679790528465",
+        6.0e-5,
+        2000,
+    ),
+    ("Scepter Valley", "-1.360022", "0.041", 3.0e-4, 2000),
+    ("Starburst", "-1.62917", "0.0203968", 1.5e-3, 1500),
+    (
+        "Deep Spiral",
+        "-0.7436438870371587",
+        "0.1318259042053",
+        8.0e-8,
+        3000,
+    ),
+];
+
 /// Parameters a reference orbit was (or will be) computed for. Used to decide
 /// when the current reference is stale enough to recompute.
 struct RequestKey {
@@ -230,6 +259,19 @@ impl FractalApp {
             self.max_iterations = v.clamp(32, MAX_REF_POINTS as u32 - 1);
         }
         true
+    }
+
+    /// Jump to a preset Mandelbrot location: decimal center (parsed at the
+    /// precision the zoom needs), half-height, and a fitting iteration count.
+    fn go_to_place(&mut self, re: &str, im: &str, half_height: f64, iterations: u32) {
+        let bits = precision_for(half_height);
+        if let (Some(cre), Some(cim)) =
+            (big_from_decimal_str(re, bits), big_from_decimal_str(im, bits))
+        {
+            self.mode = FractalMode::Mandelbrot;
+            self.view = ViewState::with_center(cre, cim, half_height);
+            self.max_iterations = iterations.clamp(32, MAX_REF_POINTS as u32 - 1);
+        }
     }
 
     /// Snapshot the current view as a shareable state.
@@ -501,6 +543,17 @@ impl FractalApp {
                 for &(name, re, im) in JULIA_PRESETS {
                     if ui.small_button(name).clicked() {
                         self.julia_c = (re, im);
+                    }
+                }
+            });
+        }
+
+        if self.mode == FractalMode::Mandelbrot {
+            ui.label("places:");
+            ui.horizontal_wrapped(|ui| {
+                for &(name, re, im, half_height, iter) in MANDEL_PLACES {
+                    if ui.small_button(name).clicked() {
+                        self.go_to_place(re, im, half_height, iter);
                     }
                 }
             });
