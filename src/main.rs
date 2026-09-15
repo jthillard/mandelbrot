@@ -13,6 +13,34 @@ mod worker;
 
 use app::FractalApp;
 
+/// wgpu configuration for eframe. The fractal fragment shader reads the
+/// reference orbit from a **storage buffer**, so the device must allow storage
+/// buffers in the fragment stage. eframe's default requests WebGL2-downlevel
+/// limits when a GL adapter is picked (storage buffers = 0), so we:
+///   * request the adapter's real limits (which include storage buffers), and
+///   * force the WebGPU backend on the web (WebGL2 can't do storage buffers at
+///     all) — failing cleanly on browsers without WebGPU, per the design.
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuSetup, wgpu};
+
+    let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let WgpuSetup::CreateNew(setup) = &mut options.wgpu_setup {
+        setup.device_descriptor = std::sync::Arc::new(|adapter: &wgpu::Adapter| {
+            wgpu::DeviceDescriptor {
+                label: Some("fractal wgpu device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: adapter.limits(),
+                ..Default::default()
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        {
+            setup.instance_descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
+        }
+    }
+    options
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     env_logger::builder()
@@ -22,6 +50,7 @@ fn main() -> eframe::Result {
 
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: wgpu_options(),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([640.0, 480.0])
@@ -43,7 +72,10 @@ fn main() {
     console_error_panic_hook::set_once();
     let _ = console_log::init_with_level(log::Level::Info);
 
-    let web_options = eframe::WebOptions::default();
+    let web_options = eframe::WebOptions {
+        wgpu_options: wgpu_options(),
+        ..Default::default()
+    };
 
     wasm_bindgen_futures::spawn_local(async {
         let document = web_sys::window()
