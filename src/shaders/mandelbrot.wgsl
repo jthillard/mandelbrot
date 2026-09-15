@@ -193,12 +193,21 @@ fn palette(id: u32, t: f32) -> vec3<f32> {
     return a + b * cos(6.28318530718 * (c * t + d));
 }
 
-// Perturbation iterate + color a single sample. `offset` is the per-pixel
-// offset in complex units. For Mandelbrot it is the c-plane offset added every
-// step (delta starts at 0); for Julia it is the z-plane offset that seeds the
-// initial delta (c is fixed, so nothing is added per step). Interior pixels
-// return black.
-fn shade(offset: vec2<f32>, px: f32) -> vec3<f32> {
+// Escape data for one sample: `ci` is the (color-independent) palette parameter,
+// `de` the distance-estimate darkening factor in [0,1], `escaped` false for the
+// interior of the set. Splitting iteration from coloring lets a colour change be
+// remapped cheaply (see the colourise pass) without re-iterating.
+struct Sample {
+    ci: f32,
+    de: f32,
+    escaped: bool,
+};
+
+// Perturbation iterate a single sample. `offset` is the per-pixel offset in
+// complex units. For Mandelbrot it is the c-plane offset added every step (delta
+// starts at 0); for Julia it is the z-plane offset that seeds the initial delta
+// (c is fixed, so nothing is added per step).
+fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     let z0 = ref_orbit[0]; // reference start (0 for Mandelbrot, center for Julia)
 
     var step_add = offset;
@@ -282,7 +291,7 @@ fn shade(offset: vec2<f32>, px: f32) -> vec3<f32> {
     }
 
     if (!escaped) {
-        return vec3<f32>(0.0, 0.0, 0.0); // interior of the set
+        return Sample(0.0, 1.0, false); // interior of the set
     }
 
     let z2 = dot(z, z);
@@ -295,9 +304,8 @@ fn shade(offset: vec2<f32>, px: f32) -> vec3<f32> {
     // sqrt compresses the huge iteration counts of deep zooms so the palette
     // varies smoothly instead of aliasing into speckle.
     let ci = sqrt(max(smooth_i, 0.0));
-    let t = fract(ci * u.color_scale + u.color_offset);
-    var col = palette(u.palette_id, t);
 
+    var de = 1.0;
     if (u.de_coloring != 0u) {
         // Exterior distance estimate (complex-plane units): |z|·ln|z| / |dz|.
         // Divided by the pixel footprint it becomes a distance in pixels; we
@@ -306,37 +314,77 @@ fn shade(offset: vec2<f32>, px: f32) -> vec3<f32> {
         // boundary simply reads as dark, which is the correct limit.
         let zmag = sqrt(max(z2, 1.0));
         let dzmag = sqrt(max(dot(dz, dz), 1e-20));
-        let de = zmag * log(zmag) / dzmag;
-        let de_px = de / max(px, 1e-30);
-        col = col * clamp(de_px, 0.0, 1.0);
+        let d = zmag * log(zmag) / dzmag;
+        de = clamp(d / max(px, 1e-30), 0.0, 1.0);
     }
-    return col;
+    return Sample(ci, de, true);
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let base = in.centered * u.span + u.dc_offset;
+// Map a sample's escape data through the palette (+ DE darkening). This is the
+// only color-dependent step, so it can be redone without re-iterating. Interior
+// samples are black.
+fn color_sample(s: Sample) -> vec3<f32> {
+    if (!s.escaped) {
+        return vec3<f32>(0.0, 0.0, 0.0);
+    }
+    let t = fract(s.ci * u.color_scale + u.color_offset);
+    return palette(u.palette_id, t) * s.de;
+}
 
-    // Screen-space complex-units-per-pixel. Derivatives must be evaluated in
-    // uniform control flow, so take them here; used to place sub-pixel AA
-    // samples and to convert the distance estimate into pixels.
+// Iteration pass: write per-pixel escape data (color-independent) so a colour
+// change is remapped by the cheap colourise pass without re-iterating.
+//   R = ci (palette parameter), G = DE factor, B = interior fraction (for AA).
+// AA is grid-supersampled here; the interior fraction lets the colourise pass
+// anti-alias the set boundary (blend toward black) after the fact.
+@fragment
+fn fs_data(in: VsOut) -> @location(0) vec4<f32> {
+    let base = in.centered * u.span + u.dc_offset;
     let dx = dpdx(base);
     let dy = dpdy(base);
-    let px = length(abs(dx) + abs(dy)); // ~ complex units per pixel (footprint)
+    let px = length(abs(dx) + abs(dy));
 
     let aa = max(u.aa_level, 1u);
-    if (aa <= 1u) {
-        return vec4<f32>(shade(base, px), 1.0);
-    }
-
-    var acc = vec3<f32>(0.0, 0.0, 0.0);
     let inv = 1.0 / f32(aa);
+    var ci_sum = 0.0;
+    var de_sum = 0.0;
+    var escaped_n = 0u;
     for (var sy: u32 = 0u; sy < aa; sy = sy + 1u) {
         for (var sx: u32 = 0u; sx < aa; sx = sx + 1u) {
-            // Sample centers evenly spread across the pixel, jitter in (-0.5, 0.5).
             let jx = (f32(sx) + 0.5) * inv - 0.5;
             let jy = (f32(sy) + 0.5) * inv - 0.5;
-            acc = acc + shade(base + jx * dx + jy * dy, px);
+            let s = iterate_sample(base + jx * dx + jy * dy, px);
+            if (s.escaped) {
+                ci_sum = ci_sum + s.ci;
+                de_sum = de_sum + s.de;
+                escaped_n = escaped_n + 1u;
+            }
+        }
+    }
+    let total = f32(aa * aa);
+    let ci_avg = select(0.0, ci_sum / f32(escaped_n), escaped_n > 0u);
+    let de_avg = select(1.0, de_sum / f32(escaped_n), escaped_n > 0u);
+    let interior_frac = 1.0 - f32(escaped_n) / total;
+    return vec4<f32>(ci_avg, de_avg, interior_frac, 1.0);
+}
+
+// Combined iterate + colour in a single pass, for PNG export (which never needs
+// incremental recolouring). The interactive path uses fs_data + the colourise
+// pass so colour changes skip iteration.
+@fragment
+fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
+    let base = in.centered * u.span + u.dc_offset;
+    let dx = dpdx(base);
+    let dy = dpdy(base);
+    let px = length(abs(dx) + abs(dy));
+
+    let aa = max(u.aa_level, 1u);
+    let inv = 1.0 / f32(aa);
+    var acc = vec3<f32>(0.0, 0.0, 0.0);
+    for (var sy: u32 = 0u; sy < aa; sy = sy + 1u) {
+        for (var sx: u32 = 0u; sx < aa; sx = sx + 1u) {
+            let jx = (f32(sx) + 0.5) * inv - 0.5;
+            let jy = (f32(sy) + 0.5) * inv - 0.5;
+            acc = acc + color_sample(iterate_sample(base + jx * dx + jy * dy, px));
         }
     }
     return vec4<f32>(acc / f32(aa * aa), 1.0);

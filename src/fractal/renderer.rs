@@ -17,6 +17,37 @@ use eframe::egui_wgpu::{self, wgpu};
 /// bounds the iteration count. 128k points * 8 bytes = 1 MiB.
 pub const MAX_REF_POINTS: usize = 1 << 17;
 
+/// Format of the intermediate iteration-data texture holding, per pixel,
+/// `(ci, DE factor, interior fraction)`. 32-bit float keeps the smooth iteration
+/// count precise at deep zoom. Color-renderable and read with nearest sampling
+/// (iteration data must never be linearly filtered across escape boundaries), so
+/// no `float32-filterable` feature is needed.
+const DATA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+
+/// True when the two uniforms differ in any field the iteration pass depends on
+/// (i.e. anything except the palette / colour scale / offset).
+fn geom_differs(a: &Uniforms, b: &Uniforms) -> bool {
+    a.span != b.span
+        || a.max_iter != b.max_iter
+        || a.ref_len != b.ref_len
+        || a.bailout_sq != b.bailout_sq
+        || a.is_julia != b.is_julia
+        || a.aa_level != b.aa_level
+        || a.kind != b.kind
+        || a.power != b.power
+        || a.dc_offset != b.dc_offset
+        || a.phoenix_p != b.phoenix_p
+        || a.de_coloring != b.de_coloring
+}
+
+/// True when the two uniforms differ in a colour-only field (remappable by the
+/// cheap colourise pass without re-iterating).
+fn color_differs(a: &Uniforms, b: &Uniforms) -> bool {
+    a.color_offset != b.color_offset
+        || a.color_scale != b.color_scale
+        || a.palette_id != b.palette_id
+}
+
 /// GPU-side view + coloring parameters. Layout must match `Uniforms` in the
 /// WGSL shader; total size is a multiple of 16 bytes for uniform-buffer rules.
 #[repr(C)]
@@ -53,26 +84,44 @@ pub struct Uniforms {
     pub _pad: [u32; 3],
 }
 
-/// Offscreen texture the fractal is rendered into, plus the bind group used to
-/// blit it. Recreated whenever the widget's pixel size changes.
+/// Offscreen textures for the two-pass render, recreated whenever the widget's
+/// pixel size changes:
+/// * `data_view` — the iteration pass's output (see [`DATA_FORMAT`]).
+/// * `color_view` — the colourise pass's output; the blit source.
+/// plus the bind groups that read them.
 struct CacheTarget {
-    view: wgpu::TextureView,
+    data_view: wgpu::TextureView,
+    color_view: wgpu::TextureView,
+    /// Colourise pass input: uniforms + the data texture.
+    colorize_bind_group: wgpu::BindGroup,
+    /// Blit pass input: the colour texture + sampler.
     blit_bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
 }
 
-/// State the cache texture was last rendered with. If the next frame's inputs
-/// match this, the cache is still valid and the fractal shader is skipped.
-struct RenderedState {
+/// What the iteration-data texture was last computed with. If the next frame's
+/// geometry inputs match, iteration is skipped and only colour may be redone.
+struct IterState {
     uniforms: Uniforms,
     generation: u64,
     width: u32,
     height: u32,
 }
 
+/// What the colour texture was last computed with. If the next frame's colour
+/// inputs (and size) match and iteration did not re-run, colourise is skipped.
+struct ColorState {
+    uniforms: Uniforms,
+    width: u32,
+    height: u32,
+}
+
 pub struct FractalRenderer {
-    pipeline: wgpu::RenderPipeline,
+    /// Iteration pass: perturbation iterate → data texture (`fs_data`).
+    iterate_pipeline: wgpu::RenderPipeline,
+    /// Combined iterate + colour in one pass (`fs_color`), used only by export.
+    export_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
     ref_buffer: wgpu::Buffer,
@@ -81,14 +130,20 @@ pub struct FractalRenderer {
     /// Generation of the reference orbit currently uploaded to `ref_buffer`.
     uploaded_generation: u64,
 
-    /// Blit pipeline + resources that copy the cache texture to egui's surface.
+    /// Colourise pass: data texture → colour texture (palette mapping).
+    colorize_pipeline: wgpu::RenderPipeline,
+    colorize_bind_group_layout: wgpu::BindGroupLayout,
+
+    /// Blit pipeline + resources that copy the colour texture to egui's surface.
     blit_pipeline: wgpu::RenderPipeline,
     blit_bind_group_layout: wgpu::BindGroupLayout,
     blit_sampler: wgpu::Sampler,
-    /// The offscreen cache; `None` until the first frame sizes it.
+    /// The offscreen textures; `None` until the first frame sizes them.
     cache: Option<CacheTarget>,
-    /// What the cache currently holds; `None` forces a re-render.
-    rendered: Option<RenderedState>,
+    /// What the data texture holds; `None` forces re-iteration.
+    iterated: Option<IterState>,
+    /// What the colour texture holds; `None` forces a recolour.
+    colored: Option<ColorState>,
 }
 
 impl FractalRenderer {
@@ -159,8 +214,9 @@ impl FractalRenderer {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("fractal pipeline"),
+        // Iteration pass: perturbation iterate → data texture (color-independent).
+        let iterate_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fractal iterate pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -170,6 +226,97 @@ impl FractalRenderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
+                entry_point: Some("fs_data"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: DATA_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Combined iterate + colour in one pass — for PNG export only.
+        let export_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fractal export pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_color"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Colourise pass: data texture + colour uniforms → colour texture.
+        let colorize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("colorize"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/colorize.wgsl").into()),
+        });
+        let colorize_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("colorize bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            // Nearest only: iteration data must not be filtered.
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let colorize_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("colorize pipeline layout"),
+                bind_group_layouts: &[Some(&colorize_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let colorize_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("colorize pipeline"),
+            layout: Some(&colorize_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &colorize_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &colorize_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
@@ -254,18 +401,22 @@ impl FractalRenderer {
         });
 
         Self {
-            pipeline,
+            iterate_pipeline,
+            export_pipeline,
             bind_group_layout,
             uniform_buffer,
             ref_buffer,
             bind_group,
             target_format,
             uploaded_generation: u64::MAX,
+            colorize_pipeline,
+            colorize_bind_group_layout,
             blit_pipeline,
             blit_bind_group_layout,
             blit_sampler,
             cache: None,
-            rendered: None,
+            iterated: None,
+            colored: None,
         }
     }
 
@@ -279,13 +430,29 @@ impl FractalRenderer {
             return;
         }
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("fractal cache"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        // Iteration-data texture (color-independent escape data).
+        let data_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fractal data"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DATA_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let data_view = data_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Colour texture (colourise output; blit source).
+        let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fractal color cache"),
+            size: extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -293,7 +460,22 @@ impl FractalRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let colorize_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("colorize bind group"),
+            layout: &self.colorize_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&data_view),
+                },
+            ],
+        });
 
         let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit bind group"),
@@ -301,7 +483,7 @@ impl FractalRenderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(&color_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -311,13 +493,16 @@ impl FractalRenderer {
         });
 
         self.cache = Some(CacheTarget {
-            view,
+            data_view,
+            color_view,
+            colorize_bind_group,
             blit_bind_group,
             width,
             height,
         });
-        // New texture → old render is gone.
-        self.rendered = None;
+        // New textures → old renders are gone.
+        self.iterated = None;
+        self.colored = None;
     }
 
     /// Handles needed to build a standalone [`ExportRender`] off the UI thread:
@@ -325,7 +510,7 @@ impl FractalRenderer {
     /// format. Cloned so the caller can drop the render-state lock before use.
     pub fn export_handles(&self) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::TextureFormat) {
         (
-            self.pipeline.clone(),
+            self.export_pipeline.clone(),
             self.bind_group_layout.clone(),
             self.target_format,
         )
@@ -582,8 +767,9 @@ pub fn encode_png_with_progress(
 
 /// A per-frame paint callback. Carries this frame's uniforms plus a reference to
 /// the current reference orbit (cheap `Arc` clone). The orbit is only re-uploaded
-/// to the GPU when its `generation` changes, and the fractal is only re-rendered
-/// into the cache when the uniforms, generation, or `size_px` change.
+/// when its `generation` changes; the expensive iteration pass re-runs only when
+/// a geometry input changes, and colour-only changes re-run just the cheap
+/// colourise pass (see `prepare`).
 pub struct FractalCallback {
     pub uniforms: Uniforms,
     pub reference: Arc<Vec<[f32; 2]>>,
@@ -619,28 +805,57 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
             renderer.uploaded_generation = self.generation;
         }
 
-        // Re-render the cache only when what it depends on changed.
-        let dirty = renderer.rendered.as_ref().is_none_or(|r| {
+        // Iteration (expensive) re-runs only when the geometry inputs change;
+        // colourise (cheap) re-runs when it did, or when only a colour changed —
+        // so palette / colour-scale / offset tweaks (e.g. colour cycling) skip
+        // the perturbation entirely.
+        let iter_dirty = renderer.iterated.as_ref().is_none_or(|r| {
             r.generation != self.generation
                 || r.width != width
                 || r.height != height
-                || bytemuck::bytes_of(&r.uniforms) != bytemuck::bytes_of(&self.uniforms)
+                || geom_differs(&r.uniforms, &self.uniforms)
         });
-        if !dirty {
-            return Vec::new();
+        let color_dirty = iter_dirty
+            || renderer.colored.as_ref().is_none_or(|c| {
+                c.width != width || c.height != height || color_differs(&c.uniforms, &self.uniforms)
+            });
+
+        if !color_dirty {
+            return Vec::new(); // cache still valid; paint() just blits it
         }
 
-        queue.write_buffer(
-            &renderer.uniform_buffer,
-            0,
-            bytemuck::bytes_of(&self.uniforms),
-        );
+        // Both passes read the uniform buffer; refresh it once.
+        queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
 
         if let Some(cache) = &renderer.cache {
+            if iter_dirty {
+                // Iteration pass: perturbation iterate → data texture.
+                let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("fractal iterate pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &cache.data_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&renderer.iterate_pipeline);
+                pass.set_bind_group(0, &renderer.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            // Colourise pass: data texture → colour texture.
             let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("fractal cache pass"),
+                label: Some("fractal colorize pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &cache.view,
+                    view: &cache.color_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -653,14 +868,21 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&renderer.pipeline);
-            pass.set_bind_group(0, &renderer.bind_group, &[]);
+            pass.set_pipeline(&renderer.colorize_pipeline);
+            pass.set_bind_group(0, &cache.colorize_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
 
-        renderer.rendered = Some(RenderedState {
+        if iter_dirty {
+            renderer.iterated = Some(IterState {
+                uniforms: self.uniforms,
+                generation: self.generation,
+                width,
+                height,
+            });
+        }
+        renderer.colored = Some(ColorState {
             uniforms: self.uniforms,
-            generation: self.generation,
             width,
             height,
         });

@@ -26,6 +26,11 @@ fn mandelbrot_shader_is_valid() {
 }
 
 #[test]
+fn colorize_shader_is_valid() {
+    validate("colorize.wgsl", include_str!("../src/shaders/colorize.wgsl"));
+}
+
+#[test]
 fn blit_shader_is_valid() {
     validate("blit.wgsl", include_str!("../src/shaders/blit.wgsl"));
 }
