@@ -15,7 +15,7 @@ const BAILOUT_SQ: f32 = 1.0e6;
 /// Cap on exported image dimension (px), to stay within GPU texture limits.
 const MAX_EXPORT_DIM: u32 = 8192 * 16;
 /// Palette names; index maps to `palette_id` in the shader.
-const PALETTE_NAMES: &[&str] = &["Rainbow", "Amber", "Ember", "Lime", "Grayscale"];
+const PALETTE_NAMES: &[&str] = &["Amber", "Rainbow", "Ember", "Lime", "Grayscale"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FractalMode {

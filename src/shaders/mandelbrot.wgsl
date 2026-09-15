@@ -62,9 +62,9 @@ fn palette(id: u32, t: f32) -> vec3<f32> {
     let a = vec3<f32>(0.5, 0.5, 0.5);
     let b = vec3<f32>(0.5, 0.5, 0.5);
     var c = vec3<f32>(1.0, 1.0, 1.0);
-    var d = vec3<f32>(0.00, 0.33, 0.67); // 0: rainbow
+    var d = vec3<f32>(0.00, 0.10, 0.20); // 0: amber / blue
     if (id == 1u) {
-        d = vec3<f32>(0.00, 0.10, 0.20); // amber / blue
+        d = vec3<f32>(0.00, 0.33, 0.67); // rainbow
     } else if (id == 2u) {
         d = vec3<f32>(0.30, 0.20, 0.20); // warm ember
     } else if (id == 3u) {
