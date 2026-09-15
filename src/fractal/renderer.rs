@@ -418,40 +418,48 @@ impl FractalRenderer {
 }
 
 /// Convert a padded BGRA/RGBA readback into tightly-packed RGBA8 and encode it
-/// as PNG bytes.
-pub fn encode_png(
+/// as PNG bytes, reporting progress in `[0, 1]` via `on_progress` as rows are
+/// streamed to the compressor (encoding is the slow, subdividable phase).
+pub fn encode_png_with_progress(
     padded: &[u8],
     width: u32,
     height: u32,
     padded_bpr: u32,
     swap_rb: bool,
+    mut on_progress: impl FnMut(f32),
 ) -> Vec<u8> {
-    let row = (width * 4) as usize;
-    let mut rgba = vec![0u8; row * height as usize];
-    for y in 0..height as usize {
-        let src_off = y * padded_bpr as usize;
-        let src = &padded[src_off..src_off + row];
-        let dst = &mut rgba[y * row..y * row + row];
-        if swap_rb {
-            for x in 0..width as usize {
-                dst[x * 4] = src[x * 4 + 2];
-                dst[x * 4 + 1] = src[x * 4 + 1];
-                dst[x * 4 + 2] = src[x * 4];
-                dst[x * 4 + 3] = src[x * 4 + 3];
-            }
-        } else {
-            dst.copy_from_slice(src);
-        }
-    }
+    use std::io::Write as _;
 
+    let row = (width * 4) as usize;
     let mut out = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut out, width, height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().expect("png header");
-        writer.write_image_data(&rgba).expect("png data");
+        let mut stream = writer.stream_writer().expect("png stream");
+        let mut line = vec![0u8; row];
+        for y in 0..height as usize {
+            let src_off = y * padded_bpr as usize;
+            let src = &padded[src_off..src_off + row];
+            if swap_rb {
+                for x in 0..width as usize {
+                    line[x * 4] = src[x * 4 + 2];
+                    line[x * 4 + 1] = src[x * 4 + 1];
+                    line[x * 4 + 2] = src[x * 4];
+                    line[x * 4 + 3] = src[x * 4 + 3];
+                }
+                stream.write_all(&line).expect("png data");
+            } else {
+                stream.write_all(src).expect("png data");
+            }
+            if y % 64 == 0 {
+                on_progress(y as f32 / height as f32);
+            }
+        }
+        stream.finish().expect("png finish");
     }
+    on_progress(1.0);
     out
 }
 

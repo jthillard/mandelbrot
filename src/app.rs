@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eframe::CreationContext;
 use eframe::egui_wgpu;
@@ -73,6 +73,16 @@ struct RequestKey {
     iter: u32,
 }
 
+/// Shared state for an in-progress PNG export. The worker (a background thread
+/// on native, an async task on web) writes `fraction`/`phase` as it goes and
+/// sets `result` once when finished; the UI reads it each frame to draw a
+/// progress bar and, on completion, to report the outcome.
+struct ExportShared {
+    fraction: f32,
+    phase: &'static str,
+    result: Option<Result<String, String>>,
+}
+
 /// Top-level egui application.
 pub struct FractalApp {
     view: ViewState,
@@ -108,6 +118,8 @@ pub struct FractalApp {
     last_size_px: egui::Vec2,
     /// Set when the user requests a PNG export (handled after the panels draw).
     export_requested: bool,
+    /// Progress/handle for an in-flight PNG export, if any.
+    export: Option<Arc<Mutex<ExportShared>>>,
     /// Short status line (saved path, "link copied", errors).
     status: Option<String>,
 
@@ -186,6 +198,7 @@ impl FractalApp {
             export_scale: 2.0,
             last_size_px: egui::vec2(1280.0, 720.0),
             export_requested: false,
+            export: None,
             status: None,
             center_re_edit,
             center_im_edit,
@@ -466,14 +479,19 @@ impl FractalApp {
     }
 
     /// Render the current view to a PNG at `export_scale` × the on-screen size,
-    /// then save it (native: file in cwd; web: browser download).
+    /// then save it (native: file in cwd; web: browser download). Runs off the
+    /// UI thread so a progress bar can animate; progress lands in `self.export`.
     fn do_export(&mut self, frame: &mut eframe::Frame) {
+        if self.export.is_some() {
+            return; // one export at a time
+        }
         let Some(rs) = frame.wgpu_render_state() else {
             self.status = Some("export unavailable (no wgpu backend)".into());
             return;
         };
         if self.reference.is_empty() {
             self.status = Some("still computing reference…".into());
+            self.export_requested = true; // retry once the reference is ready
             return;
         }
 
@@ -495,23 +513,95 @@ impl FractalApp {
             (buffer, bpr, renderer.needs_rb_swap())
         };
 
+        let shared = Arc::new(Mutex::new(ExportShared {
+            fraction: 0.0,
+            phase: "Rendering",
+            result: None,
+        }));
+        self.status = None;
+        self.export = Some(Arc::clone(&shared));
+
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let png = pollster::block_on(read_and_encode(&device, buffer, w, h, padded_bpr, swap));
             let name = std::env::var("MANDEL_EXPORT_PATH")
                 .unwrap_or_else(|_| format!("fractal-{}.png", unix_timestamp()));
-            match std::fs::write(&name, &png) {
-                Ok(_) => self.status = Some(format!("saved {name} ({w}×{h})")),
-                Err(e) => self.status = Some(format!("save failed: {e}")),
-            }
+            std::thread::spawn(move || {
+                // Wait for the GPU render + copy, then read the mapped bytes.
+                let (tx, rx) = std::sync::mpsc::channel();
+                buffer.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+                    let _ = tx.send(res);
+                });
+                let _ = device.poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
+                let _ = rx.recv();
+
+                set_progress(&shared, "Encoding", 0.02);
+                let png = {
+                    let data = buffer
+                        .slice(..)
+                        .get_mapped_range()
+                        .expect("map readback buffer");
+                    let sh = Arc::clone(&shared);
+                    crate::fractal::encode_png_with_progress(&data, w, h, padded_bpr, swap, |f| {
+                        set_progress(&sh, "Encoding", 0.02 + 0.93 * f);
+                    })
+                };
+                buffer.unmap();
+
+                set_progress(&shared, "Saving", 0.97);
+                let result = std::fs::write(&name, &png)
+                    .map(|_| format!("saved {name} ({w}×{h})"))
+                    .map_err(|e| format!("save failed: {e}"));
+                finish_export(&shared, result);
+            });
         }
         #[cfg(target_arch = "wasm32")]
         {
-            self.status = Some(format!("exporting {w}×{h}…"));
             wasm_bindgen_futures::spawn_local(async move {
-                let png = read_and_encode(&device, buffer, w, h, padded_bpr, swap).await;
+                let (tx, rx) = futures_channel::oneshot::channel();
+                buffer.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+                    let _ = tx.send(res);
+                });
+                let _ = rx.await;
+
+                set_progress(&shared, "Encoding", 0.02);
+                let png = {
+                    let data = buffer
+                        .slice(..)
+                        .get_mapped_range()
+                        .expect("map readback buffer");
+                    let sh = Arc::clone(&shared);
+                    crate::fractal::encode_png_with_progress(&data, w, h, padded_bpr, swap, |f| {
+                        set_progress(&sh, "Encoding", 0.02 + 0.93 * f);
+                    })
+                };
+                buffer.unmap();
+
+                set_progress(&shared, "Saving", 0.97);
                 web_download_png(&png, "fractal.png");
+                finish_export(&shared, Ok(format!("downloaded {w}×{h}")));
             });
+        }
+    }
+
+    /// Pick up a finished export (setting the status line) and keep repainting
+    /// while one is in flight so its progress bar animates.
+    fn poll_export(&mut self, ctx: &egui::Context) {
+        if let Some(shared) = &self.export {
+            let done = shared.lock().unwrap().result.take();
+            match done {
+                Some(Ok(msg)) => {
+                    self.status = Some(msg);
+                    self.export = None;
+                }
+                Some(Err(e)) => {
+                    self.status = Some(e);
+                    self.export = None;
+                }
+                None => ctx.request_repaint(),
+            }
         }
     }
 
@@ -654,13 +744,17 @@ impl FractalApp {
         }
 
         ui.separator();
+        let exporting = self.export.is_some();
         ui.horizontal(|ui| {
             if ui.button("Copy link").clicked() {
                 let url = self.share_url();
                 ui.ctx().copy_text(url);
                 self.status = Some("link copied".into());
             }
-            if ui.button("Export PNG").clicked() {
+            if ui
+                .add_enabled(!exporting, egui::Button::new("Export PNG"))
+                .clicked()
+            {
                 self.export_requested = true;
             }
         });
@@ -677,7 +771,17 @@ impl FractalApp {
                 (self.last_size_px.y * self.export_scale) as u32,
             ));
         });
-        if let Some(status) = &self.status {
+        if let Some(shared) = &self.export {
+            let (fraction, phase) = {
+                let s = shared.lock().unwrap();
+                (s.fraction, s.phase)
+            };
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .animate(true)
+                    .text(format!("{phase} {:.0}%", fraction * 100.0)),
+            );
+        } else if let Some(status) = &self.status {
             ui.small(status);
         }
 
@@ -773,6 +877,8 @@ impl FractalApp {
 
 impl eframe::App for FractalApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.poll_export(ui.ctx());
+
         egui::Panel::right("controls")
             .default_size(280.0)
             .show(ui, |ui| self.controls_ui(ui));
@@ -792,40 +898,19 @@ impl eframe::App for FractalApp {
     }
 }
 
-/// Map the readback buffer, unpad it, and encode a PNG. Awaited on both targets
-/// (blocked on via pollster natively; spawned on the web).
-async fn read_and_encode(
-    device: &wgpu::Device,
-    buffer: wgpu::Buffer,
-    width: u32,
-    height: u32,
-    padded_bpr: u32,
-    swap_rb: bool,
-) -> Vec<u8> {
-    let (tx, rx) = futures_channel::oneshot::channel();
-    buffer.slice(..).map_async(wgpu::MapMode::Read, move |res| {
-        let _ = tx.send(res);
-    });
+/// Update an export's progress (phase label + fraction).
+fn set_progress(shared: &Arc<Mutex<ExportShared>>, phase: &'static str, fraction: f32) {
+    let mut s = shared.lock().unwrap();
+    s.phase = phase;
+    s.fraction = fraction;
+}
 
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = device.poll(wgpu::PollType::Wait {
-        submission_index: None,
-        timeout: None,
-    });
-    #[cfg(target_arch = "wasm32")]
-    let _ = device;
-
-    let _ = rx.await;
-
-    let png = {
-        let data = buffer
-            .slice(..)
-            .get_mapped_range()
-            .expect("map readback buffer");
-        crate::fractal::encode_png(&data, width, height, padded_bpr, swap_rb)
-    };
-    buffer.unmap();
-    png
+/// Mark an export finished with its outcome.
+fn finish_export(shared: &Arc<Mutex<ExportShared>>, result: Result<String, String>) {
+    let mut s = shared.lock().unwrap();
+    s.phase = "Done";
+    s.fraction = 1.0;
+    s.result = Some(result);
 }
 
 #[cfg(not(target_arch = "wasm32"))]

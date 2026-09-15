@@ -6,5 +6,7 @@ pub mod renderer;
 pub mod share;
 
 pub use reference::{compute_mandelbrot_reference, compute_reference};
-pub use renderer::{FractalCallback, FractalRenderer, Uniforms, MAX_REF_POINTS, encode_png};
+pub use renderer::{
+    FractalCallback, FractalRenderer, MAX_REF_POINTS, Uniforms, encode_png_with_progress,
+};
 pub use share::ShareState;
