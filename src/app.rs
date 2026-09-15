@@ -5,10 +5,11 @@ use eframe::egui_wgpu;
 use eframe::egui_wgpu::wgpu;
 
 use crate::fractal::{
-    ExportRender, FractalCallback, FractalRenderer, MAX_REF_POINTS, ShareState, Uniforms,
+    ExportRender, FractalCallback, FractalKind, FractalRenderer, MAX_REF_POINTS, ShareState,
+    Uniforms,
 };
 #[cfg(target_arch = "wasm32")]
-use crate::fractal::{compute_mandelbrot_reference, compute_reference};
+use crate::fractal::{compute_reference, compute_set_reference};
 use crate::view::{
     Big, DEFAULT_HALF_HEIGHT, ViewState, big_from_decimal_str, big_from_f64, big_to_decimal_str,
     precision_for,
@@ -24,6 +25,23 @@ const PALETTE_NAMES: &[&str] = &["Amber", "Rainbow", "Ember", "Lime", "Grayscale
 pub enum FractalMode {
     Mandelbrot,
     Julia,
+}
+
+/// Selectable fractal formulas, with UI labels.
+const KINDS: &[(FractalKind, &str)] = &[
+    (FractalKind::Mandelbrot, "Mandelbrot"),
+    (FractalKind::BurningShip, "Burning Ship"),
+    (FractalKind::Tricorn, "Tricorn"),
+    (FractalKind::Multibrot, "Multibrot"),
+];
+
+/// UI label for a fractal kind.
+fn kind_label(kind: FractalKind) -> &'static str {
+    KINDS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, name)| *name)
+        .unwrap_or("Mandelbrot")
 }
 
 /// Nice-looking Julia constants offered as presets.
@@ -73,6 +91,8 @@ struct RequestKey {
     julia: bool,
     julia_c: (f64, f64),
     iter: u32,
+    kind: FractalKind,
+    power: u32,
 }
 
 /// Shared state for an in-progress PNG export. The worker (a background thread
@@ -89,6 +109,10 @@ struct ExportShared {
 pub struct FractalApp {
     view: ViewState,
     mode: FractalMode,
+    /// Iteration formula.
+    kind: FractalKind,
+    /// Exponent for the Multibrot kind.
+    power: u32,
     julia_c: (f64, f64),
     max_iterations: u32,
     color_scale: f32,
@@ -182,6 +206,8 @@ impl FractalApp {
         let mut app = Self {
             view,
             mode: FractalMode::Mandelbrot,
+            kind: FractalKind::Mandelbrot,
+            power: 3,
             julia_c: (-0.8, 0.156),
             max_iterations: 512,
             color_scale: 0.15,
@@ -219,6 +245,20 @@ impl FractalApp {
         // Debug/testing hooks.
         #[cfg(not(target_arch = "wasm32"))]
         {
+            if let Ok(k) = std::env::var("MANDEL_KIND") {
+                app.kind = match k.trim().to_ascii_lowercase().as_str() {
+                    "burningship" | "burning_ship" | "ship" => FractalKind::BurningShip,
+                    "tricorn" | "mandelbar" => FractalKind::Tricorn,
+                    "multibrot" | "multi" => FractalKind::Multibrot,
+                    _ => FractalKind::Mandelbrot,
+                };
+                if let Ok(p) = std::env::var("MANDEL_POWER")
+                    && let Ok(p) = p.trim().parse::<u32>()
+                {
+                    app.power = p.clamp(2, 8);
+                }
+                app.view = Self::default_view_for(app.mode, app.kind);
+            }
             if let Ok(jc) = std::env::var("MANDEL_JULIA") {
                 let p: Vec<&str> = jc.split(',').collect();
                 if let (Some(Ok(re)), Some(Ok(im))) = (
@@ -227,7 +267,7 @@ impl FractalApp {
                 ) {
                     app.mode = FractalMode::Julia;
                     app.julia_c = (re, im);
-                    app.view = Self::default_view_for(FractalMode::Julia);
+                    app.view = Self::default_view_for(FractalMode::Julia, app.kind);
                 }
             }
             if let Ok(frag) = std::env::var("MANDEL_SHARE")
@@ -294,6 +334,7 @@ impl FractalApp {
         let sig_digits = sig_digits_for(self.view.precision_bits());
         ShareState {
             julia: matches!(self.mode, FractalMode::Julia),
+            kind: self.kind,
             center_re: big_to_decimal_str(&self.view.center_re, sig_digits),
             center_im: big_to_decimal_str(&self.view.center_im, sig_digits),
             half_height: self.view.half_height,
@@ -311,6 +352,7 @@ impl FractalApp {
         } else {
             FractalMode::Mandelbrot
         };
+        self.kind = s.kind;
         self.julia_c = s.julia_c;
         self.color_scale = s.color_scale;
         self.color_offset = s.color_offset;
@@ -340,14 +382,20 @@ impl FractalApp {
         format!("#{fragment}")
     }
 
-    /// Default view for a given fractal mode.
-    fn default_view_for(mode: FractalMode) -> ViewState {
-        match mode {
-            FractalMode::Mandelbrot => ViewState::default(),
-            FractalMode::Julia => {
-                ViewState::with_center(big_from_f64(0.0, 53), big_from_f64(0.0, 53), 1.5)
-            }
+    /// Default view for a given set type and fractal kind. The Julia (dynamical)
+    /// plane is centered on the origin for every kind; the parameter plane frames
+    /// each kind's interesting region.
+    fn default_view_for(mode: FractalMode, kind: FractalKind) -> ViewState {
+        if mode == FractalMode::Julia {
+            return ViewState::with_center(big_from_f64(0.0, 53), big_from_f64(0.0, 53), 1.5);
         }
+        let (cr, ci, hh) = match kind {
+            FractalKind::Mandelbrot => (-0.5, 0.0, 1.25),
+            FractalKind::BurningShip => (-0.5, -0.5, 1.3),
+            FractalKind::Tricorn => (-0.25, 0.0, 1.6),
+            FractalKind::Multibrot => (0.0, 0.0, 1.5),
+        };
+        ViewState::with_center(big_from_f64(cr, 53), big_from_f64(ci, 53), hh)
     }
 
     fn current_key(&self) -> RequestKey {
@@ -358,6 +406,8 @@ impl FractalApp {
             julia: matches!(self.mode, FractalMode::Julia),
             julia_c: self.julia_c,
             iter: self.max_iterations,
+            kind: self.kind,
+            power: self.power,
         }
     }
 
@@ -378,6 +428,8 @@ impl FractalApp {
         if key.julia != matches!(self.mode, FractalMode::Julia)
             || key.julia_c != self.julia_c
             || key.iter != self.max_iterations
+            || key.kind != self.kind
+            || key.power != self.power
         {
             return true;
         }
@@ -422,6 +474,8 @@ impl FractalApp {
                     julia_c: key.julia_c,
                     max_iter,
                     precision,
+                    kind: key.kind,
+                    power: key.power,
                 });
                 self.pending = true;
             }
@@ -437,13 +491,17 @@ impl FractalApp {
                         &ji,
                         max_iter,
                         precision,
+                        key.kind,
+                        key.power,
                     )
                 } else {
-                    compute_mandelbrot_reference(
+                    compute_set_reference(
                         &key.center_re,
                         &key.center_im,
                         max_iter,
                         precision,
+                        key.kind,
+                        key.power,
                     )
                 };
                 self.apply_reference(
@@ -476,7 +534,10 @@ impl FractalApp {
             is_julia: matches!(self.mode, FractalMode::Julia) as u32,
             palette_id: self.palette,
             aa_level: if self.antialias { 2 } else { 1 },
+            kind: self.kind.shader_id(),
+            power: self.power,
             dc_offset: self.dc_offset(),
+            _pad: [0, 0],
         }
     }
 
@@ -676,8 +737,25 @@ impl FractalApp {
         ui.heading("Fractal Explorer");
         ui.separator();
 
+        // Fractal formula. Switching kinds jumps to a sensible default view,
+        // since interesting regions differ between fractals.
+        let prev_kind = self.kind;
+        egui::ComboBox::from_label("fractal")
+            .selected_text(kind_label(self.kind))
+            .show_ui(ui, |ui| {
+                for &(kind, name) in KINDS {
+                    ui.selectable_value(&mut self.kind, kind, name);
+                }
+            });
+        if self.kind == FractalKind::Multibrot {
+            ui.add(egui::Slider::new(&mut self.power, 2..=8).text("power"));
+        }
+        if self.kind != prev_kind {
+            self.view = Self::default_view_for(self.mode, self.kind);
+        }
+
         ui.horizontal(|ui| {
-            ui.radio_value(&mut self.mode, FractalMode::Mandelbrot, "Mandelbrot");
+            ui.radio_value(&mut self.mode, FractalMode::Mandelbrot, "Set");
             ui.radio_value(&mut self.mode, FractalMode::Julia, "Julia");
         });
 
@@ -705,7 +783,7 @@ impl FractalApp {
             });
         }
 
-        if self.mode == FractalMode::Mandelbrot {
+        if self.mode == FractalMode::Mandelbrot && self.kind == FractalKind::Mandelbrot {
             ui.label("places:");
             ui.horizontal_wrapped(|ui| {
                 for &(name, re, im, half_height, iter) in MANDEL_PLACES {
@@ -854,7 +932,7 @@ impl FractalApp {
 
         ui.separator();
         if ui.button("Reset view").clicked() {
-            self.view = Self::default_view_for(self.mode);
+            self.view = Self::default_view_for(self.mode, self.kind);
         }
         ui.add_space(8.0);
         ui.small("Drag to pan · scroll to zoom toward the cursor");

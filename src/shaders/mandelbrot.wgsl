@@ -22,8 +22,17 @@ struct Uniforms {
     is_julia: u32,
     palette_id: u32,
     aa_level: u32,
+    // Iteration formula: 0 Mandelbrot, 1 Burning Ship, 2 Tricorn, 3 Multibrot.
+    kind: u32,
+    // Exponent for the Multibrot kind.
+    power: u32,
     dc_offset: vec2<f32>,
 };
+
+const KIND_MANDELBROT: u32 = 0u;
+const KIND_BURNING_SHIP: u32 = 1u;
+const KIND_TRICORN: u32 = 2u;
+const KIND_MULTIBROT: u32 = 3u;
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> ref_orbit: array<vec2<f32>>;
@@ -52,6 +61,73 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
 // Complex multiply.
 fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+// Complex conjugate.
+fn conj(a: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(a.x, -a.y);
+}
+
+// |c + d| - |c|, evaluated exactly (no catastrophic cancellation even when the
+// sum crosses zero). This is what makes the Burning Ship delta correct through
+// the sign flips that happen all along the axes, where the ship's detail lives.
+fn diffabs(c: f32, d: f32) -> f32 {
+    let cd = c + d;
+    if (c >= 0.0) {
+        return select(-(2.0 * c + d), d, cd >= 0.0);
+    }
+    return select(-d, 2.0 * c + d, cd > 0.0);
+}
+
+// Binomial coefficient C(n, k) as f32 (exact for the small powers we use).
+fn binom(n: u32, k: u32) -> f32 {
+    var num = 1.0;
+    var den = 1.0;
+    for (var i: u32 = 0u; i < k; i = i + 1u) {
+        num = num * f32(n - i);
+        den = den * f32(i + 1u);
+    }
+    return num / den;
+}
+
+// Perturbation delta for z -> z^p: sum_{k=1}^{p} C(p,k) Z^{p-k} e^k. Expanded so
+// the large z^p term is never formed (that would cancel catastrophically).
+fn multibrot_delta(z: vec2<f32>, e: vec2<f32>, p: u32) -> vec2<f32> {
+    var zp: array<vec2<f32>, 9>; // Z^0 .. Z^8
+    zp[0] = vec2<f32>(1.0, 0.0);
+    for (var j: u32 = 1u; j <= p; j = j + 1u) {
+        zp[j] = cmul(zp[j - 1u], z);
+    }
+    var acc = vec2<f32>(0.0, 0.0);
+    var ek = vec2<f32>(1.0, 0.0); // e^0
+    for (var k: u32 = 1u; k <= p; k = k + 1u) {
+        ek = cmul(ek, e); // e^k
+        acc = acc + binom(p, k) * cmul(zp[p - k], ek);
+    }
+    return acc;
+}
+
+// One perturbation step of the current fractal's delta: e -> f(Z+e) - f(Z),
+// where `z` is the reference orbit value X_m. `step_add` (dc) is added by the
+// caller. Must match `FractalKind` on the CPU side.
+fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
+    if (u.kind == KIND_BURNING_SHIP) {
+        // (|x| + i|y|)^2 has real part x^2 - y^2 (an ordinary square delta) and
+        // imaginary part 2|x y|. The imaginary delta is 2(|x y| - |X Y|); diffabs
+        // computes it exactly, even where the product x y changes sign — which the
+        // old sign(X)sign(Y) shortcut got wrong whenever the delta was large
+        // enough to flip it (all the time at shallow zoom).
+        let base = 2.0 * cmul(z, e) + cmul(e, e);
+        let dp = z.x * e.y + z.y * e.x + e.x * e.y;
+        return vec2<f32>(base.x, 2.0 * diffabs(z.x * z.y, dp));
+    } else if (u.kind == KIND_TRICORN) {
+        let cz = conj(z);
+        let ce = conj(e);
+        return 2.0 * cmul(cz, ce) + cmul(ce, ce);
+    } else if (u.kind == KIND_MULTIBROT) {
+        return multibrot_delta(z, e, clamp(u.power, 2u, 8u));
+    }
+    return 2.0 * cmul(z, e) + cmul(e, e); // Mandelbrot
 }
 
 // Smooth cyclic palettes (Inigo Quilez cosine palettes), selected by id.
@@ -107,8 +183,8 @@ fn shade(offset: vec2<f32>) -> vec3<f32> {
             break; // interior
         }
 
-        // Advance the delta: e = 2*X_m*e + e^2 (+ dc for Mandelbrot).
-        e = 2.0 * cmul(xm, e) + cmul(e, e) + step_add;
+        // Advance the delta by this fractal's formula (+ dc for the set plane).
+        e = advance_delta(xm, e) + step_add;
         m = m + 1u;
         n = n + 1u;
 

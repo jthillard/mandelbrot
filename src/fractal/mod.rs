@@ -5,7 +5,7 @@ pub mod reference;
 pub mod renderer;
 pub mod share;
 
-pub use reference::{compute_mandelbrot_reference, compute_reference};
+pub use reference::{FractalKind, compute_reference, compute_set_reference};
 pub use renderer::{
     ExportRender, FractalCallback, FractalRenderer, MAX_REF_POINTS, Uniforms,
     encode_png_with_progress,

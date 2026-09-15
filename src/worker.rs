@@ -9,7 +9,7 @@
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 
-use crate::fractal::{compute_mandelbrot_reference, compute_reference};
+use crate::fractal::{FractalKind, compute_reference, compute_set_reference};
 use crate::view::{Big, big_from_f64};
 
 pub struct RefRequest {
@@ -20,6 +20,8 @@ pub struct RefRequest {
     pub julia_c: (f64, f64),
     pub max_iter: u32,
     pub precision: usize,
+    pub kind: FractalKind,
+    pub power: u32,
 }
 
 pub struct RefResult {
@@ -97,8 +99,17 @@ fn compute(req: &RefRequest) -> Vec<[f32; 2]> {
             &ji,
             req.max_iter,
             req.precision,
+            req.kind,
+            req.power,
         )
     } else {
-        compute_mandelbrot_reference(&req.center_re, &req.center_im, req.max_iter, req.precision)
+        compute_set_reference(
+            &req.center_re,
+            &req.center_im,
+            req.max_iter,
+            req.precision,
+            req.kind,
+            req.power,
+        )
     }
 }

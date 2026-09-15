@@ -35,10 +35,16 @@ pub struct Uniforms {
     pub palette_id: u32,
     /// Supersampling factor per axis: 1 = off, 2 = 2×2 (4 samples).
     pub aa_level: u32,
+    /// Iteration formula (`FractalKind::shader_id`).
+    pub kind: u32,
+    /// Exponent for the Multibrot kind.
+    pub power: u32,
     /// Complex offset of the view center from the reference center, so a stale
     /// or reused reference (computed at a slightly different center) still maps
     /// correctly. Added to every pixel's per-pixel offset.
     pub dc_offset: [f32; 2],
+    /// Padding to a 16-byte multiple (uniform buffer requirement).
+    pub _pad: [u32; 2],
 }
 
 /// Offscreen texture the fractal is rendered into, plus the bind group used to
