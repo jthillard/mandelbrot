@@ -207,6 +207,14 @@ pub struct FractalApp {
     /// Time-based animation of colours / Julia c / Phoenix p / zoom.
     anim: AnimState,
 
+    /// Smoothed frames-per-second, recomputed each ~0.5 s window. Only advances
+    /// while the app is actually repainting (interaction / animation / export);
+    /// idle frames aren't forced, so a frozen value means "nothing to render".
+    fps: f32,
+    /// Frames counted in the current FPS window, and its start time (`i.time`).
+    fps_frames: u32,
+    fps_window_start: f64,
+
     /// Reference orbit (`Z_n` as f32 pairs) for the current view.
     reference: Arc<Vec<[f32; 2]>>,
     /// Bumped whenever `reference` is replaced, so the GPU re-uploads it.
@@ -309,6 +317,9 @@ impl FractalApp {
             controls_open: true,
             fullscreen: false,
             anim: AnimState::default(),
+            fps: 0.0,
+            fps_frames: 0,
+            fps_window_start: 0.0,
             reference: Arc::new(Vec::new()),
             generation: 0,
             ref_center_re,
@@ -904,6 +915,19 @@ impl FractalApp {
                                 self.fullscreen = !self.fullscreen;
                                 self.apply_fullscreen(ui.ctx());
                             }
+                            // FPS readout. Monospace + fixed width so the number
+                            // changing doesn't jitter the button row.
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{:>3.0} FPS", self.fps))
+                                        .monospace(),
+                                )
+                                .selectable(false),
+                            )
+                            .on_hover_text(
+                                "Frames per second while rendering (interaction, \
+                                 animation, export). Frozen when idle.",
+                            );
                         });
                     });
             });
@@ -945,6 +969,27 @@ impl FractalApp {
     fn sync_fullscreen(&mut self, _ctx: &egui::Context) {
         if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
             self.fullscreen = doc.fullscreen_element().is_some();
+        }
+    }
+
+    /// Recompute the smoothed FPS. Counts frames over a ~0.5 s wall-clock window
+    /// (using egui's monotonic `i.time`, which works on native and web) and
+    /// divides once the window closes, so the readout is steady rather than
+    /// jittering every frame. Only advances when egui repaints — i.e. while the
+    /// app is doing work — so an idle app shows its last measured rate.
+    fn update_fps(&mut self, ui: &egui::Ui) {
+        let now = ui.input(|i| i.time);
+        // Reset the window if time went backwards or hasn't started yet.
+        if self.fps_window_start <= 0.0 || now < self.fps_window_start {
+            self.fps_window_start = now;
+            self.fps_frames = 0;
+        }
+        self.fps_frames += 1;
+        let elapsed = now - self.fps_window_start;
+        if elapsed >= 0.5 {
+            self.fps = (self.fps_frames as f64 / elapsed) as f32;
+            self.fps_frames = 0;
+            self.fps_window_start = now;
         }
     }
 
@@ -1418,6 +1463,7 @@ impl FractalApp {
 impl eframe::App for FractalApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll_export(ui.ctx());
+        self.update_fps(ui);
         // Track the real fullscreen state (e.g. the user pressing Esc/F11 or the
         // browser leaving fullscreen) so the toggle button label stays correct.
         self.sync_fullscreen(ui.ctx());
