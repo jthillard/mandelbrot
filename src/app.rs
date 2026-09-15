@@ -570,15 +570,25 @@ impl FractalApp {
 
         self.ensure_reference();
 
-        // Nothing to draw until the first reference orbit is ready.
+        // Poll the worker roughly every 30 ms while a reference is computing,
+        // instead of spinning a full-speed repaint. Once ready, changed inputs
+        // (or the initial draw) drive repaints on their own.
+        let poll = std::time::Duration::from_millis(30);
         if self.reference.is_empty() {
-            ui.ctx().request_repaint();
+            // Nothing to draw until the first reference orbit is ready.
+            ui.ctx().request_repaint_after(poll);
             return;
         }
-        // Keep polling the worker while a newer reference is computing.
         if self.pending {
-            ui.ctx().request_repaint();
+            ui.ctx().request_repaint_after(poll);
         }
+
+        // Cache-texture resolution: the widget size in physical pixels.
+        let ppp = ui.ctx().pixels_per_point();
+        let size_px = [
+            ((rect.width() * ppp).round() as u32).max(1),
+            ((rect.height() * ppp).round() as u32).max(1),
+        ];
 
         let uniforms = self.make_uniforms(aspect);
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
@@ -587,6 +597,7 @@ impl FractalApp {
                 uniforms,
                 reference: Arc::clone(&self.reference),
                 generation: self.generation,
+                size_px,
             },
         ));
     }

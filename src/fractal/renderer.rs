@@ -1,10 +1,13 @@
 //! wgpu resources for the fractal: the render pipeline, the uniform buffer, the
 //! reference-orbit storage buffer, and the egui paint callback that drives them.
 //!
-//! Rendering strategy: a single fullscreen triangle is drawn into the rectangle
-//! egui allocates for the fractal widget (egui presets the render pass viewport
-//! for us). The fragment shader iterates each pixel as an f32 perturbation delta
-//! from the high-precision reference orbit stored in `ref_buffer`.
+//! Rendering strategy: the expensive per-pixel perturbation shader renders into
+//! an offscreen **cache texture**, and only when the view/coloring/size actually
+//! change (tracked by `rendered`). Every egui frame then just blits that cached
+//! texture onto egui's surface with a cheap textured fullscreen triangle — so
+//! incidental repaints (mouse-move, hover, the worker-pending poll) cost a blit,
+//! not a full fractal recompute. The fragment shader iterates each pixel as an
+//! f32 perturbation delta from the reference orbit stored in `ref_buffer`.
 
 use std::sync::Arc;
 
@@ -38,6 +41,24 @@ pub struct Uniforms {
     pub dc_offset: [f32; 2],
 }
 
+/// Offscreen texture the fractal is rendered into, plus the bind group used to
+/// blit it. Recreated whenever the widget's pixel size changes.
+struct CacheTarget {
+    view: wgpu::TextureView,
+    blit_bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+}
+
+/// State the cache texture was last rendered with. If the next frame's inputs
+/// match this, the cache is still valid and the fractal shader is skipped.
+struct RenderedState {
+    uniforms: Uniforms,
+    generation: u64,
+    width: u32,
+    height: u32,
+}
+
 pub struct FractalRenderer {
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
@@ -46,6 +67,15 @@ pub struct FractalRenderer {
     target_format: wgpu::TextureFormat,
     /// Generation of the reference orbit currently uploaded to `ref_buffer`.
     uploaded_generation: u64,
+
+    /// Blit pipeline + resources that copy the cache texture to egui's surface.
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bind_group_layout: wgpu::BindGroupLayout,
+    blit_sampler: wgpu::Sampler,
+    /// The offscreen cache; `None` until the first frame sizes it.
+    cache: Option<CacheTarget>,
+    /// What the cache currently holds; `None` forces a re-render.
+    rendered: Option<RenderedState>,
 }
 
 impl FractalRenderer {
@@ -142,6 +172,74 @@ impl FractalRenderer {
             cache: None,
         });
 
+        // Blit pipeline: samples the cache texture onto egui's surface.
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blit.wgsl").into()),
+        });
+
+        let blit_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("blit bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit pipeline layout"),
+            bind_group_layouts: &[Some(&blit_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit pipeline"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
             uniform_buffer,
@@ -149,7 +247,63 @@ impl FractalRenderer {
             bind_group,
             target_format,
             uploaded_generation: u64::MAX,
+            blit_pipeline,
+            blit_bind_group_layout,
+            blit_sampler,
+            cache: None,
+            rendered: None,
         }
+    }
+
+    /// Ensure the cache texture exists at `width`×`height`. Recreates it (and its
+    /// blit bind group) on a size change, invalidating any previous render.
+    fn ensure_cache(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if let Some(c) = &self.cache
+            && c.width == width
+            && c.height == height
+        {
+            return;
+        }
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fractal cache"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit bind group"),
+            layout: &self.blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                },
+            ],
+        });
+
+        self.cache = Some(CacheTarget {
+            view,
+            blit_bind_group,
+            width,
+            height,
+        });
+        // New texture → old render is gone.
+        self.rendered = None;
     }
 
     /// Upload a reference orbit to the storage buffer (used by PNG export to
@@ -303,39 +457,88 @@ pub fn encode_png(
 
 /// A per-frame paint callback. Carries this frame's uniforms plus a reference to
 /// the current reference orbit (cheap `Arc` clone). The orbit is only re-uploaded
-/// to the GPU when its `generation` changes.
+/// to the GPU when its `generation` changes, and the fractal is only re-rendered
+/// into the cache when the uniforms, generation, or `size_px` change.
 pub struct FractalCallback {
     pub uniforms: Uniforms,
     pub reference: Arc<Vec<[f32; 2]>>,
     pub generation: u64,
+    /// Widget size in physical pixels — the cache texture resolution.
+    pub size_px: [u32; 2],
 }
 
 impl egui_wgpu::CallbackTrait for FractalCallback {
     fn prepare(
         &self,
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
+        egui_encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        if let Some(renderer) = resources.get_mut::<FractalRenderer>() {
-            queue.write_buffer(
-                &renderer.uniform_buffer,
-                0,
-                bytemuck::bytes_of(&self.uniforms),
-            );
+        let Some(renderer) = resources.get_mut::<FractalRenderer>() else {
+            return Vec::new();
+        };
 
-            if renderer.uploaded_generation != self.generation && !self.reference.is_empty() {
-                let count = self.reference.len().min(MAX_REF_POINTS);
-                queue.write_buffer(
-                    &renderer.ref_buffer,
-                    0,
-                    bytemuck::cast_slice(&self.reference[..count]),
-                );
-                renderer.uploaded_generation = self.generation;
-            }
+        let width = self.size_px[0].max(1);
+        let height = self.size_px[1].max(1);
+        renderer.ensure_cache(device, width, height);
+
+        if renderer.uploaded_generation != self.generation && !self.reference.is_empty() {
+            let count = self.reference.len().min(MAX_REF_POINTS);
+            queue.write_buffer(
+                &renderer.ref_buffer,
+                0,
+                bytemuck::cast_slice(&self.reference[..count]),
+            );
+            renderer.uploaded_generation = self.generation;
         }
+
+        // Re-render the cache only when what it depends on changed.
+        let dirty = renderer.rendered.as_ref().is_none_or(|r| {
+            r.generation != self.generation
+                || r.width != width
+                || r.height != height
+                || bytemuck::bytes_of(&r.uniforms) != bytemuck::bytes_of(&self.uniforms)
+        });
+        if !dirty {
+            return Vec::new();
+        }
+
+        queue.write_buffer(
+            &renderer.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&self.uniforms),
+        );
+
+        if let Some(cache) = &renderer.cache {
+            let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fractal cache pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &cache.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&renderer.pipeline);
+            pass.set_bind_group(0, &renderer.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        renderer.rendered = Some(RenderedState {
+            uniforms: self.uniforms,
+            generation: self.generation,
+            width,
+            height,
+        });
         Vec::new()
     }
 
@@ -345,9 +548,11 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
         render_pass: &mut wgpu::RenderPass<'static>,
         resources: &egui_wgpu::CallbackResources,
     ) {
-        if let Some(renderer) = resources.get::<FractalRenderer>() {
-            render_pass.set_pipeline(&renderer.pipeline);
-            render_pass.set_bind_group(0, &renderer.bind_group, &[]);
+        if let Some(renderer) = resources.get::<FractalRenderer>()
+            && let Some(cache) = &renderer.cache
+        {
+            render_pass.set_pipeline(&renderer.blit_pipeline);
+            render_pass.set_bind_group(0, &cache.blit_bind_group, &[]);
             render_pass.draw(0..3, 0..1);
         }
     }
