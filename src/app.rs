@@ -143,6 +143,12 @@ pub struct FractalApp {
     /// Distance-estimation shading: darkens toward the set boundary using the
     /// orbit derivative, giving crisp filaments at deep zoom instead of speckle.
     de_coloring: bool,
+    /// Whether the controls side panel is expanded. Collapsible so the fractal
+    /// can take (nearly) the whole screen — important on a phone.
+    controls_open: bool,
+    /// Whether the app is in fullscreen (browser Fullscreen API on web, viewport
+    /// fullscreen on native). Kept in sync with the real state each frame.
+    fullscreen: bool,
 
     /// Reference orbit (`Z_n` as f32 pairs) for the current view.
     reference: Arc<Vec<[f32; 2]>>,
@@ -243,6 +249,8 @@ impl FractalApp {
             palette: 0,
             antialias: false,
             de_coloring: false,
+            controls_open: true,
+            fullscreen: false,
             reference: Arc::new(Vec::new()),
             generation: 0,
             ref_center_re,
@@ -357,9 +365,10 @@ impl FractalApp {
     /// precision the zoom needs), half-height, and a fitting iteration count.
     fn go_to_place(&mut self, re: &str, im: &str, half_height: f64, iterations: u32) {
         let bits = precision_for(half_height);
-        if let (Some(cre), Some(cim)) =
-            (big_from_decimal_str(re, bits), big_from_decimal_str(im, bits))
-        {
+        if let (Some(cre), Some(cim)) = (
+            big_from_decimal_str(re, bits),
+            big_from_decimal_str(im, bits),
+        ) {
             self.mode = FractalMode::Mandelbrot;
             self.view = ViewState::with_center(cre, cim, half_height);
             // Presets carry a hand-tuned count; don't let the auto-scaler clobber it.
@@ -686,9 +695,11 @@ impl FractalApp {
 
                 // Wait for the copy, then read the mapped bytes.
                 let (tx, rx) = std::sync::mpsc::channel();
-                er.readback().slice(..).map_async(wgpu::MapMode::Read, move |res| {
-                    let _ = tx.send(res);
-                });
+                er.readback()
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |res| {
+                        let _ = tx.send(res);
+                    });
                 let _ = device.poll(wgpu::PollType::Wait {
                     submission_index: None,
                     timeout: None,
@@ -751,9 +762,11 @@ impl FractalApp {
                 er.copy_to_readback(&device, &queue);
 
                 let (tx, rx) = futures_channel::oneshot::channel();
-                er.readback().slice(..).map_async(wgpu::MapMode::Read, move |res| {
-                    let _ = tx.send(res);
-                });
+                er.readback()
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |res| {
+                        let _ = tx.send(res);
+                    });
                 let _ = rx.await;
 
                 set_progress(&shared, "Encoding", RENDER_END);
@@ -798,6 +811,82 @@ impl FractalApp {
                 }
                 None => ctx.request_repaint(),
             }
+        }
+    }
+
+    /// Floating top-left overlay with the panel toggle and fullscreen toggle.
+    /// Always on top of the fractal, so both stay reachable when the controls
+    /// panel is collapsed (the common case on a phone).
+    fn overlay_buttons(&mut self, ui: &mut egui::Ui) {
+        egui::Area::new(egui::Id::new("overlay_buttons"))
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .shadow(egui::Shadow::NONE)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let panel_label = if self.controls_open { "Hide" } else { "Menu" };
+                            if ui
+                                .button(panel_label)
+                                .on_hover_text("Show/hide the controls panel")
+                                .clicked()
+                            {
+                                self.controls_open = !self.controls_open;
+                            }
+                            let fs_label = if self.fullscreen {
+                                "Windowed"
+                            } else {
+                                "Fullscreen"
+                            };
+                            if ui
+                                .button(fs_label)
+                                .on_hover_text("Toggle fullscreen")
+                                .clicked()
+                            {
+                                self.fullscreen = !self.fullscreen;
+                                self.apply_fullscreen(ui.ctx());
+                            }
+                        });
+                    });
+            });
+    }
+
+    /// Push the desired fullscreen state to the platform.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_fullscreen(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+    }
+
+    /// Push the desired fullscreen state to the browser. `request_fullscreen`
+    /// must run inside a user gesture; the button click provides the transient
+    /// activation that carries into this frame.
+    #[cfg(target_arch = "wasm32")]
+    fn apply_fullscreen(&mut self, _ctx: &egui::Context) {
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        if self.fullscreen {
+            if let Some(el) = doc.document_element() {
+                let _ = el.request_fullscreen();
+            }
+        } else {
+            doc.exit_fullscreen();
+        }
+    }
+
+    /// Refresh `self.fullscreen` from the real platform state, so the label is
+    /// correct even when fullscreen is left by Esc/F11 or the browser UI.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sync_fullscreen(&mut self, ctx: &egui::Context) {
+        if let Some(fs) = ctx.input(|i| i.viewport().fullscreen) {
+            self.fullscreen = fs;
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn sync_fullscreen(&mut self, _ctx: &egui::Context) {
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            self.fullscreen = doc.fullscreen_element().is_some();
         }
     }
 
@@ -928,8 +1017,10 @@ impl FractalApp {
                 .font(egui::TextStyle::Monospace),
         );
         if re_resp.lost_focus()
-            && let Some(v) =
-                big_from_decimal_str(&self.center_re_edit, parse_bits_for(&self.center_re_edit, bits))
+            && let Some(v) = big_from_decimal_str(
+                &self.center_re_edit,
+                parse_bits_for(&self.center_re_edit, bits),
+            )
         {
             self.view.center_re = v;
             self.view.sync_precision();
@@ -945,8 +1036,10 @@ impl FractalApp {
                 .font(egui::TextStyle::Monospace),
         );
         if im_resp.lost_focus()
-            && let Some(v) =
-                big_from_decimal_str(&self.center_im_edit, parse_bits_for(&self.center_im_edit, bits))
+            && let Some(v) = big_from_decimal_str(
+                &self.center_im_edit,
+                parse_bits_for(&self.center_im_edit, bits),
+            )
         {
             self.view.center_im = v;
             self.view.sync_precision();
@@ -1155,14 +1248,32 @@ impl FractalApp {
 impl eframe::App for FractalApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll_export(ui.ctx());
+        // Track the real fullscreen state (e.g. the user pressing Esc/F11 or the
+        // browser leaving fullscreen) so the toggle button label stays correct.
+        self.sync_fullscreen(ui.ctx());
 
+        // Cap the panel width so it never swallows a narrow (phone) screen, and
+        // make it collapsible + scrollable so every parameter stays reachable.
+        let panel_max = (ui.available_width() * 0.6).clamp(160.0, 340.0);
+        let mut open = self.controls_open;
         egui::Panel::right("controls")
-            .default_size(280.0)
-            .show(ui, |ui| self.controls_ui(ui));
+            .resizable(true)
+            .default_size(panel_max.min(280.0))
+            .max_size(panel_max)
+            .show_collapsible(ui, &mut open, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.controls_ui(ui));
+            });
+        self.controls_open = open;
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.fractal_ui(ui));
+
+        // Floating overlay, always reachable (even when the panel is collapsed):
+        // toggle the panel and toggle fullscreen. Essential on a phone.
+        self.overlay_buttons(ui);
 
         if std::mem::take(&mut self.export_requested) {
             self.do_export(frame);
