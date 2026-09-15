@@ -43,8 +43,10 @@ pub struct Uniforms {
     /// or reused reference (computed at a slightly different center) still maps
     /// correctly. Added to every pixel's per-pixel offset.
     pub dc_offset: [f32; 2],
+    /// 0 = escape-time coloring, 1 = distance-estimation shading.
+    pub de_coloring: u32,
     /// Padding to a 16-byte multiple (uniform buffer requirement).
-    pub _pad: [u32; 2],
+    pub _pad: u32,
 }
 
 /// Offscreen texture the fractal is rendered into, plus the bind group used to

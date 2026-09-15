@@ -133,6 +133,9 @@ pub struct FractalApp {
     palette: u32,
     /// Supersample each pixel 2×2 for smoother edges (costs ~4× fragment work).
     antialias: bool,
+    /// Distance-estimation shading: darkens toward the set boundary using the
+    /// orbit derivative, giving crisp filaments at deep zoom instead of speckle.
+    de_coloring: bool,
 
     /// Reference orbit (`Z_n` as f32 pairs) for the current view.
     reference: Arc<Vec<[f32; 2]>>,
@@ -231,6 +234,7 @@ impl FractalApp {
             color_offset: 0.0,
             palette: 0,
             antialias: false,
+            de_coloring: false,
             reference: Arc::new(Vec::new()),
             generation: 0,
             ref_center_re,
@@ -295,6 +299,9 @@ impl FractalApp {
             }
             if let Ok(spec) = std::env::var("MANDEL_VIEW") {
                 app.apply_view_spec(&spec);
+            }
+            if std::env::var("MANDEL_DE").is_ok() {
+                app.de_coloring = true;
             }
             if std::env::var("MANDEL_EXPORT").is_ok() {
                 app.export_requested = true;
@@ -573,7 +580,8 @@ impl FractalApp {
             kind: self.kind.shader_id(),
             power: self.power,
             dc_offset: self.dc_offset(),
-            _pad: [0, 0],
+            de_coloring: self.de_coloring as u32,
+            _pad: 0,
         }
     }
 
@@ -857,6 +865,12 @@ impl FractalApp {
             });
         ui.checkbox(&mut self.antialias, "Antialiasing (2×2)")
             .on_hover_text("Supersample each pixel for smoother edges (~4× slower).");
+        ui.checkbox(&mut self.de_coloring, "Distance shading")
+            .on_hover_text(
+                "Shade by distance to the set boundary (from the orbit derivative) \
+                 for crisp filaments at deep zoom. Exact for Mandelbrot/Multibrot, \
+                 approximate for Burning Ship/Tricorn.",
+            );
 
         ui.separator();
         // Editable center coordinates. Shown at full precision; parsed

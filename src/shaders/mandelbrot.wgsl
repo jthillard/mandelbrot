@@ -27,6 +27,8 @@ struct Uniforms {
     // Exponent for the Multibrot kind.
     power: u32,
     dc_offset: vec2<f32>,
+    // 0 = escape-time coloring, 1 = distance-estimation shading.
+    de_coloring: u32,
 };
 
 const KIND_MANDELBROT: u32 = 0u;
@@ -130,6 +132,23 @@ fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
     return 2.0 * cmul(z, e) + cmul(e, e); // Mandelbrot
 }
 
+// Derivative f'(Z) of the iteration map at the full value Z, used to propagate
+// the orbit derivative for distance-estimation shading. Exact for the
+// holomorphic kinds (z^2 -> 2Z, z^p -> p Z^{p-1}); for the non-holomorphic
+// Burning Ship / Tricorn we use |f'| ~ |2Z|, which keeps the DE magnitude close
+// enough to de-speckle filaments.
+fn fprime(z: vec2<f32>) -> vec2<f32> {
+    if (u.kind == KIND_MULTIBROT) {
+        let p = clamp(u.power, 2u, 8u);
+        var zk = vec2<f32>(1.0, 0.0); // Z^0
+        for (var k: u32 = 1u; k < p; k = k + 1u) {
+            zk = cmul(zk, z); // -> Z^{p-1}
+        }
+        return f32(p) * zk;
+    }
+    return 2.0 * z;
+}
+
 // Smooth cyclic palettes (Inigo Quilez cosine palettes), selected by id.
 fn palette(id: u32, t: f32) -> vec3<f32> {
     if (id == 4u) {
@@ -155,14 +174,20 @@ fn palette(id: u32, t: f32) -> vec3<f32> {
 // step (delta starts at 0); for Julia it is the z-plane offset that seeds the
 // initial delta (c is fixed, so nothing is added per step). Interior pixels
 // return black.
-fn shade(offset: vec2<f32>) -> vec3<f32> {
+fn shade(offset: vec2<f32>, px: f32) -> vec3<f32> {
     let z0 = ref_orbit[0]; // reference start (0 for Mandelbrot, center for Julia)
 
     var step_add = offset;
     var e = vec2<f32>(0.0, 0.0);
+    // Orbit derivative for distance estimation. For the set plane it is d/dc
+    // (starts at 0, gains +1 each step); for Julia it is d/dz0 (starts at 1).
+    var dz = vec2<f32>(0.0, 0.0);
+    var dz_seed = vec2<f32>(1.0, 0.0);
     if (u.is_julia != 0u) {
         step_add = vec2<f32>(0.0, 0.0);
         e = offset;
+        dz = vec2<f32>(1.0, 0.0);
+        dz_seed = vec2<f32>(0.0, 0.0);
     }
 
     var m: u32 = 0u;              // reference index; invariant: y_n = X[m] + e
@@ -181,6 +206,12 @@ fn shade(offset: vec2<f32>) -> vec3<f32> {
         }
         if (n >= u.max_iter) {
             break; // interior
+        }
+
+        // Propagate the derivative of the full orbit (unaffected by rebasing,
+        // which only re-expresses the same value). Only when DE is enabled.
+        if (u.de_coloring != 0u) {
+            dz = cmul(fprime(z), dz) + dz_seed;
         }
 
         // Advance the delta by this fractal's formula (+ dc for the set plane).
@@ -209,8 +240,10 @@ fn shade(offset: vec2<f32>) -> vec3<f32> {
         return vec3<f32>(0.0, 0.0, 0.0); // interior of the set
     }
 
+    let z2 = dot(z, z);
+
     // Continuous (smooth) iteration count.
-    let log_zn = 0.5 * log(max(dot(z, z), 1.0));
+    let log_zn = 0.5 * log(max(z2, 1.0));
     let nu = log2(log_zn / log(2.0));
     let smooth_i = f32(n) + 1.0 - nu;
 
@@ -218,22 +251,38 @@ fn shade(offset: vec2<f32>) -> vec3<f32> {
     // varies smoothly instead of aliasing into speckle.
     let ci = sqrt(max(smooth_i, 0.0));
     let t = fract(ci * u.color_scale + u.color_offset);
-    return palette(u.palette_id, t);
+    var col = palette(u.palette_id, t);
+
+    if (u.de_coloring != 0u) {
+        // Exterior distance estimate (complex-plane units): |z|·ln|z| / |dz|.
+        // Divided by the pixel footprint it becomes a distance in pixels; we
+        // darken toward the boundary (< ~1 px away) so filaments stay crisp
+        // instead of aliasing into speckle. If |dz| overflowed, de -> 0 and the
+        // boundary simply reads as dark, which is the correct limit.
+        let zmag = sqrt(max(z2, 1.0));
+        let dzmag = sqrt(max(dot(dz, dz), 1e-20));
+        let de = zmag * log(zmag) / dzmag;
+        let de_px = de / max(px, 1e-30);
+        col = col * clamp(de_px, 0.0, 1.0);
+    }
+    return col;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let base = in.centered * u.span + u.dc_offset;
 
-    let aa = max(u.aa_level, 1u);
-    if (aa <= 1u) {
-        return vec4<f32>(shade(base), 1.0);
-    }
-
-    // Screen-space complex-units-per-pixel, used to place sub-pixel samples.
-    // Derivatives must be evaluated in uniform control flow, so take them here.
+    // Screen-space complex-units-per-pixel. Derivatives must be evaluated in
+    // uniform control flow, so take them here; used to place sub-pixel AA
+    // samples and to convert the distance estimate into pixels.
     let dx = dpdx(base);
     let dy = dpdy(base);
+    let px = length(abs(dx) + abs(dy)); // ~ complex units per pixel (footprint)
+
+    let aa = max(u.aa_level, 1u);
+    if (aa <= 1u) {
+        return vec4<f32>(shade(base, px), 1.0);
+    }
 
     var acc = vec3<f32>(0.0, 0.0, 0.0);
     let inv = 1.0 / f32(aa);
@@ -242,7 +291,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             // Sample centers evenly spread across the pixel, jitter in (-0.5, 0.5).
             let jx = (f32(sx) + 0.5) * inv - 0.5;
             let jy = (f32(sy) + 0.5) * inv - 0.5;
-            acc = acc + shade(base + jx * dx + jy * dy);
+            acc = acc + shade(base + jx * dx + jy * dy, px);
         }
     }
     return vec4<f32>(acc / f32(aa * aa), 1.0);
