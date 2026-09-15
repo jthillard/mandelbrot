@@ -124,6 +124,10 @@ pub struct FractalApp {
     power: u32,
     julia_c: (f64, f64),
     max_iterations: u32,
+    /// When set, `max_iterations` tracks the zoom depth automatically (so deep
+    /// zooms stay sharp without hand-tuning); the manual slider takes over when
+    /// unset. Turned off when a preset or share link supplies an explicit count.
+    auto_iterations: bool,
     color_scale: f32,
     color_offset: f32,
     palette: u32,
@@ -222,6 +226,7 @@ impl FractalApp {
             power: 3,
             julia_c: (-0.8, 0.156),
             max_iterations: 512,
+            auto_iterations: true,
             color_scale: 0.15,
             color_offset: 0.0,
             palette: 0,
@@ -338,8 +343,19 @@ impl FractalApp {
         {
             self.mode = FractalMode::Mandelbrot;
             self.view = ViewState::with_center(cre, cim, half_height);
+            // Presets carry a hand-tuned count; don't let the auto-scaler clobber it.
+            self.auto_iterations = false;
             self.max_iterations = iterations.clamp(32, MAX_REF_POINTS as u32 - 1);
         }
+    }
+
+    /// Iteration count scaled to the current zoom depth, used while
+    /// `auto_iterations` is on. Grows roughly linearly with zoom decades so deep
+    /// zooms keep enough iterations to stay sharp instead of banding.
+    fn auto_iteration_count(&self) -> u32 {
+        let decades = self.view.magnification().log10().max(0.0);
+        let iters = 400.0 + 900.0 * decades;
+        (iters.round() as u32).clamp(200, MAX_REF_POINTS as u32 - 1)
     }
 
     /// Snapshot the current view as a shareable state.
@@ -348,6 +364,7 @@ impl FractalApp {
         ShareState {
             julia: matches!(self.mode, FractalMode::Julia),
             kind: self.kind,
+            power: self.power,
             center_re: big_to_decimal_str(&self.view.center_re, sig_digits),
             center_im: big_to_decimal_str(&self.view.center_im, sig_digits),
             half_height: self.view.half_height,
@@ -355,6 +372,7 @@ impl FractalApp {
             julia_c: self.julia_c,
             color_scale: self.color_scale,
             color_offset: self.color_offset,
+            palette: self.palette,
         }
     }
 
@@ -366,9 +384,14 @@ impl FractalApp {
             FractalMode::Mandelbrot
         };
         self.kind = s.kind;
+        self.power = s.power.clamp(2, 8);
         self.julia_c = s.julia_c;
         self.color_scale = s.color_scale;
         self.color_offset = s.color_offset;
+        self.palette = (s.palette as usize).min(PALETTE_NAMES.len() - 1) as u32;
+        // The link carries an explicit iteration count; honor it rather than
+        // letting the auto-scaler immediately overwrite it.
+        self.auto_iterations = false;
         self.max_iterations = s.iterations.clamp(32, MAX_REF_POINTS as u32 - 1);
         let bits = precision_for(s.half_height);
         if let (Some(re), Some(im)) = (
@@ -808,11 +831,17 @@ impl FractalApp {
         }
 
         ui.separator();
-        ui.add(
-            egui::Slider::new(&mut self.max_iterations, 32..=100_000)
-                .text("iterations")
-                .logarithmic(true),
-        );
+        ui.checkbox(&mut self.auto_iterations, "Auto iterations")
+            .on_hover_text("Scale the iteration count with zoom depth so deep zooms stay sharp.");
+        if self.auto_iterations {
+            ui.label(format!("iterations: {} (auto)", self.max_iterations));
+        } else {
+            ui.add(
+                egui::Slider::new(&mut self.max_iterations, 32..=100_000)
+                    .text("iterations")
+                    .logarithmic(true),
+            );
+        }
         ui.add(
             egui::Slider::new(&mut self.color_scale, 0.01..=1.0)
                 .text("color scale")
@@ -1004,6 +1033,11 @@ impl FractalApp {
                 .zoom_at_pixel(off.x as f64, off.y as f64, height_px, factor);
             interacted = true;
             ui.ctx().request_repaint();
+        }
+
+        // Keep the iteration count matched to the zoom depth while auto is on.
+        if self.auto_iterations {
+            self.max_iterations = self.auto_iteration_count();
         }
 
         self.ensure_reference();
