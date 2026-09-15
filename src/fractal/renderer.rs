@@ -61,6 +61,7 @@ struct RenderedState {
 
 pub struct FractalRenderer {
     pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
     ref_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -242,6 +243,7 @@ impl FractalRenderer {
 
         Self {
             pipeline,
+            bind_group_layout,
             uniform_buffer,
             ref_buffer,
             bind_group,
@@ -306,37 +308,85 @@ impl FractalRenderer {
         self.rendered = None;
     }
 
-    /// Upload a reference orbit to the storage buffer (used by PNG export to
-    /// guarantee the buffer is current before an offscreen render).
-    pub fn upload_reference(&self, queue: &wgpu::Queue, points: &[[f32; 2]]) {
-        let count = points.len().min(MAX_REF_POINTS);
-        if count > 0 {
-            queue.write_buffer(&self.ref_buffer, 0, bytemuck::cast_slice(&points[..count]));
-        }
-    }
-
-    /// True if the render target stores bytes as BGRA (so a PNG needs R/B
-    /// swapped). Surfaces are usually `Bgra8UnormSrgb`.
-    pub fn needs_rb_swap(&self) -> bool {
-        matches!(
+    /// Handles needed to build a standalone [`ExportRender`] off the UI thread:
+    /// the (immutable) pipeline and its bind-group layout, plus the target
+    /// format. Cloned so the caller can drop the render-state lock before use.
+    pub fn export_handles(&self) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::TextureFormat) {
+        (
+            self.pipeline.clone(),
+            self.bind_group_layout.clone(),
             self.target_format,
-            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
         )
     }
+}
 
-    /// Render the current fractal (using `uniforms` and the already-uploaded
-    /// reference orbit) into an offscreen texture at `width`x`height`, then copy
-    /// it into a mappable buffer. Returns the buffer and its padded row stride.
-    /// The caller maps the buffer (blocking on native, async on web).
-    pub fn render_to_readback(
-        &self,
+/// A self-contained render of one export image. It owns its own uniform and
+/// reference buffers (a snapshot of the view at export time), so it is unaffected
+/// by panning/zooming on the main thread, and can run on a background thread.
+/// The image is rendered in horizontal tiles so progress can be reported as the
+/// GPU works through it.
+pub struct ExportRender {
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    readback: wgpu::Buffer,
+    /// Padded bytes-per-row of the readback buffer.
+    pub padded_bpr: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Number of horizontal tiles the render is split into.
+    pub tiles: u32,
+    pub swap_rb: bool,
+}
+
+impl ExportRender {
+    /// Allocate the export's dedicated GPU resources and upload the snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        pipeline: wgpu::RenderPipeline,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        target_format: wgpu::TextureFormat,
         width: u32,
         height: u32,
         uniforms: Uniforms,
-    ) -> (wgpu::Buffer, u32) {
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        reference: &[[f32; 2]],
+    ) -> Self {
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("export uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        let count = reference.len().min(MAX_REF_POINTS);
+        let ref_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("export reference orbit"),
+            size: (count.max(1) * std::mem::size_of::<[f32; 2]>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if count > 0 {
+            queue.write_buffer(&ref_buffer, 0, bytemuck::cast_slice(&reference[..count]));
+        }
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("export bind group"),
+            layout: bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ref_buffer.as_entire_binding(),
+                },
+            ],
+        });
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("export target"),
@@ -348,16 +398,14 @@ impl FractalRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: self.target_format,
+            format: target_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let unpadded_bpr = width * 4;
-        let padded_bpr = unpadded_bpr.div_ceil(align) * align;
-
+        let padded_bpr = (width * 4).div_ceil(align) * align;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("export readback"),
             size: (padded_bpr * height) as u64,
@@ -365,18 +413,62 @@ impl FractalRenderer {
             mapped_at_creation: false,
         });
 
+        // ~128px bands, kept to a sane range so progress is smooth without too
+        // many submissions.
+        let tiles = (height / 128).clamp(8, 64).min(height.max(1));
+
+        let swap_rb = matches!(
+            target_format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+
+        Self {
+            pipeline,
+            bind_group,
+            texture,
+            view,
+            readback,
+            padded_bpr,
+            width,
+            height,
+            tiles,
+            swap_rb,
+        }
+    }
+
+    /// Pixel row range `[y0, y1)` covered by tile `t`.
+    fn tile_rows(&self, t: u32) -> (u32, u32) {
+        let band = self.height.div_ceil(self.tiles);
+        let y0 = (t * band).min(self.height);
+        let y1 = (y0 + band).min(self.height);
+        (y0, y1)
+    }
+
+    /// Render one horizontal tile into the export texture and submit it. Tile 0
+    /// clears the whole attachment; later tiles preserve earlier ones.
+    pub fn render_tile(&self, device: &wgpu::Device, queue: &wgpu::Queue, t: u32) {
+        let (y0, y1) = self.tile_rows(t);
+        if y1 <= y0 {
+            return;
+        }
+        let load = if t == 0 {
+            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+        } else {
+            wgpu::LoadOp::Load
+        };
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("export"),
+            label: Some("export tile"),
         });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("export pass"),
+                label: Some("export tile pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -385,35 +477,48 @@ impl FractalRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            // Full-viewport triangle (so pixel→plane mapping matches the whole
+            // image), scissored to this tile's rows.
+            pass.set_scissor_rect(0, y0, self.width, y1 - y0);
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        queue.submit(std::iter::once(encoder.finish()));
+    }
 
+    /// Copy the finished texture into the mappable readback buffer and submit.
+    pub fn copy_to_readback(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("export copy"),
+        });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &texture,
+                texture: &self.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
+                buffer: &self.readback,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(padded_bpr),
-                    rows_per_image: Some(height),
+                    bytes_per_row: Some(self.padded_bpr),
+                    rows_per_image: Some(self.height),
                 },
             },
             wgpu::Extent3d {
-                width,
-                height,
+                width: self.width,
+                height: self.height,
                 depth_or_array_layers: 1,
             },
         );
-
         queue.submit(std::iter::once(encoder.finish()));
-        (readback, padded_bpr)
+    }
+
+    /// The mappable readback buffer (valid after [`copy_to_readback`]).
+    pub fn readback(&self) -> &wgpu::Buffer {
+        &self.readback
     }
 }
 

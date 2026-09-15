@@ -4,7 +4,9 @@ use eframe::CreationContext;
 use eframe::egui_wgpu;
 use eframe::egui_wgpu::wgpu;
 
-use crate::fractal::{FractalCallback, FractalRenderer, MAX_REF_POINTS, ShareState, Uniforms};
+use crate::fractal::{
+    ExportRender, FractalCallback, FractalRenderer, MAX_REF_POINTS, ShareState, Uniforms,
+};
 #[cfg(target_arch = "wasm32")]
 use crate::fractal::{compute_mandelbrot_reference, compute_reference};
 use crate::view::{
@@ -502,16 +504,15 @@ impl FractalApp {
 
         let device = rs.device.clone();
         let queue = rs.queue.clone();
-        let (buffer, padded_bpr, swap) = {
+        let (pipeline, bind_group_layout, format) = {
             let guard = rs.renderer.read();
             let Some(renderer) = guard.callback_resources.get::<FractalRenderer>() else {
                 self.status = Some("export unavailable".into());
                 return;
             };
-            renderer.upload_reference(&queue, &self.reference);
-            let (buffer, bpr) = renderer.render_to_readback(&device, &queue, w, h, uniforms);
-            (buffer, bpr, renderer.needs_rb_swap())
+            renderer.export_handles()
         };
+        let reference = Arc::clone(&self.reference);
 
         let shared = Arc::new(Mutex::new(ExportShared {
             fraction: 0.0,
@@ -521,14 +522,42 @@ impl FractalApp {
         self.status = None;
         self.export = Some(Arc::clone(&shared));
 
+        // Progress budget: rendering fills [0, RENDER_END], encoding the rest.
+        const RENDER_END: f32 = 0.6;
+
         #[cfg(not(target_arch = "wasm32"))]
         {
             let name = std::env::var("MANDEL_EXPORT_PATH")
                 .unwrap_or_else(|_| format!("fractal-{}.png", unix_timestamp()));
             std::thread::spawn(move || {
-                // Wait for the GPU render + copy, then read the mapped bytes.
+                let er = ExportRender::new(
+                    &device,
+                    &queue,
+                    pipeline,
+                    &bind_group_layout,
+                    format,
+                    w,
+                    h,
+                    uniforms,
+                    reference.as_slice(),
+                );
+
+                // Render the image tile by tile, waiting for each so progress
+                // reflects real GPU work.
+                for t in 0..er.tiles {
+                    er.render_tile(&device, &queue, t);
+                    let _ = device.poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    });
+                    let done = (t + 1) as f32 / er.tiles as f32;
+                    set_progress(&shared, "Rendering", RENDER_END * done);
+                }
+                er.copy_to_readback(&device, &queue);
+
+                // Wait for the copy, then read the mapped bytes.
                 let (tx, rx) = std::sync::mpsc::channel();
-                buffer.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+                er.readback().slice(..).map_async(wgpu::MapMode::Read, move |res| {
                     let _ = tx.send(res);
                 });
                 let _ = device.poll(wgpu::PollType::Wait {
@@ -537,20 +566,26 @@ impl FractalApp {
                 });
                 let _ = rx.recv();
 
-                set_progress(&shared, "Encoding", 0.02);
+                set_progress(&shared, "Encoding", RENDER_END);
                 let png = {
-                    let data = buffer
+                    let data = er
+                        .readback()
                         .slice(..)
                         .get_mapped_range()
                         .expect("map readback buffer");
                     let sh = Arc::clone(&shared);
-                    crate::fractal::encode_png_with_progress(&data, w, h, padded_bpr, swap, |f| {
-                        set_progress(&sh, "Encoding", 0.02 + 0.93 * f);
-                    })
+                    crate::fractal::encode_png_with_progress(
+                        &data,
+                        er.width,
+                        er.height,
+                        er.padded_bpr,
+                        er.swap_rb,
+                        |f| set_progress(&sh, "Encoding", RENDER_END + (0.97 - RENDER_END) * f),
+                    )
                 };
-                buffer.unmap();
+                er.readback().unmap();
 
-                set_progress(&shared, "Saving", 0.97);
+                set_progress(&shared, "Saving", 0.98);
                 let result = std::fs::write(&name, &png)
                     .map(|_| format!("saved {name} ({w}×{h})"))
                     .map_err(|e| format!("save failed: {e}"));
@@ -560,26 +595,58 @@ impl FractalApp {
         #[cfg(target_arch = "wasm32")]
         {
             wasm_bindgen_futures::spawn_local(async move {
+                let er = ExportRender::new(
+                    &device,
+                    &queue,
+                    pipeline,
+                    &bind_group_layout,
+                    format,
+                    w,
+                    h,
+                    uniforms,
+                    reference.as_slice(),
+                );
+
+                // Render tile by tile, awaiting each submission so the browser
+                // executes it and the UI can repaint between tiles.
+                for t in 0..er.tiles {
+                    er.render_tile(&device, &queue, t);
+                    let (tx, rx) = futures_channel::oneshot::channel();
+                    queue.on_submitted_work_done(move || {
+                        let _ = tx.send(());
+                    });
+                    let _ = rx.await;
+                    let done = (t + 1) as f32 / er.tiles as f32;
+                    set_progress(&shared, "Rendering", RENDER_END * done);
+                }
+                er.copy_to_readback(&device, &queue);
+
                 let (tx, rx) = futures_channel::oneshot::channel();
-                buffer.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+                er.readback().slice(..).map_async(wgpu::MapMode::Read, move |res| {
                     let _ = tx.send(res);
                 });
                 let _ = rx.await;
 
-                set_progress(&shared, "Encoding", 0.02);
+                set_progress(&shared, "Encoding", RENDER_END);
                 let png = {
-                    let data = buffer
+                    let data = er
+                        .readback()
                         .slice(..)
                         .get_mapped_range()
                         .expect("map readback buffer");
                     let sh = Arc::clone(&shared);
-                    crate::fractal::encode_png_with_progress(&data, w, h, padded_bpr, swap, |f| {
-                        set_progress(&sh, "Encoding", 0.02 + 0.93 * f);
-                    })
+                    crate::fractal::encode_png_with_progress(
+                        &data,
+                        er.width,
+                        er.height,
+                        er.padded_bpr,
+                        er.swap_rb,
+                        |f| set_progress(&sh, "Encoding", RENDER_END + (0.97 - RENDER_END) * f),
+                    )
                 };
-                buffer.unmap();
+                er.readback().unmap();
 
-                set_progress(&shared, "Saving", 0.97);
+                set_progress(&shared, "Saving", 0.98);
                 web_download_png(&png, "fractal.png");
                 finish_export(&shared, Ok(format!("downloaded {w}×{h}")));
             });
