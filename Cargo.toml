@@ -8,7 +8,6 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 dashu-float = "0.6.0"
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "accesskit"] }
 egui = "0.36.2"
-futures-channel = { version = "0.3.34", default-features = false, features = ["alloc", "std"] }
 log = "0.4.34"
 png = "0.18.1"
 
@@ -16,6 +15,7 @@ png = "0.18.1"
 env_logger = "0.11.11"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-channel = { version = "0.3.34", default-features = false, features = ["alloc", "std"] }
 console_error_panic_hook = "0.1.7"
 console_log = "1.1.0"
 js-sys = "0.3.105"
@@ -26,6 +26,7 @@ web-sys = { version = "0.3.105", features = ["Window", "Location", "Url", "UrlSe
 # Release: optimize hard (fractal math is hot).
 [profile.release]
 opt-level = 3
+codegen-units = 1
 
 # Dev: keep our own crate debuggable, but optimize dependencies (dashu, wgpu,
 # egui) so the explorer is actually interactive during development.

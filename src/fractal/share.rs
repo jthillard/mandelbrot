@@ -33,16 +33,19 @@ impl ShareState {
     pub fn encode(&self) -> String {
         let mut s = String::new();
         s.push_str(if self.julia { "m=j" } else { "m=m" });
-        s.push_str(&format!("&f={}", match self.kind {
-            FractalKind::Mandelbrot => "mandel",
-            FractalKind::BurningShip => "burning",
-            FractalKind::Multibrot => "multi",
-            FractalKind::Tricorn => "tricorn",
-            FractalKind::Celtic => "celtic",
-            FractalKind::Perpendicular => "perp",
-            FractalKind::Buffalo => "buffalo",
-            FractalKind::Phoenix => "phoenix",
-        }));
+        s.push_str(&format!(
+            "&f={}",
+            match self.kind {
+                FractalKind::Mandelbrot => "mandel",
+                FractalKind::BurningShip => "burning",
+                FractalKind::Multibrot => "multi",
+                FractalKind::Tricorn => "tricorn",
+                FractalKind::Celtic => "celtic",
+                FractalKind::Perpendicular => "perp",
+                FractalKind::Buffalo => "buffalo",
+                FractalKind::Phoenix => "phoenix",
+            }
+        ));
         s.push_str(&format!("&pw={}", self.power));
         s.push_str(&format!(
             "&re={}&im={}&hh={}&it={}",
@@ -79,7 +82,7 @@ impl ShareState {
                     "perp" => FractalKind::Perpendicular,
                     "buffalo" => FractalKind::Buffalo,
                     "phoenix" => FractalKind::Phoenix,
-                    _ => FractalKind::Mandelbrot
+                    _ => FractalKind::Mandelbrot,
                 })
                 .unwrap_or(FractalKind::Mandelbrot),
             power: map.get("pw").and_then(|s| s.parse().ok()).unwrap_or(2),

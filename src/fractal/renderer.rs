@@ -88,7 +88,7 @@ pub struct Uniforms {
 /// pixel size changes:
 /// * `data_view` — the iteration pass's output (see [`DATA_FORMAT`]).
 /// * `color_view` — the colourise pass's output; the blit source.
-/// plus the bind groups that read them.
+///   plus the bind groups that read them.
 struct CacheTarget {
     data_view: wgpu::TextureView,
     color_view: wgpu::TextureView,
