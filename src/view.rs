@@ -82,7 +82,7 @@ impl ViewState {
         let bits = self.precision_bits();
         // Grab-and-drag: moving the mouse right shows content to the left.
         self.center_re = &self.center_re - &big_from_f64(dx * cpp, bits);
-        self.center_im = &self.center_im - &big_from_f64(dy * cpp, bits); // y-down -> imag-up
+        self.center_im = &self.center_im - &big_from_f64(dy * cpp, bits);
     }
 
     /// Zoom by `factor` (<1 zooms in) keeping the complex point currently under
@@ -97,7 +97,7 @@ impl ViewState {
         // off * cpp * (1 - factor). (Derivation: new_c = fixed + (c-fixed)*f.)
         let k = cpp * (1.0 - factor);
         self.center_re = &self.center_re + &big_from_f64(off_x * k, bits);
-        self.center_im = &self.center_im + &big_from_f64(off_y * k, bits); // y flip
+        self.center_im = &self.center_im + &big_from_f64(off_y * k, bits);
         self.half_height *= factor;
     }
 

@@ -5,8 +5,8 @@ use eframe::egui_wgpu;
 use eframe::egui_wgpu::wgpu;
 
 use crate::fractal::{
-    ExportRender, FractalCallback, FractalKind, FractalRenderer, MAX_REF_POINTS, ShareState,
-    Uniforms,
+    BuddhabrotCallback, BuddhabrotRenderer, BuddhabrotUniforms, ExportRender, FractalCallback,
+    FractalKind, FractalRenderer, MAX_REF_POINTS, ShareState, Uniforms,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::fractal::{compute_reference, compute_set_reference};
@@ -29,6 +29,8 @@ const INTERACT_DOWNSCALE: u32 = 2;
 const INTERACT_SETTLE: f64 = 0.12;
 /// Palette names; index maps to `palette_id` in the shader.
 const PALETTE_NAMES: &[&str] = &["Amber", "Rainbow", "Ember", "Lime", "Grayscale"];
+/// Buddhabrot tonemap style names; index maps to `BuddhabrotUniforms::palette`.
+const BUDDHA_PALETTE_NAMES: &[&str] = &["Nebula", "Yellow", "Grayscale"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FractalMode {
@@ -265,6 +267,23 @@ pub struct FractalApp {
     /// Distance-estimation shading: darkens toward the set boundary using the
     /// orbit derivative, giving crisp filaments at deep zoom instead of speckle.
     de_coloring: bool,
+
+    /// Render as a Buddhabrot (Monte-Carlo orbit-density histogram) instead of
+    /// the ordinary escape-time set. Plain f32 view — no deep zoom, no
+    /// perturbation/reference-orbit machinery (see `fractal::buddhabrot`).
+    buddhabrot: bool,
+    /// Nested escape-iteration caps for the R/G/B histogram channels
+    /// (Nebulabrot coloring); kept ordered r <= g <= b by the UI.
+    buddha_r_cap: u32,
+    buddha_g_cap: u32,
+    buddha_b_cap: u32,
+    /// Tonemap brightness multiplier.
+    buddha_exposure: f32,
+    /// Tonemap colour style (index into `BUDDHA_PALETTE_NAMES`).
+    buddha_palette: u32,
+    /// Keep dispatching new sample batches every frame (progressive
+    /// accumulation). Turning it off freezes the current histogram.
+    buddha_accumulate: bool,
     /// Whether the controls side panel is expanded. Collapsible so the fractal
     /// can take (nearly) the whole screen — important on a phone.
     controls_open: bool,
@@ -352,11 +371,13 @@ impl FractalApp {
             .expect("eframe must run with the wgpu backend");
 
         let renderer = FractalRenderer::new(&render_state.device, render_state.target_format);
-        render_state
-            .renderer
-            .write()
-            .callback_resources
-            .insert(renderer);
+        let buddhabrot_renderer =
+            BuddhabrotRenderer::new(&render_state.device, render_state.target_format);
+        {
+            let mut guard = render_state.renderer.write();
+            guard.callback_resources.insert(renderer);
+            guard.callback_resources.insert(buddhabrot_renderer);
+        }
 
         let view = ViewState::default();
         let ref_center_re = view.center_re.clone();
@@ -382,6 +403,13 @@ impl FractalApp {
             palette: 0,
             antialias: false,
             de_coloring: false,
+            buddhabrot: false,
+            buddha_r_cap: 50,
+            buddha_g_cap: 500,
+            buddha_b_cap: 2000,
+            buddha_exposure: 1.0,
+            buddha_palette: 0,
+            buddha_accumulate: true,
             controls_open: true,
             fullscreen: false,
             anim: AnimState::default(),
@@ -459,6 +487,14 @@ impl FractalApp {
             }
             if std::env::var("MANDEL_DE").is_ok() {
                 app.de_coloring = true;
+            }
+            if std::env::var("MANDEL_BUDDHABROT").is_ok() {
+                app.buddhabrot = true;
+            }
+            if let Ok(p) = std::env::var("MANDEL_BUDDHA_PALETTE")
+                && let Ok(p) = p.trim().parse::<u32>()
+            {
+                app.buddha_palette = p.min(BUDDHA_PALETTE_NAMES.len() as u32 - 1);
             }
             if std::env::var("MANDEL_EXPORT").is_ok() {
                 app.export_requested = true;
@@ -777,12 +813,47 @@ impl FractalApp {
         }
     }
 
+    /// Buddhabrot pass uniforms. Unlike `make_uniforms`, the view center is
+    /// collapsed straight to f32 (no arbitrary-precision reference orbit) —
+    /// Buddhabrot mode doesn't support deep zoom (see `fractal::buddhabrot`).
+    fn make_buddhabrot_uniforms(&self, aspect: f64) -> BuddhabrotUniforms {
+        let center = [
+            self.view.center_re.to_f64().value() as f32,
+            self.view.center_im.to_f64().value() as f32,
+        ];
+        BuddhabrotUniforms {
+            center,
+            half_height: self.view.half_height as f32,
+            aspect: aspect as f32,
+            phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
+            lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
+            bailout_sq: BAILOUT_SQ,
+            kind: self.kind as u32,
+            power: self.power,
+            r_cap: self.buddha_r_cap,
+            g_cap: self.buddha_g_cap,
+            b_cap: self.buddha_b_cap,
+            seed: 0,               // set by the callback's own dispatch counter
+            samples_this_dispatch: 0, // set by the callback
+            exposure: self.buddha_exposure,
+            width: 0,  // set by the callback from size_px
+            height: 0, // set by the callback from size_px
+            total_samples: 0.0, // tracked by the renderer across frames
+            palette: self.buddha_palette,
+            _pad: [0; 3],
+        }
+    }
+
     /// Render the current view to a PNG at `export_scale` × the on-screen size,
     /// then save it (native: file in cwd; web: browser download). Runs off the
     /// UI thread so a progress bar can animate; progress lands in `self.export`.
     fn do_export(&mut self, frame: &mut eframe::Frame) {
         if self.export.is_some() {
             return; // one export at a time
+        }
+        if self.buddhabrot {
+            self.status = Some("PNG export isn't available in Buddhabrot mode yet".into());
+            return;
         }
         let Some(rs) = frame.wgpu_render_state() else {
             self.status = Some("export unavailable (no wgpu backend)".into());
@@ -1195,6 +1266,24 @@ impl FractalApp {
             self.view = Self::default_view_for(self.mode, self.kind);
         }
 
+        ui.checkbox(&mut self.buddhabrot, "Buddhabrot")
+            .on_hover_text(
+                "Monte-Carlo density of escaping orbits instead of the ordinary \
+                 escape-time set. Plain f32 view (no deep zoom); the image \
+                 progressively sharpens while the view stays still.",
+            );
+
+        if self.buddhabrot {
+            self.buddhabrot_ui(ui);
+            ui.separator();
+            if ui.button("Reset view").clicked() {
+                self.view = Self::default_view_for(self.mode, self.kind);
+            }
+            ui.add_space(8.0);
+            ui.small("Drag to pan · scroll to zoom toward the cursor");
+            return;
+        }
+
         ui.horizontal(|ui| {
             ui.radio_value(&mut self.mode, FractalMode::Mandelbrot, "Set");
             ui.radio_value(&mut self.mode, FractalMode::Julia, "Julia");
@@ -1484,6 +1573,48 @@ impl FractalApp {
         ui.small("Drag to pan · scroll to zoom toward the cursor");
     }
 
+    /// Controls for Buddhabrot mode: nested iteration caps (Nebulabrot R/G/B
+    /// coloring), exposure, and the progressive-accumulation toggle.
+    fn buddhabrot_ui(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.add(
+            egui::Slider::new(&mut self.buddha_r_cap, 5..=5_000)
+                .text("red cap")
+                .logarithmic(true),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.buddha_g_cap, 5..=20_000)
+                .text("green cap")
+                .logarithmic(true),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.buddha_b_cap, 5..=50_000)
+                .text("blue cap")
+                .logarithmic(true),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.buddha_exposure, 0.02..=50.0)
+                .text("exposure")
+                .logarithmic(true),
+        );
+        egui::ComboBox::from_label("colors")
+            .selected_text(BUDDHA_PALETTE_NAMES[self.buddha_palette as usize])
+            .show_ui(ui, |ui| {
+                for (i, name) in BUDDHA_PALETTE_NAMES.iter().enumerate() {
+                    ui.selectable_value(&mut self.buddha_palette, i as u32, *name);
+                }
+            });
+        ui.checkbox(&mut self.buddha_accumulate, "Keep sampling")
+            .on_hover_text("Dispatch a fresh batch of random samples every frame.");
+        if self.view.magnification() > 1.0e5 {
+            ui.colored_label(
+                egui::Color32::LIGHT_YELLOW,
+                "deep zoom isn't supported here (f32 precision only)",
+            );
+        }
+        ui.small("PNG export isn't available in Buddhabrot mode yet.");
+    }
+
     fn fractal_ui(&mut self, ui: &mut egui::Ui) {
         let size = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
@@ -1542,6 +1673,31 @@ impl FractalApp {
                 .zoom_at_pixel(off.x as f64, off.y as f64, height_px, factor);
             interacted = true;
             ui.ctx().request_repaint();
+        }
+
+        if self.buddhabrot {
+            // No reference orbit / perturbation machinery: iterate directly in
+            // f32 from the live view. Progressive accumulation means this
+            // needs its own continuous repaint, separate from the escape-time
+            // interaction-driven one above.
+            let ppp = ui.ctx().pixels_per_point();
+            let size_px = [
+                ((rect.width() * ppp).round() as u32).max(1),
+                ((rect.height() * ppp).round() as u32).max(1),
+            ];
+            let uniforms = self.make_buddhabrot_uniforms(aspect);
+            ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+                rect,
+                BuddhabrotCallback {
+                    uniforms,
+                    accumulate: self.buddha_accumulate,
+                    size_px,
+                },
+            ));
+            if self.buddha_accumulate {
+                ui.ctx().request_repaint();
+            }
+            return;
         }
 
         // Keep the iteration count matched to the zoom depth while auto is on.

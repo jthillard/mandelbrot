@@ -34,3 +34,11 @@ fn colorize_shader_is_valid() {
 fn blit_shader_is_valid() {
     validate("blit.wgsl", include_str!("../src/shaders/blit.wgsl"));
 }
+
+#[test]
+fn buddhabrot_shader_is_valid() {
+    validate(
+        "buddhabrot.wgsl",
+        include_str!("../src/shaders/buddhabrot.wgsl"),
+    );
+}
