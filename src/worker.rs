@@ -24,6 +24,8 @@ pub struct RefRequest {
     pub power: u32,
     /// Distortion constant for the Phoenix map (ignored by other kinds).
     pub phoenix_p: (f64, f64),
+    /// Distortion constant for the Lambda map (ignored by other kinds).
+    pub lambda_l: (f64, f64),
 }
 
 pub struct RefResult {
@@ -104,6 +106,7 @@ fn compute(req: &RefRequest) -> Vec<[f32; 2]> {
             req.kind,
             req.power,
             req.phoenix_p,
+            req.lambda_l,
         )
     } else {
         compute_set_reference(
@@ -114,6 +117,7 @@ fn compute(req: &RefRequest) -> Vec<[f32; 2]> {
             req.kind,
             req.power,
             req.phoenix_p,
+            req.lambda_l,
         )
     }
 }

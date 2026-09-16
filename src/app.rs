@@ -46,6 +46,7 @@ const KINDS: &[(FractalKind, &str)] = &[
     (FractalKind::Perpendicular, "Perpendicular"),
     (FractalKind::Buffalo, "Buffalo"),
     (FractalKind::Phoenix, "Phoenix"),
+    (FractalKind::Lambda, "Lambda"),
 ];
 
 /// UI label for a fractal kind.
@@ -60,7 +61,7 @@ fn kind_label(kind: FractalKind) -> &'static str {
 type JuliaPreset = (&'static str, f64, f64, u32, Option<(f64, f64)>);
 
 /// Nice-looking Julia constants offered as presets.
-const JULIA_PRESETS: [&[JuliaPreset]; FractalKind::Phoenix as usize + 1] = [
+const JULIA_PRESETS: [&[JuliaPreset]; FractalKind::Lambda as usize + 1] = [
     &[
         ("dendrite", -0.8, 0.156, 400, None),
         ("rabbit", -0.123, 0.745, 400, None),
@@ -78,6 +79,7 @@ const JULIA_PRESETS: [&[JuliaPreset]; FractalKind::Phoenix as usize + 1] = [
         ("archipelago 1", -0.415, -0.267, 500, Some((-0.556, 0.253))),
         ("archipelago 2", -0.556, 0.253, 500, Some((-0.415, -0.267))),
     ],
+    &[],
 ];
 
 type SetPreset = (
@@ -92,7 +94,7 @@ type SetPreset = (
 /// Curated beautiful locations offered as one-click presets.
 /// Each is `(name, center_re, center_im, half_height, iterations)`; the centers
 /// are decimals parsed at full precision so deep places stay sharp.
-const SET_PRESETS: [&[SetPreset]; FractalKind::Phoenix as usize + 1] = [
+const SET_PRESETS: [&[SetPreset]; FractalKind::Lambda as usize + 1] = [
     &[
         (
             "Seahorse Valley",
@@ -142,6 +144,7 @@ const SET_PRESETS: [&[SetPreset]; FractalKind::Phoenix as usize + 1] = [
         1000,
         Some((-0.9, -0.49)),
     )],
+    &[],
 ];
 
 /// Parameters a reference orbit was (or will be) computed for. Used to decide
@@ -153,6 +156,7 @@ struct RequestKey {
     julia: bool,
     julia_c: (f64, f64),
     phoenix_p: (f64, f64),
+    lambda_l: (f64, f64),
     iter: u32,
     kind: FractalKind,
     power: u32,
@@ -196,6 +200,13 @@ struct AnimState {
     phoenix_base: (f64, f64),
     phoenix_angle: f64,
 
+    /// Drift the Lambda distortion `λ` around a circle.
+    lambda: bool,
+    lambda_speed: f32,
+    lambda_radius: f64,
+    lambda_base: (f64, f64),
+    lambda_angle: f64,
+
     /// Continuously zoom toward the current center.
     zoom: bool,
     /// e-folds per second; positive zooms in, negative zooms out.
@@ -217,6 +228,11 @@ impl Default for AnimState {
             phoenix_radius: 0.08,
             phoenix_base: (0.0, 0.0),
             phoenix_angle: 0.0,
+            lambda: false,
+            lambda_speed: 0.05,
+            lambda_radius: 0.08,
+            lambda_base: (0.0, 0.0),
+            lambda_angle: 0.0,
             zoom: false,
             zoom_speed: 0.5,
         }
@@ -234,6 +250,8 @@ pub struct FractalApp {
     julia_c: (f64, f64),
     /// Distortion constant `p` for the Phoenix kind (`z^2 + c + p·z_{n-1}`).
     phoenix_p: (f64, f64),
+    /// Distortion constant `l` for the Lambda kind (`l·z(1 - z_{n-1})`).
+    lambda_l: (f64, f64),
     max_iterations: u32,
     /// When set, `max_iterations` tracks the zoom depth automatically (so deep
     /// zooms stay sharp without hand-tuning); the manual slider takes over when
@@ -356,6 +374,7 @@ impl FractalApp {
             power: 3,
             julia_c: (-0.8, 0.156),
             phoenix_p: (-0.5, 0.0),
+            lambda_l: (-0.5, 0.0),
             max_iterations: 512,
             auto_iterations: true,
             color_scale: 0.15,
@@ -517,6 +536,7 @@ impl FractalApp {
             iterations: self.max_iterations,
             julia_c: self.julia_c,
             phoenix_p: self.phoenix_p,
+            lambda_l: self.lambda_l,
             color_scale: self.color_scale,
             color_offset: self.color_offset,
             palette: self.palette,
@@ -534,6 +554,7 @@ impl FractalApp {
         self.power = s.power.clamp(2, 8);
         self.julia_c = s.julia_c;
         self.phoenix_p = s.phoenix_p;
+        self.lambda_l = s.lambda_l;
         self.color_scale = s.color_scale;
         self.color_offset = s.color_offset;
         self.palette = (s.palette as usize).min(PALETTE_NAMES.len() - 1) as u32;
@@ -582,6 +603,7 @@ impl FractalApp {
             FractalKind::Perpendicular => (-0.5, 0.0, 1.5),
             FractalKind::Buffalo => (-0.5, -0.5, 1.5),
             FractalKind::Phoenix => (0.0, 0.0, 1.6),
+            FractalKind::Lambda => (0.0, 0.0, 1.6),
         };
         ViewState::with_center(big_from_f64(cr, 53), big_from_f64(ci, 53), hh)
     }
@@ -594,6 +616,7 @@ impl FractalApp {
             julia: matches!(self.mode, FractalMode::Julia),
             julia_c: self.julia_c,
             phoenix_p: self.phoenix_p,
+            lambda_l: self.lambda_l,
             iter: self.max_iterations,
             kind: self.kind,
             power: self.power,
@@ -609,7 +632,8 @@ impl FractalApp {
 
     /// Whether the reference should be (re)computed: parameters changed, or the
     /// view drifted / zoomed far enough that the current reference no longer
-    /// serves it well.
+    /// serves it well. Lambda in Set mode has a static fractal (doesn't depend
+    /// on center), so we skip center drift checks but allow zoom precision updates.
     fn should_request(&self) -> bool {
         let Some(key) = &self.last_request else {
             return true;
@@ -617,11 +641,18 @@ impl FractalApp {
         if key.julia != matches!(self.mode, FractalMode::Julia)
             || key.julia_c != self.julia_c
             || key.phoenix_p != self.phoenix_p
+            || key.lambda_l != self.lambda_l
             || key.iter != self.max_iterations
             || key.kind != self.kind
             || key.power != self.power
         {
             return true;
+        }
+        // Lambda in Set mode is a static fractal; don't trigger recompute on center drift.
+        if self.kind == FractalKind::Lambda && matches!(self.mode, FractalMode::Mandelbrot) {
+            // But still recompute on significant zoom changes for precision
+            let ratio = self.view.half_height / key.half_height;
+            return !(0.5..=2.0).contains(&ratio);
         }
         let ratio = self.view.half_height / key.half_height;
         self.drift_from(key) > 0.5 * self.view.half_height || !(0.5..=2.0).contains(&ratio)
@@ -650,9 +681,15 @@ impl FractalApp {
     /// thread and pick up completed results. Web: compute inline.
     fn ensure_reference(&mut self) {
         if self.should_request() {
-            let key = self.current_key();
+            let mut key = self.current_key();
             let precision = self.view.precision_bits();
             let max_iter = key.iter.min(MAX_REF_POINTS as u32 - 1);
+
+            // Lambda in Set mode has a static fractal centered at origin.
+            if key.kind == FractalKind::Lambda && !key.julia {
+                key.center_re = big_from_f64(0.0, precision);
+                key.center_im = big_from_f64(0.0, precision);
+            }
 
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -667,6 +704,7 @@ impl FractalApp {
                     kind: key.kind,
                     power: key.power,
                     phoenix_p: key.phoenix_p,
+                    lambda_l: key.lambda_l,
                 });
                 self.pending = true;
             }
@@ -685,6 +723,7 @@ impl FractalApp {
                         key.kind,
                         key.power,
                         key.phoenix_p,
+                        key.lambda_l,
                     )
                 } else {
                     compute_set_reference(
@@ -695,6 +734,7 @@ impl FractalApp {
                         key.kind,
                         key.power,
                         key.phoenix_p,
+                        key.lambda_l,
                     )
                 };
                 self.apply_reference(
@@ -727,12 +767,13 @@ impl FractalApp {
             is_julia: matches!(self.mode, FractalMode::Julia) as u32,
             palette_id: self.palette,
             aa_level: if self.antialias { 2 } else { 1 },
-            kind: self.kind.shader_id(),
+            kind: self.kind as u32,
             power: self.power,
             dc_offset: self.dc_offset(),
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
+            lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
             de_coloring: self.de_coloring as u32,
-            _pad: [0, 0, 0],
+            _pad: [0],
         }
     }
 
@@ -1046,10 +1087,11 @@ impl FractalApp {
     /// repaint while active. Animations render at full resolution/AA (they do not
     /// trigger the interaction low-res pass).
     fn tick_animations(&mut self, ui: &egui::Ui) {
-        // Julia c only matters in Julia mode; Phoenix p only for the Phoenix kind.
+        // Julia c only matters in Julia mode; Phoenix p only for the Phoenix kind; Lambda λ only for Lambda kind.
         let julia_on = self.anim.julia && self.mode == FractalMode::Julia;
         let phoenix_on = self.anim.phoenix && self.kind == FractalKind::Phoenix;
-        if !(self.anim.color || self.anim.zoom || julia_on || phoenix_on) {
+        let lambda_on = self.anim.lambda && self.kind == FractalKind::Lambda;
+        if !(self.anim.color || self.anim.zoom || julia_on || phoenix_on || lambda_on) {
             return;
         }
 
@@ -1074,6 +1116,15 @@ impl FractalApp {
             self.phoenix_p = (
                 self.anim.phoenix_base.0 + self.anim.phoenix_radius * c,
                 self.anim.phoenix_base.1 + self.anim.phoenix_radius * s,
+            );
+        }
+        let lambda_on = self.anim.lambda && self.kind == FractalKind::Lambda;
+        if lambda_on {
+            self.anim.lambda_angle += std::f64::consts::TAU * self.anim.lambda_speed as f64 * dt;
+            let (s, c) = self.anim.lambda_angle.sin_cos();
+            self.lambda_l = (
+                self.anim.lambda_base.0 + self.anim.lambda_radius * c,
+                self.anim.lambda_base.1 + self.anim.lambda_radius * s,
             );
         }
         if self.anim.zoom && self.anim.zoom_speed != 0.0 {
@@ -1124,6 +1175,22 @@ impl FractalApp {
                 ui.label("i");
             });
         }
+        if self.kind == FractalKind::Lambda {
+            ui.horizontal(|ui| {
+                ui.label("λ =");
+                ui.add(
+                    egui::DragValue::new(&mut self.lambda_l.0)
+                        .speed(0.001)
+                        .range(-2.0..=2.0),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.lambda_l.1)
+                        .speed(0.001)
+                        .range(-2.0..=2.0),
+                );
+                ui.label("i");
+            });
+        }
         if self.kind != prev_kind {
             self.view = Self::default_view_for(self.mode, self.kind);
         }
@@ -1133,7 +1200,7 @@ impl FractalApp {
             ui.radio_value(&mut self.mode, FractalMode::Julia, "Julia");
         });
 
-        if self.mode == FractalMode::Julia {
+        if self.mode == FractalMode::Julia && self.kind != FractalKind::Lambda {
             ui.horizontal(|ui| {
                 ui.label("c =");
                 ui.add(
@@ -1267,6 +1334,24 @@ impl FractalApp {
                     ui.add(
                         egui::Slider::new(&mut self.anim.phoenix_radius, 0.005..=0.5)
                             .text("p radius")
+                            .logarithmic(true),
+                    );
+                }
+            }
+            if self.kind == FractalKind::Lambda {
+                if ui.checkbox(&mut self.anim.lambda, "Morph λ").changed() && self.anim.lambda {
+                    self.anim.lambda_base = self.lambda_l;
+                    self.anim.lambda_angle = 0.0;
+                }
+                if self.anim.lambda {
+                    ui.add(
+                        egui::Slider::new(&mut self.anim.lambda_speed, 0.005..=0.5)
+                            .text("λ rev/s")
+                            .logarithmic(true),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.anim.lambda_radius, 0.005..=0.5)
+                            .text("λ radius")
                             .logarithmic(true),
                     );
                 }

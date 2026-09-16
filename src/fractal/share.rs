@@ -23,6 +23,8 @@ pub struct ShareState {
     pub julia_c: (f64, f64),
     /// Distortion constant for the Phoenix kind (ignored by others).
     pub phoenix_p: (f64, f64),
+    /// Distortion constant for the Lambda kind (ignored by others).
+    pub lambda_l: (f64, f64),
     pub color_scale: f32,
     pub color_offset: f32,
     /// Palette index (`palette_id` in the shader).
@@ -44,6 +46,7 @@ impl ShareState {
                 FractalKind::Perpendicular => "perp",
                 FractalKind::Buffalo => "buffalo",
                 FractalKind::Phoenix => "phoenix",
+                FractalKind::Lambda => "lambda",
             }
         ));
         s.push_str(&format!("&pw={}", self.power));
@@ -53,6 +56,7 @@ impl ShareState {
         ));
         s.push_str(&format!("&jr={}&ji={}", self.julia_c.0, self.julia_c.1));
         s.push_str(&format!("&px={}&py={}", self.phoenix_p.0, self.phoenix_p.1));
+        s.push_str(&format!("&lx={}&ly={}", self.lambda_l.0, self.lambda_l.1));
         s.push_str(&format!(
             "&cs={}&co={}&pal={}",
             self.color_scale, self.color_offset, self.palette
@@ -82,6 +86,7 @@ impl ShareState {
                     "perp" => FractalKind::Perpendicular,
                     "buffalo" => FractalKind::Buffalo,
                     "phoenix" => FractalKind::Phoenix,
+                    "lambda" => FractalKind::Lambda,
                     _ => FractalKind::Mandelbrot,
                 })
                 .unwrap_or(FractalKind::Mandelbrot),
@@ -97,6 +102,10 @@ impl ShareState {
             phoenix_p: (
                 map.get("px").and_then(|s| s.parse().ok()).unwrap_or(-0.5),
                 map.get("py").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            ),
+            lambda_l: (
+                map.get("lx").and_then(|s| s.parse().ok()).unwrap_or(-0.5),
+                map.get("ly").and_then(|s| s.parse().ok()).unwrap_or(0.0),
             ),
             color_scale: map.get("cs").and_then(|s| s.parse().ok()).unwrap_or(0.02),
             color_offset: map.get("co").and_then(|s| s.parse().ok()).unwrap_or(0.0),
@@ -121,6 +130,7 @@ mod tests {
             iterations: 4000,
             julia_c: (-0.123, 0.745),
             phoenix_p: (-0.5, 0.1),
+            lambda_l: (-0.5, 0.0),
             color_scale: 0.02,
             color_offset: 0.25,
             palette: 3,

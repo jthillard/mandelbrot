@@ -78,10 +78,13 @@ pub struct Uniforms {
     /// ignored by other kinds. Kept next to `dc_offset` so both `vec2`s land on
     /// 8-byte boundaries, matching the shader's layout.
     pub phoenix_p: [f32; 2],
+    /// Distortion constant `l` for the Lambda map (`l·z(1 - z)`);
+    /// ignored by other kinds.
+    pub lambda_l: [f32; 2],
     /// 0 = escape-time coloring, 1 = distance-estimation shading.
     pub de_coloring: u32,
     /// Padding to a 16-byte multiple (uniform buffer requirement).
-    pub _pad: [u32; 3],
+    pub _pad: [u32; 1],
 }
 
 /// Offscreen textures for the two-pass render, recreated whenever the widget's

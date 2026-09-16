@@ -30,6 +30,9 @@ struct Uniforms {
     // Distortion constant p for the Phoenix map (z^2 + c + p*z_{n-1}); unused
     // by other kinds. Placed by dc_offset so both vec2s stay 8-byte aligned.
     phoenix_p: vec2<f32>,
+    // Distortion constant l for the Lambda map (l*z(1 - z_{n-1})); unused
+    // by other kinds.
+    lambda_l: vec2<f32>,
     // 0 = escape-time coloring, 1 = distance-estimation shading.
     de_coloring: u32,
 };
@@ -42,6 +45,7 @@ const KIND_CELTIC: u32 = 4u;
 const KIND_PERPENDICULAR: u32 = 5u;
 const KIND_BUFFALO: u32 = 6u;
 const KIND_PHOENIX: u32 = 7u;
+const KIND_LAMBDA: u32 = 8u;
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> ref_orbit: array<vec2<f32>>;
@@ -82,7 +86,7 @@ fn conj(a: vec2<f32>) -> vec2<f32> {
 // the sign flips that happen all along the axes, where the ship's detail lives.
 fn diffabs(c: f32, d: f32) -> f32 {
     let cd = c + d;
-    if (c >= 0.0) {
+    if c >= 0.0 {
         return select(-(2.0 * c + d), d, cd >= 0.0);
     }
     return select(-d, 2.0 * c + d, cd > 0.0);
@@ -120,7 +124,7 @@ fn multibrot_delta(z: vec2<f32>, e: vec2<f32>, p: u32) -> vec2<f32> {
 // where `z` is the reference orbit value X_m. `step_add` (dc) is added by the
 // caller. Must match `FractalKind` on the CPU side.
 fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
-    if (u.kind == KIND_BURNING_SHIP) {
+    if u.kind == KIND_BURNING_SHIP {
         // (|x| + i|y|)^2 has real part x^2 - y^2 (an ordinary square delta) and
         // imaginary part 2|x y|. The imaginary delta is 2(|x y| - |X Y|); diffabs
         // computes it exactly, even where the product x y changes sign — which the
@@ -129,29 +133,33 @@ fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
         let base = 2.0 * cmul(z, e) + cmul(e, e);
         let dp = z.x * e.y + z.y * e.x + e.x * e.y;
         return vec2<f32>(base.x, 2.0 * diffabs(z.x * z.y, dp));
-    } else if (u.kind == KIND_TRICORN) {
+    } else if u.kind == KIND_TRICORN {
         let cz = conj(z);
         let ce = conj(e);
         return 2.0 * cmul(cz, ce) + cmul(ce, ce);
-    } else if (u.kind == KIND_MULTIBROT) {
+    } else if u.kind == KIND_MULTIBROT {
         return multibrot_delta(z, e, clamp(u.power, 2u, 8u));
-    } else if (u.kind == KIND_CELTIC) {
+    } else if u.kind == KIND_CELTIC {
         // z^2 delta split: sq.x = delta of Re(z^2), sq.y = delta of Im(z^2).
         // Celtic abs the real output, so |Re(z^2)| delta = diffabs(Re(Z^2), sq.x).
         let sq = 2.0 * cmul(z, e) + cmul(e, e);
         return vec2<f32>(diffabs(z.x * z.x - z.y * z.y, sq.x), sq.y);
-    } else if (u.kind == KIND_BUFFALO) {
+    } else if u.kind == KIND_BUFFALO {
         // Abs both outputs: real |Re(z^2)|, imag -|Im(z^2)| (Im(Z^2) = 2 X Y).
         let sq = 2.0 * cmul(z, e) + cmul(e, e);
         return vec2<f32>(diffabs(z.x * z.x - z.y * z.y, sq.x),
                          -diffabs(2.0 * z.x * z.y, sq.y));
-    } else if (u.kind == KIND_PERPENDICULAR) {
+    } else if u.kind == KIND_PERPENDICULAR {
         // real x^2 - y^2 (ordinary square delta), imag -2 x |y|.
         // d(-2 x |y|) = -2[ X·(|Y+ey|-|Y|) + ex·|Y+ey| ]; diffabs gives |Y+ey|-|Y|.
         let sq = 2.0 * cmul(z, e) + cmul(e, e);
         let da = diffabs(z.y, e.y);        // |Y + ey| - |Y|
         let abs_yf = abs(z.y) + da;        // |Y + ey|
         return vec2<f32>(sq.x, -2.0 * (z.x * da + e.x * abs_yf));
+    } else if u.kind == KIND_LAMBDA {
+        // Lambda map: z^{n+1} = λ·z·(1-z). Delta: e = λ·e·(1-2z-e).
+        let one_minus_2z_minus_e = vec2<f32>(1.0 - 2.0*z.x - e.x, -2.0*z.y - e.y);
+        return cmul(u.lambda_l, cmul(e, one_minus_2z_minus_e));
     }
     return 2.0 * cmul(z, e) + cmul(e, e); // Mandelbrot (and Phoenix square part)
 }
@@ -162,31 +170,34 @@ fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
 // Burning Ship / Tricorn we use |f'| ~ |2Z|, which keeps the DE magnitude close
 // enough to de-speckle filaments.
 fn fprime(z: vec2<f32>) -> vec2<f32> {
-    if (u.kind == KIND_MULTIBROT) {
+    if u.kind == KIND_MULTIBROT {
         let p = clamp(u.power, 2u, 8u);
         var zk = vec2<f32>(1.0, 0.0); // Z^0
         for (var k: u32 = 1u; k < p; k = k + 1u) {
             zk = cmul(zk, z); // -> Z^{p-1}
         }
         return f32(p) * zk;
+    } else if u.kind == KIND_LAMBDA {
+        // Lambda: f'(z) = λ·(1-2z).
+        return cmul(u.lambda_l, vec2<f32>(1.0 - 2.0*z.x, -2.0*z.y));
     }
     return 2.0 * z;
 }
 
 // Smooth cyclic palettes (Inigo Quilez cosine palettes), selected by id.
 fn palette(id: u32, t: f32) -> vec3<f32> {
-    if (id == 4u) {
+    if id == 4u {
         return vec3<f32>(t, t, t); // grayscale
     }
     let a = vec3<f32>(0.5, 0.5, 0.5);
     let b = vec3<f32>(0.5, 0.5, 0.5);
     var c = vec3<f32>(1.0, 1.0, 1.0);
     var d = vec3<f32>(0.00, 0.10, 0.20); // 0: amber / blue
-    if (id == 1u) {
+    if id == 1u {
         d = vec3<f32>(0.00, 0.33, 0.67); // rainbow
-    } else if (id == 2u) {
+    } else if id == 2u {
         d = vec3<f32>(0.30, 0.20, 0.20); // warm ember
-    } else if (id == 3u) {
+    } else if id == 3u {
         c = vec3<f32>(1.0, 1.0, 0.5);
         d = vec3<f32>(0.80, 0.90, 0.30); // lime / magenta
     }
@@ -220,7 +231,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     // y_{n-1}, and its derivative for DE). Both start at 0 (y_{-1} = 0).
     var e_prev = vec2<f32>(0.0, 0.0);
     var dz_prev = vec2<f32>(0.0, 0.0);
-    if (u.is_julia != 0u) {
+    if u.is_julia != 0u {
         step_add = vec2<f32>(0.0, 0.0);
         e = offset;
         dz = vec2<f32>(1.0, 0.0);
@@ -232,65 +243,65 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     var z = vec2<f32>(0.0, 0.0);  // full value y_n, kept for coloring
     var escaped = false;
 
-    loop {
-        let xm = ref_orbit[m];
-        z = xm + e;
+        loop {
+            let xm = ref_orbit[m];
+            z = xm + e;
 
-        let z2 = dot(z, z);
-        if (z2 > u.bailout_sq) {
-            escaped = true;
-            break;
-        }
-        if (n >= u.max_iter) {
-            break; // interior
-        }
+            let z2 = dot(z, z);
+            if z2 > u.bailout_sq {
+                escaped = true;
+                break;
+            }
+            if n >= u.max_iter {
+                break; // interior
+            }
 
         // Propagate the derivative of the full orbit (unaffected by rebasing,
         // which only re-expresses the same value). Only when DE is enabled.
         // Phoenix's two-term map adds p·dz_{n-1} and carries the previous dz.
-        if (u.de_coloring != 0u) {
-            var dz_new = cmul(fprime(z), dz) + dz_seed;
-            if (u.kind == KIND_PHOENIX) {
-                dz_new = dz_new + cmul(u.phoenix_p, dz_prev);
-                dz_prev = dz;
+            if u.de_coloring != 0u {
+                var dz_new = cmul(fprime(z), dz) + dz_seed;
+                if u.kind == KIND_PHOENIX {
+                    dz_new = dz_new + cmul(u.phoenix_p, dz_prev);
+                    dz_prev = dz;
+                }
+                dz = dz_new;
             }
-            dz = dz_new;
-        }
 
         // Advance the delta by this fractal's formula (+ dc for the set plane).
         // Phoenix additionally adds p·e_{n-1} and carries the previous delta.
-        let e_old = e;
-        e = advance_delta(xm, e) + step_add;
-        if (u.kind == KIND_PHOENIX) {
-            e = e + cmul(u.phoenix_p, e_prev);
-            e_prev = e_old;
-        }
-        m = m + 1u;
-        n = n + 1u;
+            let e_old = e;
+            e = advance_delta(xm, e) + step_add;
+            if u.kind == KIND_PHOENIX {
+                e = e + cmul(u.phoenix_p, e_prev);
+                e_prev = e_old;
+            }
+            m = m + 1u;
+            n = n + 1u;
 
         // Keep the reference index valid and the delta small.
-        if (m >= u.ref_len) {
+            if m >= u.ref_len {
             // Reference exhausted: any pixel that followed it this far has
             // effectively escaped (interior pixels rebase before reaching here).
-            z = ref_orbit[u.ref_len - 1u] + e;
-            escaped = true;
-            break;
-        }
-        let y = ref_orbit[m] + e;
-        if (dot(y, y) < dot(e, e)) {
+                z = ref_orbit[u.ref_len - 1u] + e;
+                escaped = true;
+                break;
+            }
+            let y = ref_orbit[m] + e;
+            if dot(y, y) < dot(e, e) {
             // Rebase to index 0: carry the full value as the new delta. Valid
             // because y_n = X[0] + (y_n - X[0]); for Mandelbrot X[0]=0.
             // Phoenix: after rebasing the implied previous reference is Y[-1]=0,
             // so the previous delta becomes the full previous value y_n (= z).
-            if (u.kind == KIND_PHOENIX) {
-                e_prev = z;
+                if u.kind == KIND_PHOENIX {
+                    e_prev = z;
+                }
+                e = y - z0;
+                m = 0u;
             }
-            e = y - z0;
-            m = 0u;
         }
-    }
 
-    if (!escaped) {
+    if !escaped {
         return Sample(0.0, 1.0, false); // interior of the set
     }
 
@@ -306,7 +317,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     let ci = sqrt(max(smooth_i, 0.0));
 
     var de = 1.0;
-    if (u.de_coloring != 0u) {
+    if u.de_coloring != 0u {
         // Exterior distance estimate (complex-plane units): |z|·ln|z| / |dz|.
         // Divided by the pixel footprint it becomes a distance in pixels; we
         // darken toward the boundary (< ~1 px away) so filaments stay crisp
@@ -324,7 +335,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
 // only color-dependent step, so it can be redone without re-iterating. Interior
 // samples are black.
 fn color_sample(s: Sample) -> vec3<f32> {
-    if (!s.escaped) {
+    if !s.escaped {
         return vec3<f32>(0.0, 0.0, 0.0);
     }
     let t = fract(s.ci * u.color_scale + u.color_offset);
@@ -353,7 +364,7 @@ fn fs_data(in: VsOut) -> @location(0) vec4<f32> {
             let jx = (f32(sx) + 0.5) * inv - 0.5;
             let jy = (f32(sy) + 0.5) * inv - 0.5;
             let s = iterate_sample(base + jx * dx + jy * dy, px);
-            if (s.escaped) {
+            if s.escaped {
                 ci_sum = ci_sum + s.ci;
                 de_sum = de_sum + s.de;
                 escaped_n = escaped_n + 1u;

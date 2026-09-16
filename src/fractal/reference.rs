@@ -18,37 +18,23 @@ use crate::view::{Big, big_from_f64};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FractalKind {
     /// `z -> z^2 + c`.
-    Mandelbrot,
+    Mandelbrot = 0,
     /// `z -> (|Re z| + i|Im z|)^2 + c`.
-    BurningShip,
+    BurningShip = 1,
     /// `z -> conj(z)^2 + c` (the Mandelbar).
-    Tricorn,
+    Tricorn = 2,
     /// `z -> z^power + c` (power >= 2).
-    Multibrot,
+    Multibrot = 3,
     /// `z -> |Re(z^2)| + i·Im(z^2) + c` (abs on the real output of the square).
-    Celtic,
+    Celtic = 4,
     /// `z -> (x^2 - y^2) - 2·x·|y|·i + c` (abs on the imaginary input).
-    Perpendicular,
+    Perpendicular = 5,
     /// `z -> |Re(z^2)| - |Im(z^2)|·i + c` (abs on both outputs).
-    Buffalo,
+    Buffalo = 6,
     /// `z -> z^2 + c + p·z_{n-1}` (two-term recurrence; `p` is `phoenix_p`).
-    Phoenix,
-}
-
-impl FractalKind {
-    /// Integer id matching the shader's `KIND_*` constants.
-    pub fn shader_id(self) -> u32 {
-        match self {
-            FractalKind::Mandelbrot => 0,
-            FractalKind::BurningShip => 1,
-            FractalKind::Tricorn => 2,
-            FractalKind::Multibrot => 3,
-            FractalKind::Celtic => 4,
-            FractalKind::Perpendicular => 5,
-            FractalKind::Buffalo => 6,
-            FractalKind::Phoenix => 7,
-        }
-    }
+    Phoenix = 7,
+    /// `z -> lambda·z(1 - z)` (logistic map).
+    Lambda = 8,
 }
 
 /// Reference orbit escapes once |Z|^2 exceeds this. Kept larger than the pixel
@@ -70,6 +56,7 @@ pub fn compute_reference(
     kind: FractalKind,
     power: u32,
     phoenix_p: (f64, f64),
+    lambda_l: (f64, f64),
 ) -> Vec<[f32; 2]> {
     let cr = c_re.clone().with_precision(precision).value();
     let ci = c_im.clone().with_precision(precision).value();
@@ -82,6 +69,9 @@ pub fn compute_reference(
     // Phoenix distortion constant `p` (a small fixed complex number).
     let pr = big_from_f64(phoenix_p.0, precision);
     let pi = big_from_f64(phoenix_p.1, precision);
+    // Lambda distortion constant `l` (a small fixed complex number).
+    let lr = big_from_f64(lambda_l.0, precision);
+    let li = big_from_f64(lambda_l.1, precision);
 
     let mut points: Vec<[f32; 2]> = Vec::with_capacity(max_iter as usize + 1);
 
@@ -144,6 +134,14 @@ pub fn compute_reference(
                 let pzi = &pr * &zi_prev + &pi * &zr_prev;
                 (re2 + &cr + pzr, im2 + &ci + pzi)
             }
+            FractalKind::Lambda => {
+                // λ·z(1 - z): logistic map.
+                let re2 = 1 - &zr;
+                let im2 = -&zi;
+                let lzr = &lr * &zr - &li * &zi;
+                let lzi = &lr * &zi + &li * &zr;
+                (&lzr * &re2 - &lzi * &im2, re2 * lzi + lzr * im2)
+            }
         };
 
         // Shift the previous iterate (only the Phoenix arm reads it).
@@ -182,6 +180,7 @@ fn complex_pow(zr: &Big, zi: &Big, power: u32, precision: usize) -> (Big, Big) {
 
 /// Convenience: parameter-plane ("Mandelbrot-set") reference (`z0 = 0`,
 /// `c = center`) for any `kind`.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_set_reference(
     center_re: &Big,
     center_im: &Big,
@@ -190,10 +189,11 @@ pub fn compute_set_reference(
     kind: FractalKind,
     power: u32,
     phoenix_p: (f64, f64),
+    lambda_l: (f64, f64),
 ) -> Vec<[f32; 2]> {
     let zero = big_zero(precision);
     compute_reference(
-        &zero, &zero, center_re, center_im, max_iter, precision, kind, power, phoenix_p,
+        &zero, &zero, center_re, center_im, max_iter, precision, kind, power, phoenix_p, lambda_l,
     )
 }
 
@@ -207,8 +207,16 @@ mod tests {
     fn reference_matches_naive_f64() {
         let cr = Big::try_from(-0.75_f64).unwrap();
         let ci = Big::try_from(0.1_f64).unwrap();
-        let points =
-            compute_set_reference(&cr, &ci, 60, 200, FractalKind::Mandelbrot, 2, (0.0, 0.0));
+        let points = compute_set_reference(
+            &cr,
+            &ci,
+            60,
+            200,
+            FractalKind::Mandelbrot,
+            2,
+            (0.0, 0.0),
+            (0.0, 0.0),
+        );
 
         // Independent naive f64 orbit.
         let (c_re, c_im) = (-0.75_f64, 0.1_f64);
@@ -238,8 +246,16 @@ mod tests {
     fn interior_orbit_runs_full_length() {
         let cr = Big::try_from(-0.2_f64).unwrap();
         let ci = Big::try_from(0.0_f64).unwrap();
-        let points =
-            compute_set_reference(&cr, &ci, 500, 120, FractalKind::Mandelbrot, 2, (0.0, 0.0));
+        let points = compute_set_reference(
+            &cr,
+            &ci,
+            500,
+            120,
+            FractalKind::Mandelbrot,
+            2,
+            (0.0, 0.0),
+            (0.0, 0.0),
+        );
         assert_eq!(points.len(), 501, "interior orbit should not escape");
     }
 
@@ -248,8 +264,16 @@ mod tests {
     fn burning_ship_reference_matches_naive_f64() {
         let cr = Big::try_from(-1.75_f64).unwrap();
         let ci = Big::try_from(-0.03_f64).unwrap();
-        let points =
-            compute_set_reference(&cr, &ci, 60, 200, FractalKind::BurningShip, 2, (0.0, 0.0));
+        let points = compute_set_reference(
+            &cr,
+            &ci,
+            60,
+            200,
+            FractalKind::BurningShip,
+            2,
+            (0.0, 0.0),
+            (0.0, 0.0),
+        );
 
         let (c_re, c_im) = (-1.75_f64, -0.03_f64);
         let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
@@ -269,8 +293,16 @@ mod tests {
     fn multibrot3_reference_matches_naive_f64() {
         let cr = Big::try_from(0.3_f64).unwrap();
         let ci = Big::try_from(0.2_f64).unwrap();
-        let points =
-            compute_set_reference(&cr, &ci, 60, 200, FractalKind::Multibrot, 3, (0.0, 0.0));
+        let points = compute_set_reference(
+            &cr,
+            &ci,
+            60,
+            200,
+            FractalKind::Multibrot,
+            3,
+            (0.0, 0.0),
+            (0.0, 0.0),
+        );
 
         let (c_re, c_im) = (0.3_f64, 0.2_f64);
         let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
@@ -304,6 +336,7 @@ mod tests {
             FractalKind::Mandelbrot,
             2,
             (0.0, 0.0),
+            (0.0, 0.0),
         );
 
         let (mut zr, mut zi) = (0.15_f64, -0.1_f64);
@@ -324,7 +357,16 @@ mod tests {
     fn celtic_reference_matches_naive_f64() {
         let cr = Big::try_from(-0.6_f64).unwrap();
         let ci = Big::try_from(0.4_f64).unwrap();
-        let points = compute_set_reference(&cr, &ci, 60, 200, FractalKind::Celtic, 2, (0.0, 0.0));
+        let points = compute_set_reference(
+            &cr,
+            &ci,
+            60,
+            200,
+            FractalKind::Celtic,
+            2,
+            (0.0, 0.0),
+            (0.0, 0.0),
+        );
 
         let (c_re, c_im) = (-0.6_f64, 0.4_f64);
         let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
@@ -345,8 +387,16 @@ mod tests {
     fn perpendicular_reference_matches_naive_f64() {
         let cr = Big::try_from(-0.7_f64).unwrap();
         let ci = Big::try_from(-0.2_f64).unwrap();
-        let points =
-            compute_set_reference(&cr, &ci, 60, 200, FractalKind::Perpendicular, 2, (0.0, 0.0));
+        let points = compute_set_reference(
+            &cr,
+            &ci,
+            60,
+            200,
+            FractalKind::Perpendicular,
+            2,
+            (0.0, 0.0),
+            (0.0, 0.0),
+        );
 
         let (c_re, c_im) = (-0.7_f64, -0.2_f64);
         let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
@@ -367,7 +417,16 @@ mod tests {
     fn buffalo_reference_matches_naive_f64() {
         let cr = Big::try_from(-1.2_f64).unwrap();
         let ci = Big::try_from(-0.35_f64).unwrap();
-        let points = compute_set_reference(&cr, &ci, 60, 200, FractalKind::Buffalo, 2, (0.0, 0.0));
+        let points = compute_set_reference(
+            &cr,
+            &ci,
+            60,
+            200,
+            FractalKind::Buffalo,
+            2,
+            (0.0, 0.0),
+            (0.0, 0.0),
+        );
 
         let (c_re, c_im) = (-1.2_f64, -0.35_f64);
         let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
@@ -389,7 +448,8 @@ mod tests {
         let cr = Big::try_from(0.5667_f64).unwrap();
         let ci = Big::try_from(0.0_f64).unwrap();
         let p = (-0.5_f64, 0.0_f64);
-        let points = compute_set_reference(&cr, &ci, 60, 200, FractalKind::Phoenix, 2, p);
+        let points =
+            compute_set_reference(&cr, &ci, 60, 200, FractalKind::Phoenix, 2, p, (0.0, 0.0));
 
         let (c_re, c_im) = (0.5667_f64, 0.0_f64);
         let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
