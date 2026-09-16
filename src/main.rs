@@ -1,3 +1,7 @@
+// Without these, rust fails to infer Send/Sync trait impls
+// Probably caused by the new trait solver
+#![recursion_limit = "256"]
+
 // Fractal Explorer — Rust + wgpu + egui + WGSL deep-zoom Mandelbrot.
 //
 // A single binary drives both native and web (WASM/WebGPU) builds; the two
@@ -25,14 +29,13 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
 
     let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
     if let WgpuSetup::CreateNew(setup) = &mut options.wgpu_setup {
-        setup.device_descriptor = std::sync::Arc::new(|adapter: &wgpu::Adapter| {
-            wgpu::DeviceDescriptor {
+        setup.device_descriptor =
+            std::sync::Arc::new(|adapter: &wgpu::Adapter| wgpu::DeviceDescriptor {
                 label: Some("fractal wgpu device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: adapter.limits(),
                 ..Default::default()
-            }
-        });
+            });
         #[cfg(target_arch = "wasm32")]
         {
             setup.instance_descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;

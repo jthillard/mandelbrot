@@ -508,7 +508,13 @@ impl FractalRenderer {
     /// Handles needed to build a standalone [`ExportRender`] off the UI thread:
     /// the (immutable) pipeline and its bind-group layout, plus the target
     /// format. Cloned so the caller can drop the render-state lock before use.
-    pub fn export_handles(&self) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::TextureFormat) {
+    pub fn export_handles(
+        &self,
+    ) -> (
+        wgpu::RenderPipeline,
+        wgpu::BindGroupLayout,
+        wgpu::TextureFormat,
+    ) {
         (
             self.export_pipeline.clone(),
             self.bind_group_layout.clone(),
@@ -825,7 +831,11 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
         }
 
         // Both passes read the uniform buffer; refresh it once.
-        queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
+        queue.write_buffer(
+            &renderer.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&self.uniforms),
+        );
 
         if let Some(cache) = &renderer.cache {
             if iter_dirty {

@@ -14,6 +14,7 @@ use crate::view::{Big, big_from_f64};
 
 /// The iteration formula. Must be kept in sync with `advance_delta` and the
 /// `KIND_*` constants in the shader.
+#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FractalKind {
     /// `z -> z^2 + c`.
@@ -58,6 +59,7 @@ const REFERENCE_ESCAPE_SQ: f64 = 1.0e10;
 /// Compute the reference orbit `Z_0..Z_{len-1}` where `Z_0 = z0` and
 /// `Z_{n+1} = f(Z_n, c)` for the given `kind` (and `power`, for Multibrot), up
 /// to `max_iter` steps at `precision` bits. Each entry is `[re, im]` in f32.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_reference(
     z0_re: &Big,
     z0_im: &Big,
@@ -205,7 +207,8 @@ mod tests {
     fn reference_matches_naive_f64() {
         let cr = Big::try_from(-0.75_f64).unwrap();
         let ci = Big::try_from(0.1_f64).unwrap();
-        let points = compute_set_reference(&cr, &ci, 60, 200, FractalKind::Mandelbrot, 2, (0.0, 0.0));
+        let points =
+            compute_set_reference(&cr, &ci, 60, 200, FractalKind::Mandelbrot, 2, (0.0, 0.0));
 
         // Independent naive f64 orbit.
         let (c_re, c_im) = (-0.75_f64, 0.1_f64);
@@ -215,8 +218,14 @@ mod tests {
             // significant figures.
             let tol_re = 1e-4 * (1.0 + zr.abs());
             let tol_im = 1e-4 * (1.0 + zi.abs());
-            assert!((point[0] as f64 - zr).abs() < tol_re, "re mismatch: {point:?} vs {zr}");
-            assert!((point[1] as f64 - zi).abs() < tol_im, "im mismatch: {point:?} vs {zi}");
+            assert!(
+                (point[0] as f64 - zr).abs() < tol_re,
+                "re mismatch: {point:?} vs {zr}"
+            );
+            assert!(
+                (point[1] as f64 - zi).abs() < tol_im,
+                "im mismatch: {point:?} vs {zi}"
+            );
             let nzr = zr * zr - zi * zi + c_re;
             let nzi = 2.0 * zr * zi + c_im;
             zr = nzr;
