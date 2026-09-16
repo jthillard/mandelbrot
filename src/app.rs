@@ -57,42 +57,91 @@ fn kind_label(kind: FractalKind) -> &'static str {
         .unwrap_or("Mandelbrot")
 }
 
+type JuliaPreset = (&'static str, f64, f64, u32, Option<(f64, f64)>);
+
 /// Nice-looking Julia constants offered as presets.
-const JULIA_PRESETS: &[(&str, f64, f64)] = &[
-    ("dendrite", -0.8, 0.156),
-    ("rabbit", -0.123, 0.745),
-    ("spiral", -0.4, 0.6),
-    ("san marco", -0.75, 0.0),
-    ("siegel", -0.391, -0.587),
+const JULIA_PRESETS: [&[JuliaPreset]; FractalKind::Phoenix as usize + 1] = [
+    &[
+        ("dendrite", -0.8, 0.156, 400, None),
+        ("rabbit", -0.123, 0.745, 400, None),
+        ("spiral", -0.4, 0.6, 400, None),
+        ("san marco", -0.75, 0.0, 400, None),
+        ("siegel", -0.391, -0.587, 400, None),
+    ],
+    &[("eyes", -0.241, 0.157, 1000, None)],
+    &[("pools", -0.50381, 0.07750, 400, None)],
+    &[],
+    &[],
+    &[],
+    &[],
+    &[
+        ("archipelago 1", -0.415, -0.267, 500, Some((-0.556, 0.253))),
+        ("archipelago 2", -0.556, 0.253, 500, Some((-0.415, -0.267))),
+    ],
 ];
 
-/// Curated beautiful Mandelbrot locations offered as one-click presets.
+type SetPreset = (
+    &'static str,
+    &'static str,
+    &'static str,
+    f64,
+    u32,
+    Option<(f64, f64)>,
+);
+
+/// Curated beautiful locations offered as one-click presets.
 /// Each is `(name, center_re, center_im, half_height, iterations)`; the centers
 /// are decimals parsed at full precision so deep places stay sharp.
-const MANDEL_PLACES: &[(&str, &str, &str, f64, u32)] = &[
-    (
-        "Seahorse Valley",
-        "-0.743643887037158704752191506114774",
-        "0.131825904205311970493132056385139",
-        4.0e-6,
+const SET_PRESETS: [&[SetPreset]; FractalKind::Phoenix as usize + 1] = [
+    &[
+        (
+            "Seahorse Valley",
+            "-0.743643887037158704752191506114774",
+            "0.131825904205311970493132056385139",
+            4.0e-6,
+            1500,
+            None,
+        ),
+        (
+            "Elephant Valley",
+            "0.2549870375144766",
+            "0.0005679790528465",
+            6.0e-5,
+            2000,
+            None,
+        ),
+        ("Scepter Valley", "-1.36012", "0.0406", 2.5e-4, 2000, None),
+        ("Starburst", "-1.62917", "0.0203968", 1.5e-3, 1500, None),
+        (
+            "Deep Spiral",
+            "-0.7436438870371587",
+            "0.1318259042053",
+            8.0e-8,
+            10000,
+            None,
+        ),
+    ],
+    &[(
+        "Ship",
+        "-1.76485017213465",
+        "-0.0317013204392752",
+        5.3e-2,
         1500,
-    ),
-    (
-        "Elephant Valley",
-        "0.2549870375144766",
-        "0.0005679790528465",
-        6.0e-5,
-        2000,
-    ),
-    ("Scepter Valley", "-1.360022", "0.041", 3.0e-4, 2000),
-    ("Starburst", "-1.62917", "0.0203968", 1.5e-3, 1500),
-    (
-        "Deep Spiral",
-        "-0.7436438870371587",
-        "0.1318259042053",
-        8.0e-8,
-        3000,
-    ),
+        None,
+    )],
+    &[],
+    &[],
+    &[],
+    &[],
+    &[],
+    &[(
+        "Galaxy",
+        "-0.2165696026100408",
+        "-0.0676553191878954",
+        5e-1,
+        1000,
+        Some((-0.9, -0.49)),
+    )],
 ];
 
 /// Parameters a reference orbit was (or will be) computed for. Used to decide
@@ -1099,21 +1148,33 @@ impl FractalApp {
                 );
                 ui.label("i");
             });
-            ui.horizontal_wrapped(|ui| {
-                for &(name, re, im) in JULIA_PRESETS {
-                    if ui.small_button(name).clicked() {
-                        self.julia_c = (re, im);
+
+            if !JULIA_PRESETS[self.kind as usize].is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for &(name, re, im, iterations, phoenix) in JULIA_PRESETS[self.kind as usize] {
+                        if ui.small_button(name).clicked() {
+                            self.julia_c = (re, im);
+                            self.max_iterations = iterations.clamp(32, MAX_REF_POINTS as u32 - 1);
+
+                            if let Some(phoenix) = phoenix {
+                                self.phoenix_p = phoenix;
+                            }
+                        }
                     }
-                }
-            });
+                });
+            }
         }
 
-        if self.mode == FractalMode::Mandelbrot && self.kind == FractalKind::Mandelbrot {
+        if self.mode == FractalMode::Mandelbrot && !SET_PRESETS[self.kind as usize].is_empty() {
             ui.label("places:");
             ui.horizontal_wrapped(|ui| {
-                for &(name, re, im, half_height, iter) in MANDEL_PLACES {
+                for &(name, re, im, half_height, iter, phoenix) in SET_PRESETS[self.kind as usize] {
                     if ui.small_button(name).clicked() {
                         self.go_to_place(re, im, half_height, iter);
+
+                        if let Some(phoenix) = phoenix {
+                            self.phoenix_p = phoenix;
+                        }
                     }
                 }
             });
