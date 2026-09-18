@@ -10,6 +10,7 @@ use crate::fractal::{
 };
 #[cfg(target_arch = "wasm32")]
 use crate::fractal::{compute_reference, compute_set_reference};
+use crate::lights::Light;
 use crate::view::{
     Big, DEFAULT_HALF_HEIGHT, ViewState, big_from_decimal_str, big_from_f64, big_to_decimal_str,
     precision_for,
@@ -29,6 +30,8 @@ const INTERACT_DOWNSCALE: u32 = 2;
 const INTERACT_SETTLE: f64 = 0.12;
 /// Palette names; index maps to `palette_id` in the shader.
 const PALETTE_NAMES: &[&str] = &["Amber", "Rainbow", "Ember", "Lime", "Grayscale"];
+/// Shadow palette names; index maps to `palette_id` in the shader.
+const SHADOW_PALETTE_NAMES: &[&str] = &["Grayscale", "Red & Blue", "Custom lights"];
 /// Buddhabrot tonemap style names; index maps to `BuddhabrotUniforms::palette`.
 const BUDDHA_PALETTE_NAMES: &[&str] = &["Nebula", "Yellow", "Grayscale"];
 
@@ -121,7 +124,7 @@ const SET_PRESETS: [&[SetPreset]; FractalKind::Lambda as usize + 1] = [
             "-0.7436438870371587",
             "0.1318259042053",
             8.0e-8,
-            10000,
+            2000,
             None,
         ),
     ],
@@ -262,11 +265,17 @@ pub struct FractalApp {
     color_scale: f32,
     color_offset: f32,
     palette: u32,
+    shadow_palette: u32,
     /// Supersample each pixel 2×2 for smoother edges (costs ~4× fragment work).
     antialias: bool,
     /// Distance-estimation shading: darkens toward the set boundary using the
     /// orbit derivative, giving crisp filaments at deep zoom instead of speckle.
     de_coloring: bool,
+    // Use shadow coloring
+    shadow: bool,
+
+    /// List of enabled lights in the world
+    lights: Vec<Light>,
 
     /// Render as a Buddhabrot (Monte-Carlo orbit-density histogram) instead of
     /// the ordinary escape-time set. Plain f32 view — no deep zoom, no
@@ -401,8 +410,11 @@ impl FractalApp {
             color_scale: 0.15,
             color_offset: 0.0,
             palette: 0,
+            shadow_palette: 0,
             antialias: false,
             de_coloring: false,
+            shadow: false,
+            lights: vec![Light::default()],
             buddhabrot: false,
             buddha_r_cap: 50,
             buddha_g_cap: 500,
@@ -576,6 +588,7 @@ impl FractalApp {
             color_scale: self.color_scale,
             color_offset: self.color_offset,
             palette: self.palette,
+            shadow_palette: self.shadow_palette,
         }
     }
 
@@ -594,6 +607,8 @@ impl FractalApp {
         self.color_scale = s.color_scale;
         self.color_offset = s.color_offset;
         self.palette = (s.palette as usize).min(PALETTE_NAMES.len() - 1) as u32;
+        self.shadow_palette =
+            (s.shadow_palette as usize).min(SHADOW_PALETTE_NAMES.len() - 1) as u32;
         // The link carries an explicit iteration count; honor it rather than
         // letting the auto-scaler immediately overwrite it.
         self.auto_iterations = false;
@@ -802,14 +817,16 @@ impl FractalApp {
             bailout_sq: BAILOUT_SQ,
             is_julia: matches!(self.mode, FractalMode::Julia) as u32,
             palette_id: self.palette,
+            shadow_palette_id: self.shadow_palette,
             aa_level: if self.antialias { 2 } else { 1 },
             kind: self.kind as u32,
             power: self.power,
             dc_offset: self.dc_offset(),
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
-            de_coloring: self.de_coloring as u32,
-            _pad: [0],
+            de_coloring: (self.de_coloring | self.shadow) as u32,
+            shadow: self.shadow as u32,
+            _pad: [0; _],
         }
     }
 
@@ -833,11 +850,11 @@ impl FractalApp {
             r_cap: self.buddha_r_cap,
             g_cap: self.buddha_g_cap,
             b_cap: self.buddha_b_cap,
-            seed: 0,               // set by the callback's own dispatch counter
+            seed: 0,                  // set by the callback's own dispatch counter
             samples_this_dispatch: 0, // set by the callback
             exposure: self.buddha_exposure,
-            width: 0,  // set by the callback from size_px
-            height: 0, // set by the callback from size_px
+            width: 0,           // set by the callback from size_px
+            height: 0,          // set by the callback from size_px
             total_samples: 0.0, // tracked by the renderer across frames
             palette: self.buddha_palette,
             _pad: [0; 3],
@@ -1354,32 +1371,66 @@ impl FractalApp {
                 .logarithmic(true),
         );
         ui.add(egui::Slider::new(&mut self.color_offset, 0.0..=1.0).text("color offset"));
-        egui::ComboBox::from_label("palette")
-            .selected_text(PALETTE_NAMES[self.palette as usize])
-            .show_ui(ui, |ui| {
-                for (i, name) in PALETTE_NAMES.iter().enumerate() {
-                    ui.selectable_value(&mut self.palette, i as u32, *name);
+        ui.checkbox(&mut self.shadow, "Shadow");
+        if !self.shadow {
+            egui::ComboBox::from_label("palette")
+                .selected_text(PALETTE_NAMES[self.palette as usize])
+                .show_ui(ui, |ui| {
+                    for (i, name) in PALETTE_NAMES.iter().enumerate() {
+                        ui.selectable_value(&mut self.palette, i as u32, *name);
+                    }
+                });
+        } else {
+            egui::ComboBox::from_label("palette")
+                .selected_text(SHADOW_PALETTE_NAMES[self.shadow_palette as usize])
+                .show_ui(ui, |ui| {
+                    for (i, name) in SHADOW_PALETTE_NAMES.iter().enumerate() {
+                        ui.selectable_value(&mut self.shadow_palette, i as u32, *name);
+                    }
+                });
+        }
+        if self.shadow && self.shadow_palette as usize == SHADOW_PALETTE_NAMES.len() - 1 {
+            ui.horizontal(|ui| {
+                ui.label("lights:");
+                if ui.button("+").clicked() {
+                    self.lights.push(Light::default());
                 }
             });
+            egui::Grid::new("lights")
+                .striped(true)
+                .num_columns(1)
+                .show(ui, |ui| {
+                    self.lights.retain_mut(|light| {
+                        let delete = !light.widget(ui);
+                        ui.end_row();
+                        delete
+                    });
+                });
+        }
+        ui.separator();
         ui.checkbox(&mut self.antialias, "Antialiasing (2×2)")
             .on_hover_text("Supersample each pixel for smoother edges (~4× slower).");
-        ui.checkbox(&mut self.de_coloring, "Distance shading")
-            .on_hover_text(
-                "Shade by distance to the set boundary (from the orbit derivative) \
+        if !self.shadow {
+            ui.checkbox(&mut self.de_coloring, "Distance shading")
+                .on_hover_text(
+                    "Shade by distance to the set boundary (from the orbit derivative) \
                  for crisp filaments at deep zoom. Exact for the holomorphic kinds \
                  (Mandelbrot/Multibrot/Phoenix), approximate for the abs-based kinds \
                  (Burning Ship/Tricorn/Celtic/Perpendicular/Buffalo).",
-            );
+                );
+        }
 
         ui.collapsing("Animation", |ui| {
-            ui.checkbox(&mut self.anim.color, "Cycle colours")
-                .on_hover_text("Scroll the palette offset over time.");
-            if self.anim.color {
-                ui.add(
-                    egui::Slider::new(&mut self.anim.color_speed, 0.01..=2.0)
-                        .text("cycles/s")
-                        .logarithmic(true),
-                );
+            if !self.shadow {
+                ui.checkbox(&mut self.anim.color, "Cycle colours")
+                    .on_hover_text("Scroll the palette offset over time.");
+                if self.anim.color {
+                    ui.add(
+                        egui::Slider::new(&mut self.anim.color_speed, 0.01..=2.0)
+                            .text("cycles/s")
+                            .logarithmic(true),
+                    );
+                }
             }
 
             ui.checkbox(&mut self.anim.zoom, "Auto-zoom")
@@ -1754,6 +1805,7 @@ impl FractalApp {
             rect,
             FractalCallback {
                 uniforms,
+                lights: self.lights.clone(),
                 reference: Arc::clone(&self.reference),
                 generation: self.generation,
                 size_px,

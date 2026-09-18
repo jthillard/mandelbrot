@@ -26,7 +26,8 @@ web-sys = { version = "0.3.105", features = ["Window", "Location", "Url", "UrlSe
 # Release: optimize hard (fractal math is hot).
 [profile.release]
 opt-level = 3
-codegen-units = 1
+# codegen-units = 1
+debug = true
 
 # Dev: keep our own crate debuggable, but optimize dependencies (dashu, wgpu,
 # egui) so the explorer is actually interactive during development.

@@ -21,6 +21,7 @@ struct Uniforms {
     bailout_sq: f32,
     is_julia: u32,
     palette_id: u32,
+    shadow_palette_id: u32,
     aa_level: u32,
     // Iteration formula (see the KIND_* constants below).
     kind: u32,
@@ -35,6 +36,8 @@ struct Uniforms {
     lambda_l: vec2<f32>,
     // 0 = escape-time coloring, 1 = distance-estimation shading.
     de_coloring: u32,
+    // 0 = classic colors, 1 = shadows
+    shadow: u32,
 };
 
 const KIND_MANDELBROT: u32 = 0u;
@@ -158,7 +161,7 @@ fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
         return vec2<f32>(sq.x, -2.0 * (z.x * da + e.x * abs_yf));
     } else if u.kind == KIND_LAMBDA {
         // Lambda map: z^{n+1} = λ·z·(1-z). Delta: e = λ·e·(1-2z-e).
-        let one_minus_2z_minus_e = vec2<f32>(1.0 - 2.0*z.x - e.x, -2.0*z.y - e.y);
+        let one_minus_2z_minus_e = vec2<f32>(1.0 - 2.0 * z.x - e.x, -2.0 * z.y - e.y);
         return cmul(u.lambda_l, cmul(e, one_minus_2z_minus_e));
     }
     return 2.0 * cmul(z, e) + cmul(e, e); // Mandelbrot (and Phoenix square part)
@@ -179,7 +182,7 @@ fn fprime(z: vec2<f32>) -> vec2<f32> {
         return f32(p) * zk;
     } else if u.kind == KIND_LAMBDA {
         // Lambda: f'(z) = λ·(1-2z).
-        return cmul(u.lambda_l, vec2<f32>(1.0 - 2.0*z.x, -2.0*z.y));
+        return cmul(u.lambda_l, vec2<f32>(1.0 - 2.0 * z.x, -2.0 * z.y));
     }
     return 2.0 * z;
 }
@@ -326,7 +329,11 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         let zmag = sqrt(max(z2, 1.0));
         let dzmag = sqrt(max(dot(dz, dz), 1e-20));
         let d = zmag * log(zmag) / dzmag;
-        de = clamp(d / max(px, 1e-30), 0.0, 1.0);
+        var max_de = 1.;
+        if u.shadow != 0u {
+            max_de = 1000.;
+        }
+        de = clamp(d / max(px, 1e-30), 0.0, max_de);
     }
     return Sample(ci, de, true);
 }

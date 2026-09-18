@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use eframe::egui_wgpu::{self, wgpu};
 
+use crate::lights::{Light, MAX_LIGHT_COUNT};
+
 /// Maximum reference-orbit length (points) the storage buffer can hold. Also
 /// bounds the iteration count. 128k points * 8 bytes = 1 MiB.
 pub const MAX_REF_POINTS: usize = 1 << 17;
@@ -46,6 +48,8 @@ fn color_differs(a: &Uniforms, b: &Uniforms) -> bool {
     a.color_offset != b.color_offset
         || a.color_scale != b.color_scale
         || a.palette_id != b.palette_id
+        || a.shadow_palette_id != b.shadow_palette_id
+        || a.shadow != b.shadow
 }
 
 /// GPU-side view + coloring parameters. Layout must match `Uniforms` in the
@@ -64,12 +68,14 @@ pub struct Uniforms {
     /// 0 = Mandelbrot, 1 = Julia.
     pub is_julia: u32,
     pub palette_id: u32,
+    pub shadow_palette_id: u32,
     /// Supersampling factor per axis: 1 = off, 2 = 2×2 (4 samples).
     pub aa_level: u32,
     /// Iteration formula (`FractalKind::shader_id`).
     pub kind: u32,
     /// Exponent for the Multibrot kind.
     pub power: u32,
+    pub _pad: [u32; 1],
     /// Complex offset of the view center from the reference center, so a stale
     /// or reused reference (computed at a slightly different center) still maps
     /// correctly. Added to every pixel's per-pixel offset.
@@ -83,8 +89,8 @@ pub struct Uniforms {
     pub lambda_l: [f32; 2],
     /// 0 = escape-time coloring, 1 = distance-estimation shading.
     pub de_coloring: u32,
-    /// Padding to a 16-byte multiple (uniform buffer requirement).
-    pub _pad: [u32; 1],
+    // 0 = classic colors, 1 = shadows
+    pub shadow: u32,
 }
 
 /// Offscreen textures for the two-pass render, recreated whenever the widget's
@@ -128,6 +134,7 @@ pub struct FractalRenderer {
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
     ref_buffer: wgpu::Buffer,
+    lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     target_format: wgpu::TextureFormat,
     /// Generation of the reference orbit currently uploaded to `ref_buffer`.
@@ -167,6 +174,13 @@ impl FractalRenderer {
             label: Some("reference orbit"),
             size: (MAX_REF_POINTS * std::mem::size_of::<[f32; 2]>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lights parameters"),
+            size: (MAX_LIGHT_COUNT * std::mem::size_of::<Light>()) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -301,6 +315,16 @@ impl FractalRenderer {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let colorize_pipeline_layout =
@@ -409,6 +433,7 @@ impl FractalRenderer {
             bind_group_layout,
             uniform_buffer,
             ref_buffer,
+            lights_buffer,
             bind_group,
             target_format,
             uploaded_generation: u64::MAX,
@@ -476,6 +501,10 @@ impl FractalRenderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&data_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.lights_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -781,6 +810,7 @@ pub fn encode_png_with_progress(
 /// colourise pass (see `prepare`).
 pub struct FractalCallback {
     pub uniforms: Uniforms,
+    pub lights: Vec<Light>,
     pub reference: Arc<Vec<[f32; 2]>>,
     pub generation: u64,
     /// Widget size in physical pixels — the cache texture resolution.
@@ -827,7 +857,8 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
         let color_dirty = iter_dirty
             || renderer.colored.as_ref().is_none_or(|c| {
                 c.width != width || c.height != height || color_differs(&c.uniforms, &self.uniforms)
-            });
+            })
+            || true;
 
         if !color_dirty {
             return Vec::new(); // cache still valid; paint() just blits it
@@ -839,6 +870,10 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
             0,
             bytemuck::bytes_of(&self.uniforms),
         );
+        let mut bytes = [0; size_of::<Light>() * MAX_LIGHT_COUNT];
+        bytes[..self.lights.len() * size_of::<Light>()]
+            .copy_from_slice(bytemuck::cast_slice(&self.lights));
+        queue.write_buffer(&renderer.lights_buffer, 0, &bytes);
 
         if let Some(cache) = &renderer.cache {
             if iter_dirty {

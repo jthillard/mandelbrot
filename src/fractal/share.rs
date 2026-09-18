@@ -29,6 +29,8 @@ pub struct ShareState {
     pub color_offset: f32,
     /// Palette index (`palette_id` in the shader).
     pub palette: u32,
+    /// Shadow palette index (`shadow_palette_id` in the shader).
+    pub shadow_palette: u32,
 }
 
 impl ShareState {
@@ -110,6 +112,7 @@ impl ShareState {
             color_scale: map.get("cs").and_then(|s| s.parse().ok()).unwrap_or(0.02),
             color_offset: map.get("co").and_then(|s| s.parse().ok()).unwrap_or(0.0),
             palette: map.get("pal").and_then(|s| s.parse().ok()).unwrap_or(0),
+            shadow_palette: map.get("spal").and_then(|s| s.parse().ok()).unwrap_or(0),
         })
     }
 }
@@ -134,6 +137,7 @@ mod tests {
             color_scale: 0.02,
             color_offset: 0.25,
             palette: 3,
+            shadow_palette: 1,
         };
         let d = ShareState::decode(&s.encode()).unwrap();
         assert_eq!(d.julia, s.julia);
@@ -146,6 +150,7 @@ mod tests {
         assert_eq!(d.julia_c, s.julia_c);
         assert_eq!(d.phoenix_p, s.phoenix_p);
         assert_eq!(d.palette, s.palette);
+        assert_eq!(d.shadow_palette, s.shadow_palette);
     }
 
     #[test]
