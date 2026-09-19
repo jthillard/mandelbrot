@@ -45,9 +45,23 @@ pub struct Cli {
     #[arg(long)]
     pub export: bool,
 
-    /// Output path for --export (default: fractal-<timestamp>.png).
+    /// Output path for --export/--headless (default: fractal-<timestamp>.png).
     #[arg(long, value_name = "PATH")]
     pub export_path: Option<String>,
+
+    /// Run without opening a window: render the current view to a PNG and
+    /// exit. Combine with --kind/--julia/--share/--view etc. to pick what to
+    /// render. Not yet supported with --buddhabrot.
+    #[arg(long)]
+    pub headless: bool,
+
+    /// Output image width in pixels (--headless only).
+    #[arg(long, value_name = "PX", default_value_t = 1920)]
+    pub width: u32,
+
+    /// Output image height in pixels (--headless only).
+    #[arg(long, value_name = "PX", default_value_t = 1080)]
+    pub height: u32,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

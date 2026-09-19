@@ -16,6 +16,8 @@ mod view;
 #[cfg(not(target_arch = "wasm32"))]
 mod cli;
 #[cfg(not(target_arch = "wasm32"))]
+mod headless;
+#[cfg(not(target_arch = "wasm32"))]
 mod worker;
 
 use app::FractalApp;
@@ -49,10 +51,23 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
+    use clap::Parser as _;
+
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
         .init();
+
+    let cli = cli::Cli::parse();
+    if cli.headless {
+        return match headless::run(cli) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
 
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,

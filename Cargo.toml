@@ -14,6 +14,7 @@ png = "0.18.1"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = "0.11.11"
 clap = { version = "4.5.51", features = ["derive"] }
+pollster = "1.0.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-channel = { version = "0.3.34", default-features = false, features = ["alloc", "std"] }

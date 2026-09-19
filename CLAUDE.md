@@ -31,10 +31,15 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the wasm-bindgen
 python3 -m http.server -d dist 8080
 ```
 
-Native debug env vars (see `src/app.rs`, near the top of `FractalApp::new`):
-`MANDEL_KIND`, `MANDEL_POWER`, `MANDEL_JULIA="re,im"`, `MANDEL_SHARE="<fragment>"`,
-`MANDEL_VIEW="re,im,half_height[,iterations]"`, `MANDEL_DE=1`,
-`MANDEL_BUDDHABROT=1`, `MANDEL_EXPORT=1` (+ `MANDEL_EXPORT_PATH=out.png`).
+Native CLI flags (`src/cli.rs`, applied in `FractalApp::apply_cli`): `--kind`,
+`--power`, `--julia re,im`, `--share <fragment>`,
+`--view re,im,half_height[,iterations]`, `--de`, `--buddhabrot`,
+`--buddha-palette`, `--export` (+ `--export-path out.png`). `--headless`
+(`src/headless.rs`) skips the window entirely: it builds the same view from
+the other flags, creates its own offscreen wgpu device, and renders straight
+to a PNG (`--width`/`--height`, default 1920×1080) — implies `--export`'s
+save behavior without needing a GPU-backed window/event loop. Not yet
+supported with `--buddhabrot`. Run `mandelbrot --help` for the full list.
 
 There's no GPU in most sandboxes: `cargo check`/`cargo test --test shader_valid`
 are the fast, headless way to validate a change. `cargo test` also runs but

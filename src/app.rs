@@ -2,16 +2,16 @@ use std::sync::{Arc, Mutex};
 
 use eframe::CreationContext;
 use eframe::egui_wgpu;
+#[cfg(target_arch = "wasm32")]
 use eframe::egui_wgpu::wgpu;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::cli::Cli;
 use crate::fractal::{
     BuddhabrotCallback, BuddhabrotRenderer, BuddhabrotUniforms, ExportRender, FractalCallback,
-    FractalKind, FractalRenderer, MAX_REF_POINTS, ShareState, Uniforms,
+    FractalKind, FractalRenderer, MAX_REF_POINTS, ShareState, Uniforms, compute_reference,
+    compute_set_reference,
 };
-#[cfg(target_arch = "wasm32")]
-use crate::fractal::{compute_reference, compute_set_reference};
 use crate::lights::Light;
 use crate::view::{
     Big, DEFAULT_HALF_HEIGHT, ViewState, big_from_decimal_str, big_from_f64, big_to_decimal_str,
@@ -395,6 +395,27 @@ impl FractalApp {
             guard.callback_resources.insert(buddhabrot_renderer);
         }
 
+        let mut app = Self::default_state();
+
+        // On the web, restore a shared view from the URL fragment (#...).
+        #[cfg(target_arch = "wasm32")]
+        if let Some(frag) = web_location_hash() {
+            if let Some(state) = ShareState::decode(&frag) {
+                app.apply_share(&state);
+            }
+        }
+
+        // Debug/testing hooks, driven by CLI flags.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.apply_cli(Cli::parse());
+
+        app
+    }
+
+    /// Build the app's default state (no window, no GPU, no CLI applied yet).
+    /// Shared by the windowed app (`new`, which then layers CLI/share-link
+    /// overrides on top) and headless rendering.
+    pub(crate) fn default_state() -> Self {
         let view = ViewState::default();
         let ref_center_re = view.center_re.clone();
         let ref_center_im = view.center_im.clone();
@@ -404,7 +425,7 @@ impl FractalApp {
         let center_im_edit = big_to_decimal_str(&view.center_im, sig);
         let zoom_edit = format_magnification(view.magnification());
 
-        let mut app = Self {
+        Self {
             view,
             mode: FractalMode::Mandelbrot,
             kind: FractalKind::Mandelbrot,
@@ -455,63 +476,53 @@ impl FractalApp {
             center_im_edit,
             zoom_edit,
             zoom_edited: false,
-        };
+        }
+    }
 
-        // On the web, restore a shared view from the URL fragment (#...).
-        #[cfg(target_arch = "wasm32")]
-        if let Some(frag) = web_location_hash() {
-            if let Some(state) = ShareState::decode(&frag) {
-                app.apply_share(&state);
+    /// Apply native CLI flags on top of the default state: fractal kind/mode,
+    /// a restored share link or explicit view, coloring toggles, and export
+    /// options. Shared by the windowed app and headless rendering.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn apply_cli(&mut self, cli: Cli) {
+        if let Some(k) = cli.kind {
+            self.kind = k.into();
+            if let Some(p) = cli.power {
+                self.power = p.clamp(2, 8);
+            }
+            self.view = Self::default_view_for(self.mode, self.kind);
+        }
+        if let Some(jc) = cli.julia {
+            let p: Vec<&str> = jc.split(',').collect();
+            if let (Some(Ok(re)), Some(Ok(im))) = (
+                p.first().map(|s| s.trim().parse::<f64>()),
+                p.get(1).map(|s| s.trim().parse::<f64>()),
+            ) {
+                self.mode = FractalMode::Julia;
+                self.julia_c = (re, im);
+                self.view = Self::default_view_for(FractalMode::Julia, self.kind);
             }
         }
-
-        // Debug/testing hooks, driven by CLI flags.
-        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(frag) = cli.share
+            && let Some(state) = ShareState::decode(&frag)
         {
-            let cli = Cli::parse();
-
-            if let Some(k) = cli.kind {
-                app.kind = k.into();
-                if let Some(p) = cli.power {
-                    app.power = p.clamp(2, 8);
-                }
-                app.view = Self::default_view_for(app.mode, app.kind);
-            }
-            if let Some(jc) = cli.julia {
-                let p: Vec<&str> = jc.split(',').collect();
-                if let (Some(Ok(re)), Some(Ok(im))) = (
-                    p.first().map(|s| s.trim().parse::<f64>()),
-                    p.get(1).map(|s| s.trim().parse::<f64>()),
-                ) {
-                    app.mode = FractalMode::Julia;
-                    app.julia_c = (re, im);
-                    app.view = Self::default_view_for(FractalMode::Julia, app.kind);
-                }
-            }
-            if let Some(frag) = cli.share
-                && let Some(state) = ShareState::decode(&frag)
-            {
-                app.apply_share(&state);
-            }
-            if let Some(spec) = cli.view {
-                app.apply_view_spec(&spec);
-            }
-            if cli.de {
-                app.de_coloring = true;
-            }
-            if cli.buddhabrot {
-                app.buddhabrot = true;
-            }
-            if let Some(p) = cli.buddha_palette {
-                app.buddha_palette = p.min(BUDDHA_PALETTE_NAMES.len() as u32 - 1);
-            }
-            app.export_path = cli.export_path;
-            if cli.export {
-                app.export_requested = true;
-            }
+            self.apply_share(&state);
         }
-
-        app
+        if let Some(spec) = cli.view {
+            self.apply_view_spec(&spec);
+        }
+        if cli.de {
+            self.de_coloring = true;
+        }
+        if cli.buddhabrot {
+            self.buddhabrot = true;
+        }
+        if let Some(p) = cli.buddha_palette {
+            self.buddha_palette = p.min(BUDDHA_PALETTE_NAMES.len() as u32 - 1);
+        }
+        self.export_path = cli.export_path;
+        if cli.export {
+            self.export_requested = true;
+        }
     }
 
     /// Apply a view spec "re,im,half_height[,iterations]" (re/im are decimal,
@@ -726,6 +737,14 @@ impl FractalApp {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// The current reference orbit, as uploaded to the GPU. Used by headless
+    /// rendering to build its own `ExportRender` without going through
+    /// `egui_wgpu`'s callback machinery.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn reference_points(&self) -> &[[f32; 2]] {
+        &self.reference
+    }
+
     /// Recompute the reference orbit when needed. Native: dispatch to a worker
     /// thread and pick up completed results. Web: compute inline.
     fn ensure_reference(&mut self) {
@@ -804,7 +823,63 @@ impl FractalApp {
         }
     }
 
-    fn make_uniforms(&self, aspect: f64) -> Uniforms {
+    /// Compute the reference orbit for the current view synchronously, on the
+    /// calling thread — unlike `ensure_reference`, which dispatches to the
+    /// native worker (or, on wasm, computes inline but still runs once per
+    /// frame poll). Used by headless rendering, which has no frame loop to
+    /// poll a background result on and only ever needs one reference.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn compute_reference_blocking(&mut self) {
+        if self.auto_iterations {
+            self.max_iterations = self.auto_iteration_count();
+        }
+        let mut key = self.current_key();
+        let precision = self.view.precision_bits();
+        let max_iter = key.iter.min(MAX_REF_POINTS as u32 - 1);
+
+        // Lambda in Set mode has a static fractal centered at origin.
+        if key.kind == FractalKind::Lambda && !key.julia {
+            key.center_re = big_from_f64(0.0, precision);
+            key.center_im = big_from_f64(0.0, precision);
+        }
+
+        let points = if key.julia {
+            let jr = big_from_f64(key.julia_c.0, precision);
+            let ji = big_from_f64(key.julia_c.1, precision);
+            compute_reference(
+                &key.center_re,
+                &key.center_im,
+                &jr,
+                &ji,
+                max_iter,
+                precision,
+                key.kind,
+                key.power,
+                key.phoenix_p,
+                key.lambda_l,
+            )
+        } else {
+            compute_set_reference(
+                &key.center_re,
+                &key.center_im,
+                max_iter,
+                precision,
+                key.kind,
+                key.power,
+                key.phoenix_p,
+                key.lambda_l,
+            )
+        };
+        self.apply_reference(
+            points,
+            key.center_re.clone(),
+            key.center_im.clone(),
+            key.half_height,
+        );
+        self.last_request = Some(key);
+    }
+
+    pub(crate) fn make_uniforms(&self, aspect: f64) -> Uniforms {
         let (span_x, span_y) = self.view.span(aspect);
         Uniforms {
             span: [span_x as f32, span_y as f32],
@@ -905,9 +980,6 @@ impl FractalApp {
         self.status = None;
         self.export = Some(Arc::clone(&shared));
 
-        // Progress budget: rendering fills [0, RENDER_END], encoding the rest.
-        const RENDER_END: f32 = 0.6;
-
         #[cfg(not(target_arch = "wasm32"))]
         {
             let name = self
@@ -926,51 +998,11 @@ impl FractalApp {
                     uniforms,
                     reference.as_slice(),
                 );
-
-                // Render the image tile by tile, waiting for each so progress
-                // reflects real GPU work.
-                for t in 0..er.tiles {
-                    er.render_tile(&device, &queue, t);
-                    let _ = device.poll(wgpu::PollType::Wait {
-                        submission_index: None,
-                        timeout: None,
+                let sh = Arc::clone(&shared);
+                let png =
+                    crate::fractal::export_to_png_blocking(&device, &queue, &er, |phase, f| {
+                        set_progress(&sh, phase, f)
                     });
-                    let done = (t + 1) as f32 / er.tiles as f32;
-                    set_progress(&shared, "Rendering", RENDER_END * done);
-                }
-                er.copy_to_readback(&device, &queue);
-
-                // Wait for the copy, then read the mapped bytes.
-                let (tx, rx) = std::sync::mpsc::channel();
-                er.readback()
-                    .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |res| {
-                        let _ = tx.send(res);
-                    });
-                let _ = device.poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: None,
-                });
-                let _ = rx.recv();
-
-                set_progress(&shared, "Encoding", RENDER_END);
-                let png = {
-                    let data = er
-                        .readback()
-                        .slice(..)
-                        .get_mapped_range()
-                        .expect("map readback buffer");
-                    let sh = Arc::clone(&shared);
-                    crate::fractal::encode_png_with_progress(
-                        &data,
-                        er.width,
-                        er.height,
-                        er.padded_bpr,
-                        er.swap_rb,
-                        |f| set_progress(&sh, "Encoding", RENDER_END + (0.97 - RENDER_END) * f),
-                    )
-                };
-                er.readback().unmap();
 
                 set_progress(&shared, "Saving", 0.98);
                 let result = std::fs::write(&name, &png)
@@ -981,6 +1013,8 @@ impl FractalApp {
         }
         #[cfg(target_arch = "wasm32")]
         {
+            // Progress budget: rendering fills [0, RENDER_END], encoding the rest.
+            const RENDER_END: f32 = 0.6;
             wasm_bindgen_futures::spawn_local(async move {
                 let er = ExportRender::new(
                     &device,
@@ -1872,7 +1906,7 @@ fn finish_export(shared: &Arc<Mutex<ExportShared>>, result: Result<String, Strin
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn unix_timestamp() -> u64 {
+pub(crate) fn unix_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

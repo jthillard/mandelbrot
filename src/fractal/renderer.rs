@@ -757,6 +757,59 @@ impl ExportRender {
     }
 }
 
+/// Render `er` tile by tile (blocking on the GPU after each tile so progress
+/// reflects real work), read it back, and encode the result as PNG bytes.
+/// Blocks the calling thread throughout, so it's only for native targets:
+/// the UI export path runs it on a background thread, headless rendering
+/// runs it directly since it has no frame loop to share a thread with.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn export_to_png_blocking(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    er: &ExportRender,
+    mut on_progress: impl FnMut(&'static str, f32),
+) -> Vec<u8> {
+    // Progress budget: rendering fills [0, RENDER_END], encoding the rest.
+    const RENDER_END: f32 = 0.6;
+
+    for t in 0..er.tiles {
+        er.render_tile(device, queue, t);
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let done = (t + 1) as f32 / er.tiles as f32;
+        on_progress("Rendering", RENDER_END * done);
+    }
+    er.copy_to_readback(device, queue);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    er.readback()
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    let _ = rx.recv();
+
+    on_progress("Encoding", RENDER_END);
+    let png = {
+        let data = er
+            .readback()
+            .slice(..)
+            .get_mapped_range()
+            .expect("map readback buffer");
+        encode_png_with_progress(&data, er.width, er.height, er.padded_bpr, er.swap_rb, |f| {
+            on_progress("Encoding", RENDER_END + (0.97 - RENDER_END) * f)
+        })
+    };
+    er.readback().unmap();
+    png
+}
+
 /// Convert a padded BGRA/RGBA readback into tightly-packed RGBA8 and encode it
 /// as PNG bytes, reporting progress in `[0, 1]` via `on_progress` as rows are
 /// streamed to the compressor (encoding is the slow, subdividable phase).
