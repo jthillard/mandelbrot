@@ -1253,8 +1253,8 @@ impl FractalApp {
         self.info_open = open;
     }
 
-    /// Help window: what the app does, plus a reference for mouse/touch
-    /// controls (there are no in-app keyboard shortcuts today).
+    /// Help window: what the app does, plus a reference for mouse/touch and
+    /// keyboard controls.
     fn help_window(&mut self, ctx: &egui::Context) {
         let mut open = self.help_open;
         egui::Window::new("Help")
@@ -1305,6 +1305,32 @@ impl FractalApp {
                         ui.separator();
 
                         ui.heading("Keyboard");
+                        egui::Grid::new("help_keyboard_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Arrow keys");
+                                ui.label("Pan the view");
+                                ui.end_row();
+                                ui.label("Z / S");
+                                ui.label("Zoom in / out toward the center");
+                                ui.end_row();
+                                ui.label("+ / -");
+                                ui.label("Increase / decrease iterations");
+                                ui.end_row();
+                                ui.label("R");
+                                ui.label("Reset to the default view");
+                                ui.end_row();
+                                ui.label("H");
+                                ui.label("Toggle this Help window");
+                                ui.end_row();
+                                ui.label("I");
+                                ui.label("Toggle the Info window");
+                                ui.end_row();
+                                ui.label("A");
+                                ui.label("Toggle antialiasing (2×2)");
+                                ui.end_row();
+                            });
                         ui.separator();
 
                         ui.heading("Tips");
@@ -1930,6 +1956,84 @@ impl FractalApp {
                 .zoom_at_pixel(off.x as f64, off.y as f64, height_px, factor);
             interacted = true;
             ui.ctx().request_repaint();
+        }
+
+        // Keyboard: arrows pan, z/s zoom in/out, +/- adjust iterations, R
+        // resets the view, H/I toggle the Help/Info windows. Skipped while a
+        // text field (e.g. the center/zoom edit boxes) has focus.
+        if !ui.ctx().egui_wants_keyboard_input() {
+            let dt = ui.input(|i| i.stable_dt as f64).clamp(0.0, 0.1);
+            let (left, right, up, down, zoom_in, zoom_out) = ui.input(|i| {
+                (
+                    i.key_down(egui::Key::ArrowLeft),
+                    i.key_down(egui::Key::ArrowRight),
+                    i.key_down(egui::Key::ArrowUp),
+                    i.key_down(egui::Key::ArrowDown),
+                    i.key_down(egui::Key::Z),
+                    i.key_down(egui::Key::S),
+                )
+            });
+
+            // Pixels/sec pan speed — matches a brisk mouse drag regardless of
+            // frame rate. See `pan_pixels`'s screen-space (+x right, +y down)
+            // convention: Right/Down pan the *camera* right/down, which is
+            // the opposite delta sign from a drag that would show the same
+            // content (a drag grabs the canvas; these keys move the camera).
+            const PAN_SPEED_PX: f64 = 700.0;
+            let mut dx = 0.0;
+            let mut dy = 0.0;
+            if left {
+                dx += PAN_SPEED_PX * dt;
+            }
+            if right {
+                dx -= PAN_SPEED_PX * dt;
+            }
+            if down {
+                dy -= PAN_SPEED_PX * dt;
+            }
+            if up {
+                dy += PAN_SPEED_PX * dt;
+            }
+            if dx != 0.0 || dy != 0.0 {
+                self.view.pan_pixels(dx, dy, height_px);
+                interacted = true;
+            }
+
+            // e-folds/sec, same scale as the auto-zoom animation.
+            const ZOOM_SPEED: f64 = 1.0;
+            if zoom_in != zoom_out {
+                let rate = if zoom_in { ZOOM_SPEED } else { -ZOOM_SPEED };
+                let factor = (-rate * dt).exp();
+                self.view.zoom_at_pixel(0.0, 0.0, height_px, factor);
+                interacted = true;
+            }
+            if left || right || up || down || zoom_in || zoom_out {
+                ui.ctx().request_repaint();
+            }
+
+            if ui.input(|i| i.key_pressed(egui::Key::R)) {
+                self.view = Self::default_view_for(self.mode, self.kind);
+                interacted = true;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::H)) {
+                self.help_open = !self.help_open;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::I)) {
+                self.info_open = !self.info_open;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::A)) {
+                self.antialias = !self.antialias;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)) {
+                self.auto_iterations = false;
+                self.max_iterations = ((self.max_iterations as f64 * 1.25).round() as u32)
+                    .clamp(32, MAX_REF_POINTS as u32 - 1);
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Minus)) {
+                self.auto_iterations = false;
+                self.max_iterations = ((self.max_iterations as f64 / 1.25).round() as u32)
+                    .clamp(32, MAX_REF_POINTS as u32 - 1);
+            }
         }
 
         if self.buddhabrot {
