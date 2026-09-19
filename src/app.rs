@@ -4,6 +4,8 @@ use eframe::CreationContext;
 use eframe::egui_wgpu;
 use eframe::egui_wgpu::wgpu;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::cli::Cli;
 use crate::fractal::{
     BuddhabrotCallback, BuddhabrotRenderer, BuddhabrotUniforms, ExportRender, FractalCallback,
     FractalKind, FractalRenderer, MAX_REF_POINTS, ShareState, Uniforms,
@@ -15,6 +17,8 @@ use crate::view::{
     Big, DEFAULT_HALF_HEIGHT, ViewState, big_from_decimal_str, big_from_f64, big_to_decimal_str,
     precision_for,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use clap::Parser;
 
 const BAILOUT_SQ: f32 = 1.0e6;
 /// Cap on exported image dimension (px), to stay within GPU texture limits.
@@ -338,6 +342,9 @@ pub struct FractalApp {
     export_requested: bool,
     /// Progress/handle for an in-flight PNG export, if any.
     export: Option<Arc<Mutex<ExportShared>>>,
+    /// Output path for `--export` (native CLI only); falls back to a
+    /// timestamped name when unset.
+    export_path: Option<String>,
     /// Short status line (saved path, "link copied", errors).
     status: Option<String>,
 
@@ -442,6 +449,7 @@ impl FractalApp {
             last_interact_time: -1.0e9,
             export_requested: false,
             export: None,
+            export_path: None,
             status: None,
             center_re_edit,
             center_im_edit,
@@ -457,28 +465,19 @@ impl FractalApp {
             }
         }
 
-        // Debug/testing hooks.
+        // Debug/testing hooks, driven by CLI flags.
         #[cfg(not(target_arch = "wasm32"))]
         {
-            if let Ok(k) = std::env::var("MANDEL_KIND") {
-                app.kind = match k.trim().to_ascii_lowercase().as_str() {
-                    "burningship" | "burning_ship" | "ship" => FractalKind::BurningShip,
-                    "tricorn" | "mandelbar" => FractalKind::Tricorn,
-                    "multibrot" | "multi" => FractalKind::Multibrot,
-                    "celtic" => FractalKind::Celtic,
-                    "perpendicular" | "perp" => FractalKind::Perpendicular,
-                    "buffalo" => FractalKind::Buffalo,
-                    "phoenix" => FractalKind::Phoenix,
-                    _ => FractalKind::Mandelbrot,
-                };
-                if let Ok(p) = std::env::var("MANDEL_POWER")
-                    && let Ok(p) = p.trim().parse::<u32>()
-                {
+            let cli = Cli::parse();
+
+            if let Some(k) = cli.kind {
+                app.kind = k.into();
+                if let Some(p) = cli.power {
                     app.power = p.clamp(2, 8);
                 }
                 app.view = Self::default_view_for(app.mode, app.kind);
             }
-            if let Ok(jc) = std::env::var("MANDEL_JULIA") {
+            if let Some(jc) = cli.julia {
                 let p: Vec<&str> = jc.split(',').collect();
                 if let (Some(Ok(re)), Some(Ok(im))) = (
                     p.first().map(|s| s.trim().parse::<f64>()),
@@ -489,26 +488,25 @@ impl FractalApp {
                     app.view = Self::default_view_for(FractalMode::Julia, app.kind);
                 }
             }
-            if let Ok(frag) = std::env::var("MANDEL_SHARE")
+            if let Some(frag) = cli.share
                 && let Some(state) = ShareState::decode(&frag)
             {
                 app.apply_share(&state);
             }
-            if let Ok(spec) = std::env::var("MANDEL_VIEW") {
+            if let Some(spec) = cli.view {
                 app.apply_view_spec(&spec);
             }
-            if std::env::var("MANDEL_DE").is_ok() {
+            if cli.de {
                 app.de_coloring = true;
             }
-            if std::env::var("MANDEL_BUDDHABROT").is_ok() {
+            if cli.buddhabrot {
                 app.buddhabrot = true;
             }
-            if let Ok(p) = std::env::var("MANDEL_BUDDHA_PALETTE")
-                && let Ok(p) = p.trim().parse::<u32>()
-            {
+            if let Some(p) = cli.buddha_palette {
                 app.buddha_palette = p.min(BUDDHA_PALETTE_NAMES.len() as u32 - 1);
             }
-            if std::env::var("MANDEL_EXPORT").is_ok() {
+            app.export_path = cli.export_path;
+            if cli.export {
                 app.export_requested = true;
             }
         }
@@ -912,8 +910,10 @@ impl FractalApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let name = std::env::var("MANDEL_EXPORT_PATH")
-                .unwrap_or_else(|_| format!("fractal-{}.png", unix_timestamp()));
+            let name = self
+                .export_path
+                .clone()
+                .unwrap_or_else(|| format!("fractal-{}.png", unix_timestamp()));
             std::thread::spawn(move || {
                 let er = ExportRender::new(
                     &device,

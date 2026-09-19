@@ -9,10 +9,12 @@
 // and calls the wasm `main`, which boots eframe onto the page's <canvas>.
 
 mod app;
-mod lights;
 mod fractal;
+mod lights;
 mod view;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod worker;
 
