@@ -67,6 +67,23 @@ fn kind_label(kind: FractalKind) -> &'static str {
         .unwrap_or("Mandelbrot")
 }
 
+/// The iteration formula for a kind, in human-readable notation (mirrors the
+/// doc comments on `FractalKind`'s variants). `power` is only used by
+/// Multibrot.
+fn kind_formula(kind: FractalKind, power: u32) -> String {
+    match kind {
+        FractalKind::Mandelbrot => "z = z² + c".to_string(),
+        FractalKind::BurningShip => "z = (|Re(z)| + i|Im(z)|)² + c".to_string(),
+        FractalKind::Tricorn => "z = conj(z)² + c".to_string(),
+        FractalKind::Multibrot => format!("z = z^{power} + c"),
+        FractalKind::Celtic => "z = |Re(z²)| + i·Im(z²) + c".to_string(),
+        FractalKind::Perpendicular => "z = (x² − y²) − 2x|y|i + c".to_string(),
+        FractalKind::Buffalo => "z = |Re(z²)| − i|Im(z²)| + c".to_string(),
+        FractalKind::Phoenix => "z = z² + c + p·z_prev".to_string(),
+        FractalKind::Lambda => "z = λ·z(1 − z)".to_string(),
+    }
+}
+
 type JuliaPreset = (&'static str, f64, f64, u32, Option<(f64, f64)>);
 
 /// Nice-looking Julia constants offered as presets.
@@ -303,6 +320,11 @@ pub struct FractalApp {
     /// Whether the app is in fullscreen (browser Fullscreen API on web, viewport
     /// fullscreen on native). Kept in sync with the real state each frame.
     fullscreen: bool,
+    /// Whether the "Fractal Info" popup (formula/constants/zoom for the
+    /// current view) is open.
+    info_open: bool,
+    /// Whether the Help window (about + mouse/touch controls) is open.
+    help_open: bool,
     /// Time-based animation of colours / Julia c / Phoenix p / zoom.
     anim: AnimState,
 
@@ -452,6 +474,8 @@ impl FractalApp {
             buddha_accumulate: true,
             controls_open: true,
             fullscreen: false,
+            info_open: false,
+            help_open: false,
             anim: AnimState::default(),
             fps: 0.0,
             fps_frames: 0,
@@ -1127,6 +1151,13 @@ impl FractalApp {
                                 self.fullscreen = !self.fullscreen;
                                 self.apply_fullscreen(ui.ctx());
                             }
+                            if ui
+                                .button("Help")
+                                .on_hover_text("About this app, and mouse/touch controls")
+                                .clicked()
+                            {
+                                self.help_open = !self.help_open;
+                            }
                             // FPS readout. Monospace + fixed width so the number
                             // changing doesn't jitter the button row.
                             ui.add(
@@ -1143,6 +1174,147 @@ impl FractalApp {
                         });
                     });
             });
+    }
+
+    /// Floating bottom-left overlay: a single button that toggles the
+    /// "Fractal Info" window. Kept separate from `overlay_buttons` (top-left)
+    /// so it stays out of the way of the panel toggle / fullscreen controls,
+    /// but is still reachable even when the controls panel is collapsed.
+    fn info_button(&mut self, ui: &mut egui::Ui) {
+        egui::Area::new(egui::Id::new("info_button"))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .shadow(egui::Shadow::NONE)
+                    .show(ui, |ui| {
+                        if ui
+                            .button("Fractal infos")
+                            .on_hover_text("Show details about the current fractal")
+                            .clicked()
+                        {
+                            self.info_open = !self.info_open;
+                        }
+                    });
+            });
+    }
+
+    /// Window with details about what's currently on screen: formula, active
+    /// per-kind constants, zoom depth, iteration count. Reads live state, so
+    /// it stays correct as the user pans/zooms/switches kinds.
+    fn info_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.info_open;
+        egui::Window::new("Fractal Info")
+            .id(egui::Id::new("info_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -44.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(kind_label(self.kind))
+                        .strong()
+                        .heading(),
+                );
+                let mode_label = if self.buddhabrot {
+                    "Buddhabrot mode — orbit density (random c, z₀ = 0)"
+                } else {
+                    match self.mode {
+                        FractalMode::Mandelbrot => {
+                            "Mandelbrot mode — parameter space (c varies per pixel, z₀ = 0)"
+                        }
+                        FractalMode::Julia => {
+                            "Julia mode — dynamical plane for a fixed c (z₀ varies per pixel)"
+                        }
+                    }
+                };
+                ui.label(mode_label);
+                ui.separator();
+
+                ui.label(format!("formula: {}", kind_formula(self.kind, self.power)));
+                if self.mode == FractalMode::Julia {
+                    ui.label(format!("c = {:.6} {:+.6}i", self.julia_c.0, self.julia_c.1));
+                }
+                if self.kind == FractalKind::Phoenix {
+                    ui.label(format!(
+                        "p = {:.6} {:+.6}i",
+                        self.phoenix_p.0, self.phoenix_p.1
+                    ));
+                }
+                if self.kind == FractalKind::Lambda {
+                    ui.label(format!(
+                        "λ = {:.6} {:+.6}i",
+                        self.lambda_l.0, self.lambda_l.1
+                    ));
+                }
+                ui.separator();
+
+                ui.label(self.kind.description());
+            });
+        self.info_open = open;
+    }
+
+    /// Help window: what the app does, plus a reference for mouse/touch
+    /// controls (there are no in-app keyboard shortcuts today).
+    fn help_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.help_open;
+        egui::Window::new("Help")
+            .id(egui::Id::new("help_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(480.0)
+                    .show(ui, |ui| {
+                        ui.heading("About");
+                        ui.label(
+                            "A deep-zoom fractal explorer. It renders the Mandelbrot set \
+                             and several related fractals (Burning Ship, Tricorn, \
+                             Multibrot, Celtic, Perpendicular, Buffalo, Phoenix, Lambda).",
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            "Each fractals can be rendered in different modes: \n\
+                             • Mandelbrot mode fixes z₀=0 and then for each pixel, set c as it's position \
+                             in the complex plane. \n\
+                             • Julia mode fixes c and instead varies the \
+                             starting point z₀ across the plane. \n\
+                             • Buddhabrot mode switches to a different, Monte-Carlo rendering of orbit density \
+                             instead of the ordinary escape-time set.",
+                        );
+                        ui.separator();
+
+                        ui.heading("Mouse & touch");
+                        egui::Grid::new("help_mouse_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Drag");
+                                ui.label("Pan the view");
+                                ui.end_row();
+                                ui.label("Scroll / trackpad");
+                                ui.label("Zoom toward the cursor");
+                                ui.end_row();
+                                ui.label("Pinch (touch)");
+                                ui.label("Zoom toward the gesture center");
+                                ui.end_row();
+                                ui.label("Two-finger drag (touch)");
+                                ui.label("Pan the view");
+                                ui.end_row();
+                            });
+                        ui.separator();
+
+                        ui.heading("Keyboard");
+                        ui.separator();
+
+                        ui.heading("Tips");
+                        ui.label(
+                            "• \"Copy link\" (in the panel) encodes the exact view so it \
+                             can be reopened later or sent to someone else.",
+                        );
+                    });
+            });
+        self.help_open = open;
     }
 
     /// Push the desired fullscreen state to the platform.
@@ -1878,6 +2050,9 @@ impl eframe::App for FractalApp {
         // Floating overlay, always reachable (even when the panel is collapsed):
         // toggle the panel and toggle fullscreen. Essential on a phone.
         self.overlay_buttons(ui);
+        self.info_button(ui);
+        self.info_window(ui.ctx());
+        self.help_window(ui.ctx());
 
         if std::mem::take(&mut self.export_requested) {
             self.do_export(frame);

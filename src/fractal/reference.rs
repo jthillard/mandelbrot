@@ -37,6 +37,26 @@ pub enum FractalKind {
     Lambda = 8,
 }
 
+impl FractalKind {
+    pub fn description(&self) -> &str {
+        match self {
+            FractalKind::Mandelbrot => {
+                "The Mandelbrot set is the most famous fractal set, obtained with the simplest escape-time formula. This set represents all Julia fractals: each points of the Mandelbrot set is related to a specific Julia fractal."
+            }
+            FractalKind::BurningShip => {
+                "A variation of the famous Mandelbrot set, using absolute values on the real and imaginary part of each iterations."
+            }
+            FractalKind::Tricorn => "The Tricorn set is obtained using the same formula as the Mandelbrot set, taking the complex conjugate of the previous iteration.",
+            FractalKind::Multibrot => "Multibrot use the same formula as the Mandelbrot set, with a bigger exposant.",
+            FractalKind::Celtic => "",
+            FractalKind::Perpendicular => "",
+            FractalKind::Buffalo => "",
+            FractalKind::Phoenix => "",
+            FractalKind::Lambda => "",
+        }
+    }
+}
+
 /// Reference orbit escapes once |Z|^2 exceeds this. Kept larger than the pixel
 /// bailout so pixels escaping alongside the reference can still reach their
 /// bailout before the stored orbit runs out.
