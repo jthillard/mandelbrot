@@ -61,11 +61,15 @@ pixel is a handful of `f32` complex multiplies.
 - `src/view.rs` — `ViewState`; center is arbitrary-precision `FBig` (`Big`
   type alias), pixel scale stays `f64` (still in-range at 10³⁰×). Precision
   (bits) scales with zoom depth (`precision_for`).
-- `src/fractal/reference.rs` — `FractalKind` enum (Mandelbrot, Burning Ship,
-  Tricorn, Multibrot, Celtic, Perpendicular, Buffalo, Phoenix, Lambda) and
-  `compute_reference`/`compute_set_reference`: iterate the chosen formula at
-  high precision on the CPU, emitting `Z_n` as `f32` pairs — that's the
-  reference orbit the GPU perturbs from.
+- `src/fractal/kind.rs` — the `FractalKind` enum (Mandelbrot, Burning Ship,
+  Tricorn, Multibrot, Celtic, Perpendicular, Buffalo, Phoenix, Lambda,
+  Complex Multibrot) plus everything that only needs to switch on it:
+  `label`/`description`/`formula` (UI text), `share_tag`/`from_share_tag`
+  (share-link encoding), `default_set_view` (per-kind starting view), and the
+  `ALL` array used to enumerate every kind.
+- `src/fractal/reference.rs` — `compute_reference`/`compute_set_reference`:
+  iterate the chosen formula at high precision on the CPU, emitting `Z_n` as
+  `f32` pairs — that's the reference orbit the GPU perturbs from.
 - `src/shaders/*.wgsl` — none of these are standalone WGSL modules; WGSL has
   no `#include`, so each is compiled by concatenating plain-text fragments
   with `concat!`/`include_str!` at the `create_shader_module` call site (see
@@ -106,29 +110,31 @@ pixel is a handful of `f32` complex multiplies.
   `should_request`/`ensure_reference` (decide when the reference is stale and
   dispatch/collect it), `make_uniforms` (assemble the per-frame `Uniforms`),
   `tick_animations` (drives the "morph c/p/λ" and auto-zoom animations),
-  `default_view_for` (per-kind starting view). `KINDS`, `JULIA_PRESETS`, and
-  `SET_PRESETS` are sized as `[T; FractalKind::<last variant> as usize + 1]` —
-  adding a new `FractalKind` means bumping all three (and adding an empty
-  `&[]` slot to the two preset arrays if the kind has none).
+  `default_view_for` (wraps `FractalKind::default_set_view`, adding the
+  kind-independent Julia case). `JULIA_PRESETS` and `SET_PRESETS` are sized as
+  `[T; FractalKind::<last variant> as usize + 1]` — adding a new `FractalKind`
+  means bumping both (and adding an empty `&[]` slot to each if the kind has
+  none), plus adding it to `FractalKind::ALL` in `kind.rs`.
 - `src/fractal/share.rs` — `ShareState`: encodes the full view (mode, kind,
   full-precision decimal center, zoom, iterations, per-kind constants,
   coloring) as a `#`-fragment URL for bookmarking/sharing deep-zoom locations.
 
 ### Adding a new `FractalKind`
 
-Touches, in order: `reference.rs` (enum variant + CPU iteration formula, and a
-test comparing against a naive `f64` iteration), `common.wgsl` (matching
-`KIND_*` const), `mandelbrot.wgsl` (matching `advance_delta`/`fprime` arms),
-`buddhabrot.wgsl` (matching arm in `advance()`, if the kind makes sense as a
-Buddhabrot), `renderer.rs`
-`Uniforms` (only if the kind needs a new per-kind constant, e.g. Phoenix's
-`phoenix_p`), `share.rs` (encode/decode string tag), `app.rs` (`KINDS` label,
-`JULIA_PRESETS`/`SET_PRESETS` slot, `default_view_for` entry, and optionally a
-UI control for its constant + an animation toggle, following the
-Phoenix/Lambda pattern). If `c` doesn't enter the formula additively (e.g. a
-rational map with `c` in a denominator), the `advance_delta`/`step_add` split
-doesn't work — that needs its own step function plus extra per-step reference
-data uploaded in a second GPU buffer alongside the orbit.
+Touches, in order: `kind.rs` (enum variant + `ALL` slot + `label`/
+`description`/`formula`/`share_tag`/`from_share_tag`/`default_set_view`
+arms), `reference.rs` (CPU iteration formula arm, and a test comparing
+against a naive `f64` iteration), `common.wgsl` (matching `KIND_*` const),
+`mandelbrot.wgsl` (matching `advance_delta`/`fprime` arms), `buddhabrot.wgsl`
+(matching arm in `advance()`, if the kind makes sense as a Buddhabrot),
+`renderer.rs` `Uniforms` (only if the kind needs a new per-kind constant,
+e.g. Phoenix's `phoenix_p`), `app.rs` (`JULIA_PRESETS`/`SET_PRESETS` slot,
+and optionally a UI control for its constant + an animation toggle,
+following the Phoenix/Lambda pattern). If `c` doesn't enter the formula
+additively (e.g. a rational map with `c` in a denominator), the
+`advance_delta`/`step_add` split doesn't work — that needs its own step
+function plus extra per-step reference data uploaded in a second GPU buffer
+alongside the orbit.
 
 ### Buddhabrot is a separate pipeline
 

@@ -10,56 +10,8 @@
 //! * Mandelbrot-set: `z0 = 0`, `c = view center` (the c-plane point per pixel).
 //! * Julia-set:      `z0 = view center`, `c = fractal constant` (fixed per view).
 
+use super::kind::FractalKind;
 use crate::view::{Big, big_from_f64};
-
-/// The iteration formula. Must be kept in sync with `advance_delta` and the
-/// `KIND_*` constants in the shader.
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FractalKind {
-    /// `z -> z^2 + c`.
-    Mandelbrot = 0,
-    /// `z -> (|Re z| + i|Im z|)^2 + c`.
-    BurningShip = 1,
-    /// `z -> conj(z)^2 + c` (the Mandelbar).
-    Tricorn = 2,
-    /// `z -> z^power + c` (power >= 2).
-    Multibrot = 3,
-    /// `z -> |Re(z^2)| + i·Im(z^2) + c` (abs on the real output of the square).
-    Celtic = 4,
-    /// `z -> (x^2 - y^2) - 2·x·|y|·i + c` (abs on the imaginary input).
-    Perpendicular = 5,
-    /// `z -> |Re(z^2)| - |Im(z^2)|·i + c` (abs on both outputs).
-    Buffalo = 6,
-    /// `z -> z^2 + c + p·z_{n-1}` (two-term recurrence; `p` is `phoenix_p`).
-    Phoenix = 7,
-    /// `z -> lambda·z(1 - z)` (logistic map).
-    Lambda = 8,
-    /// `z -> z^power + c`, where `power` is a complex constant (the
-    /// `complex_power` argument), via the principal branch `z^p = exp(p·ln z)`.
-    ComplexMultibrot = 9,
-}
-
-impl FractalKind {
-    pub fn description(&self) -> &str {
-        match self {
-            FractalKind::Mandelbrot => {
-                "The Mandelbrot set is the most famous fractal set, obtained with the simplest escape-time formula. This set represents all Julia fractals: each points of the Mandelbrot set is related to a specific Julia fractal."
-            }
-            FractalKind::BurningShip => {
-                "A variation of the famous Mandelbrot set, using absolute values on the real and imaginary part of each iterations."
-            }
-            FractalKind::Tricorn => "The Tricorn set is obtained using the same formula as the Mandelbrot set, taking the complex conjugate of the previous iteration.",
-            FractalKind::Multibrot => "Multibrot use the same formula as the Mandelbrot set, with a bigger exposant.",
-            FractalKind::Celtic => "",
-            FractalKind::Perpendicular => "",
-            FractalKind::Buffalo => "",
-            FractalKind::Phoenix => "",
-            FractalKind::Lambda => "",
-            FractalKind::ComplexMultibrot => "Like Multibrot, but the exponent itself is a complex number instead of a plain integer, via z^p = exp(p·ln z).",
-        }
-    }
-}
 
 /// Reference orbit escapes once |Z|^2 exceeds this. Kept larger than the pixel
 /// bailout so pixels escaping alongside the reference can still reach their

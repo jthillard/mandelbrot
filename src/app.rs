@@ -46,49 +46,6 @@ pub enum FractalMode {
     Buddhabrot,
 }
 
-/// Selectable fractal formulas, with UI labels.
-const KINDS: &[(FractalKind, &str)] = &[
-    (FractalKind::Mandelbrot, "Mandelbrot"),
-    (FractalKind::BurningShip, "Burning Ship"),
-    (FractalKind::Tricorn, "Tricorn"),
-    (FractalKind::Multibrot, "Multibrot"),
-    (FractalKind::Celtic, "Celtic"),
-    (FractalKind::Perpendicular, "Perpendicular"),
-    (FractalKind::Buffalo, "Buffalo"),
-    (FractalKind::Phoenix, "Phoenix"),
-    (FractalKind::Lambda, "Lambda"),
-    (FractalKind::ComplexMultibrot, "Complex Multibrot"),
-];
-
-/// UI label for a fractal kind.
-fn kind_label(kind: FractalKind) -> &'static str {
-    KINDS
-        .iter()
-        .find(|(k, _)| *k == kind)
-        .map(|(_, name)| *name)
-        .unwrap_or("Mandelbrot")
-}
-
-/// The iteration formula for a kind, in human-readable notation (mirrors the
-/// doc comments on `FractalKind`'s variants). `power` is only used by
-/// Multibrot; `complex_power` only by Complex Multibrot.
-fn kind_formula(kind: FractalKind, power: u32, complex_power: (f64, f64)) -> String {
-    match kind {
-        FractalKind::Mandelbrot => "z = z² + c".to_string(),
-        FractalKind::BurningShip => "z = (|Re(z)| + i|Im(z)|)² + c".to_string(),
-        FractalKind::Tricorn => "z = conj(z)² + c".to_string(),
-        FractalKind::Multibrot => format!("z = z^{power} + c"),
-        FractalKind::Celtic => "z = |Re(z²)| + i·Im(z²) + c".to_string(),
-        FractalKind::Perpendicular => "z = (x² − y²) − 2x|y|i + c".to_string(),
-        FractalKind::Buffalo => "z = |Re(z²)| − i|Im(z²)| + c".to_string(),
-        FractalKind::Phoenix => "z = z² + c + p·z_prev".to_string(),
-        FractalKind::Lambda => "z = λ·z(1 − z)".to_string(),
-        FractalKind::ComplexMultibrot => {
-            format!("z = z^({:.3}{:+.3}i) + c", complex_power.0, complex_power.1)
-        }
-    }
-}
-
 type JuliaPreset = (&'static str, f64, f64, u32, Option<(f64, f64)>);
 
 /// Nice-looking Julia constants offered as presets.
@@ -697,18 +654,7 @@ impl FractalApp {
         if mode == FractalMode::Julia {
             return ViewState::with_center(big_from_f64(0.0, 53), big_from_f64(0.0, 53), 1.5);
         }
-        let (cr, ci, hh) = match kind {
-            FractalKind::Mandelbrot => (-0.5, 0.0, 1.25),
-            FractalKind::BurningShip => (-0.5, -0.5, 1.3),
-            FractalKind::Tricorn => (-0.25, 0.0, 1.6),
-            FractalKind::Multibrot => (0.0, 0.0, 1.5),
-            FractalKind::Celtic => (-0.5, 0.0, 1.6),
-            FractalKind::Perpendicular => (-0.5, 0.0, 1.5),
-            FractalKind::Buffalo => (-0.5, -0.5, 1.5),
-            FractalKind::Phoenix => (0.0, 0.0, 1.6),
-            FractalKind::Lambda => (0.0, 0.0, 1.6),
-            FractalKind::ComplexMultibrot => (0.0, 0.0, 1.5),
-        };
+        let (cr, ci, hh) = kind.default_set_view();
         ViewState::with_center(big_from_f64(cr, 53), big_from_f64(ci, 53), hh)
     }
 
@@ -1249,11 +1195,7 @@ impl FractalApp {
             .resizable(false)
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -44.0))
             .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(kind_label(self.kind))
-                        .strong()
-                        .heading(),
-                );
+                ui.label(egui::RichText::new(self.kind.label()).strong().heading());
                 let mode_label = match self.mode {
                     FractalMode::Mandelbrot => {
                         "Mandelbrot mode — parameter space (c varies per pixel, z₀ = 0)"
@@ -1268,7 +1210,7 @@ impl FractalApp {
 
                 ui.label(format!(
                     "formula: {}",
-                    kind_formula(self.kind, self.power, self.complex_power)
+                    self.kind.formula(self.power, self.complex_power)
                 ));
                 if self.mode == FractalMode::Julia {
                     ui.label(format!("c = {:.6} {:+.6}i", self.julia_c.0, self.julia_c.1));
@@ -1517,10 +1459,10 @@ impl FractalApp {
         // since interesting regions differ between fractals.
         let prev_kind = self.kind;
         egui::ComboBox::from_label("fractal")
-            .selected_text(kind_label(self.kind))
+            .selected_text(self.kind.label())
             .show_ui(ui, |ui| {
-                for &(kind, name) in KINDS {
-                    ui.selectable_value(&mut self.kind, kind, name);
+                for kind in FractalKind::ALL {
+                    ui.selectable_value(&mut self.kind, kind, kind.label());
                 }
             });
         if self.kind == FractalKind::Multibrot {

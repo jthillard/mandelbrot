@@ -2,12 +2,14 @@
 //! egui paint callback.
 
 pub mod buddhabrot;
+pub mod kind;
 pub mod reference;
 pub mod renderer;
 pub mod share;
 
 pub use buddhabrot::{BuddhabrotCallback, BuddhabrotRenderer, BuddhabrotUniforms};
-pub use reference::{FractalKind, compute_reference, compute_set_reference};
+pub use kind::FractalKind;
+pub use reference::{compute_reference, compute_set_reference};
 #[cfg(target_arch = "wasm32")]
 pub use renderer::encode_png_with_progress;
 #[cfg(not(target_arch = "wasm32"))]

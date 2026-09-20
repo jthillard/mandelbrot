@@ -39,21 +39,7 @@ impl ShareState {
     pub fn encode(&self) -> String {
         let mut s = String::new();
         s.push_str(if self.julia { "m=j" } else { "m=m" });
-        s.push_str(&format!(
-            "&f={}",
-            match self.kind {
-                FractalKind::Mandelbrot => "mandel",
-                FractalKind::BurningShip => "burning",
-                FractalKind::Multibrot => "multi",
-                FractalKind::Tricorn => "tricorn",
-                FractalKind::Celtic => "celtic",
-                FractalKind::Perpendicular => "perp",
-                FractalKind::Buffalo => "buffalo",
-                FractalKind::Phoenix => "phoenix",
-                FractalKind::Lambda => "lambda",
-                FractalKind::ComplexMultibrot => "cmulti",
-            }
-        ));
+        s.push_str(&format!("&f={}", self.kind.share_tag()));
         s.push_str(&format!("&pw={}", self.power));
         s.push_str(&format!(
             "&re={}&im={}&hh={}&it={}",
@@ -86,19 +72,7 @@ impl ShareState {
             julia: map.get("m").map(|m| *m == "j").unwrap_or(false),
             kind: map
                 .get("f")
-                .map(|f| match *f {
-                    "mandel" => FractalKind::Mandelbrot,
-                    "multi" => FractalKind::Multibrot,
-                    "burning" => FractalKind::BurningShip,
-                    "tricorn" => FractalKind::Tricorn,
-                    "celtic" => FractalKind::Celtic,
-                    "perp" => FractalKind::Perpendicular,
-                    "buffalo" => FractalKind::Buffalo,
-                    "phoenix" => FractalKind::Phoenix,
-                    "lambda" => FractalKind::Lambda,
-                    "cmulti" => FractalKind::ComplexMultibrot,
-                    _ => FractalKind::Mandelbrot,
-                })
+                .and_then(|f| FractalKind::from_share_tag(f))
                 .unwrap_or(FractalKind::Mandelbrot),
             power: map.get("pw").and_then(|s| s.parse().ok()).unwrap_or(2),
             center_re: (*map.get("re")?).to_string(),
