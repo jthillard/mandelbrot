@@ -152,13 +152,13 @@ impl FractalKind {
         match self {
             FractalKind::Mandelbrot => (-0.5, 0.0, 1.25),
             FractalKind::BurningShip => (-0.5, -0.5, 1.3),
-            FractalKind::Tricorn => (-0.25, 0.0, 1.6),
+            FractalKind::Tricorn => (-0.25, 0.0, 1.7),
             FractalKind::Multibrot => (0.0, 0.0, 1.5),
             FractalKind::Celtic => (-0.5, 0.0, 1.6),
             FractalKind::Perpendicular => (-0.5, 0.0, 1.5),
-            FractalKind::Buffalo => (-0.5, -0.5, 1.5),
-            FractalKind::Phoenix => (0.0, 0.0, 1.6),
-            FractalKind::Lambda => (0.0, 0.0, 1.6),
+            FractalKind::Buffalo => (-0.5, 0.5, 1.5),
+            FractalKind::Phoenix => (-0.5, 0.0, 1.5),
+            FractalKind::Lambda => (-0.5, 0.0, 2.4),
             FractalKind::ComplexMultibrot => (0.0, 0.0, 1.5),
         }
     }
