@@ -25,6 +25,18 @@ pub struct Cli {
     #[arg(long, value_name = "RE,IM")]
     pub julia: Option<String>,
 
+    /// Coloring palette index.
+    #[arg(long, value_name = "INDEX")]
+    pub palette: Option<u32>,
+
+    /// Phoenix constant p for the Phoenix kind (z -> z^2 + c + p*z_prev).
+    #[arg(long, value_name = "RE,IM")]
+    pub phoenix_p: Option<String>,
+
+    /// Lambda constant λ for the Lambda kind (z -> λ*z*(1 - z)).
+    #[arg(long, value_name = "RE,IM")]
+    pub lambda_l: Option<String>,
+
     /// Restore a view from a share-link fragment (the part after '#').
     #[arg(long, value_name = "FRAGMENT")]
     pub share: Option<String>,
@@ -45,11 +57,7 @@ pub struct Cli {
     #[arg(long, value_name = "INDEX")]
     pub buddha_palette: Option<u32>,
 
-    /// Render a PNG export on startup.
-    #[arg(long)]
-    pub export: bool,
-
-    /// Output path for --export/--headless (default: fractal-<timestamp>.png).
+    /// Output path for --headless (default: fractal-<timestamp>.png).
     #[arg(long, value_name = "PATH")]
     pub export_path: Option<String>,
 

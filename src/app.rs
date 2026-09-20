@@ -327,7 +327,7 @@ pub struct FractalApp {
     export_requested: bool,
     /// Progress/handle for an in-flight PNG export, if any.
     export: Option<Arc<Mutex<ExportShared>>>,
-    /// Output path for `--export` (native CLI only); falls back to a
+    /// Output path for `--export-path` (native CLI only); falls back to a
     /// timestamped name when unset.
     export_path: Option<String>,
     /// Short status line (saved path, "link copied", errors).
@@ -500,6 +500,24 @@ impl FractalApp {
                 self.view = Self::default_view_for(FractalMode::Julia, self.kind);
             }
         }
+        if let Some(pp) = &cli.phoenix_p {
+            let p: Vec<&str> = pp.split(',').collect();
+            if let (Some(Ok(re)), Some(Ok(im))) = (
+                p.first().map(|s| s.trim().parse::<f64>()),
+                p.get(1).map(|s| s.trim().parse::<f64>()),
+            ) {
+                self.phoenix_p = (re, im);
+            }
+        }
+        if let Some(ll) = &cli.lambda_l {
+            let p: Vec<&str> = ll.split(',').collect();
+            if let (Some(Ok(re)), Some(Ok(im))) = (
+                p.first().map(|s| s.trim().parse::<f64>()),
+                p.get(1).map(|s| s.trim().parse::<f64>()),
+            ) {
+                self.lambda_l = (re, im);
+            }
+        }
         if let Some(frag) = cli.share
             && let Some(state) = ShareState::decode(&frag)
         {
@@ -517,10 +535,10 @@ impl FractalApp {
         if let Some(p) = cli.buddha_palette {
             self.buddha_palette = p.min(BUDDHA_PALETTE_NAMES.len() as u32 - 1);
         }
-        self.export_path = cli.export_path;
-        if cli.export {
-            self.export_requested = true;
+        if let Some(p) = cli.palette {
+            self.palette = p.min(PALETTE_NAMES.len() as u32 - 1);
         }
+        self.export_path = cli.export_path;
     }
 
     /// Apply a view spec "re,im,half_height[,iterations]" (re/im are decimal,

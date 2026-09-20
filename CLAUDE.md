@@ -32,14 +32,15 @@ python3 -m http.server -d dist 8080
 ```
 
 Native CLI flags (`src/cli.rs`, applied in `FractalApp::apply_cli`): `--kind`,
-`--power`, `--julia re,im`, `--share <fragment>`,
+`--power`, `--julia re,im`, `--phoenix-p re,im`, `--lambda-l re,im`,
+`--palette`, `--share <fragment>`,
 `--view re,im,half_height[,iterations]`, `--de`, `--buddhabrot`,
-`--buddha-palette`, `--export` (+ `--export-path out.png`). `--headless`
-(`src/headless.rs`) skips the window entirely: it builds the same view from
-the other flags, creates its own offscreen wgpu device, and renders straight
-to a PNG (`--width`/`--height`, default 1920×1080) — implies `--export`'s
-save behavior without needing a GPU-backed window/event loop. Not yet
-supported with `--buddhabrot`. Run `mandelbrot --help` for the full list.
+`--buddha-palette`. `--headless` (`src/headless.rs`) skips the window
+entirely: it builds the same view from the other flags, creates its own
+offscreen wgpu device, and renders straight to a PNG (`--width`/`--height`,
+default 1920×1080, `--export-path out.png`) without needing a GPU-backed
+window/event loop. Not yet supported with `--buddhabrot`. Run
+`mandelbrot --help` for the full list.
 
 There's no GPU in most sandboxes: `cargo check`/`cargo test --test shader_valid`
 are the fast, headless way to validate a change. `cargo test` also runs but
