@@ -57,13 +57,50 @@ pub struct Cli {
     #[arg(long, value_name = "INDEX")]
     pub buddha_palette: Option<u32>,
 
-    /// Output path for --headless (default: fractal-<timestamp>.png).
+    /// Output path for --headless (default: fractal-<timestamp>.png). When
+    /// animating (--to-view/--to-share), this is a directory of
+    /// frame-00001.png, frame-00002.png, ... instead (default:
+    /// frames-<timestamp>/).
     #[arg(long, value_name = "PATH")]
     pub export_path: Option<String>,
 
+    /// End view for an animation: "re,im,half_height[,iterations]", the same
+    /// syntax as --view. Combine with --view (or --share, --kind, --julia...)
+    /// for the start view; headless then renders a sequence of frames
+    /// interpolating the camera from start to end instead of a single PNG.
+    #[arg(long, value_name = "RE,IM,HALF_HEIGHT[,ITERATIONS]")]
+    pub to_view: Option<String>,
+
+    /// End view for an animation, as a share-link fragment (only the
+    /// position/zoom/iterations are used; alternative to --to-view for
+    /// pasting a location copied from the app's "Copy share link").
+    #[arg(long, value_name = "FRAGMENT")]
+    pub to_share: Option<String>,
+
+    /// Number of frames to render for an animation. Alternative to --fps +
+    /// --duration.
+    #[arg(long, value_name = "N")]
+    pub frames: Option<u32>,
+
+    /// Frames per second, used with --duration to compute the frame count
+    /// (ignored if --frames is given). Also used in the ffmpeg command
+    /// hint printed after rendering.
+    #[arg(long, value_name = "N", default_value_t = 30.0)]
+    pub fps: f64,
+
+    /// Animation duration in seconds, used with --fps to compute the frame
+    /// count (ignored if --frames is given).
+    #[arg(long, value_name = "SECONDS")]
+    pub duration: Option<f64>,
+
+    /// Pace animation frames linearly instead of easing in/out (smoothstep).
+    #[arg(long)]
+    pub linear: bool,
+
     /// Run without opening a window: render the current view to a PNG and
     /// exit. Combine with --kind/--julia/--share/--view etc. to pick what to
-    /// render. Not yet supported with --buddhabrot.
+    /// render, or --to-view/--to-share to render an animation instead of a
+    /// single frame. Not yet supported with --buddhabrot.
     #[arg(long)]
     pub headless: bool,
 

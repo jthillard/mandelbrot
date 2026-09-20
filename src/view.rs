@@ -120,6 +120,44 @@ pub fn big_from_decimal_str(s: &str, bits: usize) -> Option<Big> {
     Some(dec.with_base_and_precision::<2>(bits.max(53)).value())
 }
 
+/// Parse a "re,im,half_height[,iterations]" spec (re/im decimal, parsed at
+/// full precision) into a view and an optional iteration count. Shared by
+/// `FractalApp::apply_view_spec` (the `--view` CLI flag) and headless
+/// animation's `--to-view`.
+pub fn parse_view_spec(spec: &str) -> Option<(ViewState, Option<u32>)> {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let half_height = parts[2].trim().parse::<f64>().ok()?;
+    if !(half_height > 0.0 && half_height.is_finite()) {
+        return None;
+    }
+    let bits = precision_for(half_height);
+    let re = big_from_decimal_str(parts[0], bits)?;
+    let im = big_from_decimal_str(parts[1], bits)?;
+    let iterations = parts.get(3).and_then(|s| s.trim().parse::<u32>().ok());
+    Some((ViewState::with_center(re, im, half_height), iterations))
+}
+
+/// Interpolate between two views for an animation frame, `t` in `[0, 1]`.
+/// The center moves linearly through the complex plane (at full precision);
+/// the half-height interpolates geometrically (log-linear), since zoom depth
+/// spans many decades and a linear sweep would crawl at the start and blow
+/// past the target at the end.
+pub fn interpolate_view(from: &ViewState, to: &ViewState, t: f64) -> ViewState {
+    let half_height = from.half_height * (to.half_height / from.half_height).powf(t);
+    let bits = precision_for(half_height);
+    let t_big = big_from_f64(t, bits);
+    let re0 = from.center_re.clone().with_precision(bits).value();
+    let im0 = from.center_im.clone().with_precision(bits).value();
+    let re1 = to.center_re.clone().with_precision(bits).value();
+    let im1 = to.center_im.clone().with_precision(bits).value();
+    let center_re = &re0 + &(&(&re1 - &re0) * &t_big);
+    let center_im = &im0 + &(&(&im1 - &im0) * &t_big);
+    ViewState::with_center(center_re, center_im, half_height)
+}
+
 /// Render a `Big` as a decimal string with `sig_digits` significant digits.
 pub fn big_to_decimal_str(x: &Big, sig_digits: usize) -> String {
     let dec = x

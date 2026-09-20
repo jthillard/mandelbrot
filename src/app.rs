@@ -15,7 +15,7 @@ use crate::fractal::{
 use crate::lights::Light;
 use crate::view::{
     Big, DEFAULT_HALF_HEIGHT, ViewState, big_from_decimal_str, big_from_f64, big_to_decimal_str,
-    precision_for,
+    parse_view_spec, precision_for,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use clap::Parser;
@@ -545,30 +545,38 @@ impl FractalApp {
     /// parsed at full precision). Used by the native debug env var.
     #[allow(dead_code)]
     pub fn apply_view_spec(&mut self, spec: &str) -> bool {
-        let parts: Vec<&str> = spec.split(',').collect();
-        if parts.len() < 3 {
-            return false;
-        }
-        let Ok(half_height) = parts[2].trim().parse::<f64>() else {
+        let Some((view, iterations)) = parse_view_spec(spec) else {
             return false;
         };
-        if !(half_height > 0.0 && half_height.is_finite()) {
-            return false;
-        }
-        let bits = precision_for(half_height);
-        let (Some(re), Some(im)) = (
-            big_from_decimal_str(parts[0], bits),
-            big_from_decimal_str(parts[1], bits),
-        ) else {
-            return false;
-        };
-        self.view = ViewState::with_center(re, im, half_height);
-        if let Some(it) = parts.get(3)
-            && let Ok(v) = it.trim().parse::<u32>()
-        {
+        self.view = view;
+        if let Some(v) = iterations {
             self.max_iterations = v.clamp(32, MAX_REF_POINTS as u32 - 1);
         }
         true
+    }
+
+    /// The current view (center + half-height). Used by headless animation
+    /// to snapshot the start of a camera path.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn view_state(&self) -> &ViewState {
+        &self.view
+    }
+
+    /// Jump straight to `view` for the next frame, keeping every other
+    /// parameter (kind, colors, iteration count, ...) as-is. Used by
+    /// headless animation to step through interpolated keyframes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_view(&mut self, view: ViewState) {
+        self.view = view;
+    }
+
+    /// Force `max_iterations` to auto-scale with zoom depth on every
+    /// subsequent `compute_reference_blocking` call. Used by headless
+    /// animation so iteration count keeps pace with the camera zooming in,
+    /// the same way it does while dragging/zooming interactively.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_auto_iterations(&mut self, v: bool) {
+        self.auto_iterations = v;
     }
 
     /// Jump to a preset Mandelbrot location: decimal center (parsed at the

@@ -42,6 +42,21 @@ default 1920×1080, `--export-path out.png`) without needing a GPU-backed
 window/event loop. Not yet supported with `--buddhabrot`. Run
 `mandelbrot --help` for the full list.
 
+`--headless` also has an animation mode, for feeding into `ffmpeg`: add
+`--to-view re,im,half_height[,iterations]` (or `--to-share <fragment>`, which
+only pulls position/zoom/iterations out of the link) alongside a start view
+(`--view`/`--share`/`--kind`/`--julia`), plus `--frames N` or
+`--fps`/`--duration`. `--export-path` then names an output *directory* of
+`frame-00001.png`, `frame-00002.png`, ... instead of a single file. Only the
+camera (center + half-height) is animated — kind, colors, and per-kind
+constants stay fixed at whatever the start flags set. `view::interpolate_view`
+does the interpolation: half-height geometrically (log-linear, since zoom
+spans many decades), center linearly through the complex plane at full
+`Big` precision; `--linear` swaps the default smoothstep easing for constant
+pacing. Iteration count auto-scales with zoom depth per frame (same
+`auto_iteration_count` the interactive app uses while zooming), overriding
+any iteration count from `--view`/`--share`/`--to-view`/`--to-share`.
+
 There's no GPU in most sandboxes: `cargo check`/`cargo test --test shader_valid`
 are the fast, headless way to validate a change. `cargo test` also runs but
 doesn't touch the GPU — the reference-orbit tests are pure CPU math (see
