@@ -141,20 +141,34 @@ pub fn parse_view_spec(spec: &str) -> Option<(ViewState, Option<u32>)> {
 }
 
 /// Interpolate between two views for an animation frame, `t` in `[0, 1]`.
-/// The center moves linearly through the complex plane (at full precision);
-/// the half-height interpolates geometrically (log-linear), since zoom depth
+/// The half-height interpolates geometrically (log-linear), since zoom depth
 /// spans many decades and a linear sweep would crawl at the start and blow
-/// past the target at the end.
+/// past the target at the end. The center has to shrink its offset from the
+/// target at that *same* geometric rate: blending it linearly in `t` instead
+/// barely moves it while the view is still huge (early frames), so the
+/// target stays effectively off-screen — offset/half_height ratio blows up —
+/// for nearly the whole animation, and only lands on `to`'s center in the
+/// literal last frame where `t == 1` forces an exact match. `g(t)` below
+/// tracks the same `q^t` decay used for `half_height` (keeping the
+/// offset/half_height ratio roughly constant, i.e. the target's on-screen
+/// position steady) but is shifted so it lands on exactly 1 at `t = 0` and
+/// exactly 0 at `t = 1`.
 pub fn interpolate_view(from: &ViewState, to: &ViewState, t: f64) -> ViewState {
-    let half_height = from.half_height * (to.half_height / from.half_height).powf(t);
+    let q = to.half_height / from.half_height;
+    let half_height = from.half_height * q.powf(t);
     let bits = precision_for(half_height);
-    let t_big = big_from_f64(t, bits);
+    let g = if (q - 1.0).abs() < 1e-12 {
+        1.0 - t
+    } else {
+        (q.powf(t) - q) / (1.0 - q)
+    };
+    let g_big = big_from_f64(g, bits);
     let re0 = from.center_re.clone().with_precision(bits).value();
     let im0 = from.center_im.clone().with_precision(bits).value();
     let re1 = to.center_re.clone().with_precision(bits).value();
     let im1 = to.center_im.clone().with_precision(bits).value();
-    let center_re = &re0 + &(&(&re1 - &re0) * &t_big);
-    let center_im = &im0 + &(&(&im1 - &im0) * &t_big);
+    let center_re = &re1 + &(&(&re0 - &re1) * &g_big);
+    let center_im = &im1 + &(&(&im0 - &im1) * &g_big);
     ViewState::with_center(center_re, center_im, half_height)
 }
 
@@ -186,4 +200,65 @@ pub fn big_from_f64(x: f64, bits: usize) -> Big {
         .unwrap_or_default()
         .with_precision(bits)
         .value()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn re_im_f64(v: &ViewState) -> (f64, f64) {
+        let re: f64 = v.center_re.to_decimal().value().to_f64().value();
+        let im: f64 = v.center_im.to_decimal().value().to_f64().value();
+        (re, im)
+    }
+
+    #[test]
+    fn interpolate_view_hits_exact_endpoints() {
+        let bits = precision_for(1.0);
+        let from = ViewState::with_center(big_from_f64(-0.5, bits), big_from_f64(0.0, bits), 1.5);
+        let to = ViewState::with_center(
+            big_from_f64(-0.7515, precision_for(1e-20)),
+            big_from_f64(0.1013, precision_for(1e-20)),
+            1e-20,
+        );
+
+        let start = interpolate_view(&from, &to, 0.0);
+        assert_eq!(re_im_f64(&start), re_im_f64(&from));
+        assert_eq!(start.half_height, from.half_height);
+
+        let end = interpolate_view(&from, &to, 1.0);
+        assert_eq!(re_im_f64(&end), re_im_f64(&to));
+        assert_eq!(end.half_height, to.half_height);
+    }
+
+    /// Regression test: a deep zoom's center used to be blended linearly in
+    /// `t` while `half_height` shrank geometrically, so partway through the
+    /// animation the offset from the target would already be far larger than
+    /// the (tiny, geometrically-shrunk) view — the target only snapped into
+    /// frame on the very last frame. The offset/half_height ratio should
+    /// instead stay roughly bounded throughout.
+    #[test]
+    fn interpolate_view_keeps_target_offset_bounded() {
+        let bits = precision_for(1.0);
+        let from = ViewState::with_center(big_from_f64(-0.5, bits), big_from_f64(0.0, bits), 1.5);
+        let to = ViewState::with_center(
+            big_from_f64(-0.7515, precision_for(1e-20)),
+            big_from_f64(0.1013, precision_for(1e-20)),
+            1e-20,
+        );
+        let (to_re, to_im) = re_im_f64(&to);
+
+        for i in 1..10 {
+            let t = i as f64 / 10.0;
+            let mid = interpolate_view(&from, &to, t);
+            let (re, im) = re_im_f64(&mid);
+            let offset = ((re - to_re).powi(2) + (im - to_im).powi(2)).sqrt();
+            let ratio = offset / mid.half_height;
+            assert!(
+                ratio < 10.0,
+                "t={t}: offset/half_height ratio {ratio} blew up (offset={offset}, half_height={})",
+                mid.half_height
+            );
+        }
+    }
 }
