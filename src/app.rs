@@ -43,6 +43,7 @@ const BUDDHA_PALETTE_NAMES: &[&str] = &["Nebula", "Yellow", "Grayscale"];
 pub enum FractalMode {
     Mandelbrot,
     Julia,
+    Buddhabrot,
 }
 
 /// Selectable fractal formulas, with UI labels.
@@ -307,10 +308,6 @@ pub struct FractalApp {
     /// List of enabled lights in the world
     lights: Vec<Light>,
 
-    /// Render as a Buddhabrot (Monte-Carlo orbit-density histogram) instead of
-    /// the ordinary escape-time set. Plain f32 view — no deep zoom, no
-    /// perturbation/reference-orbit machinery (see `fractal::buddhabrot`).
-    buddhabrot: bool,
     /// Nested escape-iteration caps for the R/G/B histogram channels
     /// (Nebulabrot coloring); kept ordered r <= g <= b by the UI.
     buddha_r_cap: u32,
@@ -436,6 +433,8 @@ impl FractalApp {
             }
         }
 
+        cc.egui_ctx.set_zoom_factor(1.1);
+
         // Debug/testing hooks, driven by CLI flags.
         #[cfg(not(target_arch = "wasm32"))]
         app.apply_cli(Cli::parse());
@@ -475,7 +474,6 @@ impl FractalApp {
             de_coloring: false,
             shadow: false,
             lights: vec![Light::default()],
-            buddhabrot: false,
             buddha_r_cap: 50,
             buddha_g_cap: 500,
             buddha_b_cap: 2000,
@@ -557,7 +555,7 @@ impl FractalApp {
             self.de_coloring = true;
         }
         if cli.buddhabrot {
-            self.buddhabrot = true;
+            self.mode = FractalMode::Buddhabrot;
         }
         if let Some(p) = cli.buddha_palette {
             self.buddha_palette = p.min(BUDDHA_PALETTE_NAMES.len() as u32 - 1);
@@ -996,7 +994,7 @@ impl FractalApp {
         if self.export.is_some() {
             return; // one export at a time
         }
-        if self.buddhabrot {
+        if self.mode == FractalMode::Buddhabrot {
             self.status = Some("PNG export isn't available in Buddhabrot mode yet".into());
             return;
         }
@@ -1246,22 +1244,22 @@ impl FractalApp {
                         .strong()
                         .heading(),
                 );
-                let mode_label = if self.buddhabrot {
-                    "Buddhabrot mode — orbit density (random c, z₀ = 0)"
-                } else {
-                    match self.mode {
-                        FractalMode::Mandelbrot => {
-                            "Mandelbrot mode — parameter space (c varies per pixel, z₀ = 0)"
-                        }
-                        FractalMode::Julia => {
-                            "Julia mode — dynamical plane for a fixed c (z₀ varies per pixel)"
-                        }
+                let mode_label = match self.mode {
+                    FractalMode::Mandelbrot => {
+                        "Mandelbrot mode — parameter space (c varies per pixel, z₀ = 0)"
                     }
+                    FractalMode::Julia => {
+                        "Julia mode — dynamical plane for a fixed c (z₀ varies per pixel)"
+                    }
+                    FractalMode::Buddhabrot => "Buddhabrot mode — orbit density (random c, z₀ = 0)",
                 };
                 ui.label(mode_label);
                 ui.separator();
 
-                ui.label(format!("formula: {}", kind_formula(self.kind, self.power)));
+                ui.label(format!(
+                    "formula: {}",
+                    kind_formula(self.kind, self.power, self.complex_power)
+                ));
                 if self.mode == FractalMode::Julia {
                     ui.label(format!("c = {:.6} {:+.6}i", self.julia_c.0, self.julia_c.1));
                 }
@@ -1503,6 +1501,7 @@ impl FractalApp {
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Fractal Explorer");
         ui.separator();
+        ui.add_space(4.);
 
         // Fractal formula. Switching kinds jumps to a sensible default view,
         // since interesting regions differ between fractals.
@@ -1569,16 +1568,22 @@ impl FractalApp {
             self.view = Self::default_view_for(self.mode, self.kind);
         }
 
-        ui.checkbox(&mut self.buddhabrot, "Buddhabrot")
-            .on_hover_text(
-                "Monte-Carlo density of escaping orbits instead of the ordinary \
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.mode, FractalMode::Mandelbrot, "Set");
+            ui.radio_value(&mut self.mode, FractalMode::Julia, "Julia");
+            ui.radio_value(&mut self.mode, FractalMode::Buddhabrot, "Buddhabrot")
+                .on_hover_text(
+                    "Monte-Carlo density of escaping orbits instead of the ordinary \
                  escape-time set. Plain f32 view (no deep zoom); the image \
                  progressively sharpens while the view stays still.",
-            );
+                );
+        });
 
-        if self.buddhabrot {
+        if self.mode == FractalMode::Buddhabrot {
             self.buddhabrot_ui(ui);
+            ui.add_space(4.);
             ui.separator();
+            ui.add_space(4.);
             if ui.button("Reset view").clicked() {
                 self.view = Self::default_view_for(self.mode, self.kind);
             }
@@ -1586,11 +1591,6 @@ impl FractalApp {
             ui.small("Drag to pan · scroll to zoom toward the cursor");
             return;
         }
-
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.mode, FractalMode::Mandelbrot, "Set");
-            ui.radio_value(&mut self.mode, FractalMode::Julia, "Julia");
-        });
 
         if self.mode == FractalMode::Julia && self.kind != FractalKind::Lambda {
             ui.horizontal(|ui| {
@@ -1609,6 +1609,7 @@ impl FractalApp {
             });
 
             if !JULIA_PRESETS[self.kind as usize].is_empty() {
+                ui.label("places:");
                 ui.horizontal_wrapped(|ui| {
                     for &(name, re, im, iterations, phoenix) in JULIA_PRESETS[self.kind as usize] {
                         if ui.small_button(name).clicked() {
@@ -1639,7 +1640,9 @@ impl FractalApp {
             });
         }
 
+        ui.add_space(4.);
         ui.separator();
+        ui.add_space(4.);
         ui.checkbox(&mut self.auto_iterations, "Auto iterations")
             .on_hover_text("Scale the iteration count with zoom depth so deep zooms stay sharp.");
         if self.auto_iterations {
@@ -1693,7 +1696,9 @@ impl FractalApp {
                     });
                 });
         }
+        ui.add_space(4.);
         ui.separator();
+        ui.add_space(4.);
         ui.checkbox(&mut self.antialias, "Antialiasing (2×2)")
             .on_hover_text("Supersample each pixel for smoother edges (~4× slower).");
         if !self.shadow {
@@ -1784,7 +1789,9 @@ impl FractalApp {
             }
         });
 
+        ui.add_space(4.);
         ui.separator();
+        ui.add_space(4.);
         // Editable center coordinates. Shown at full precision; parsed
         // losslessly on commit (Enter or focus loss). While a field is focused
         // we leave the user's text alone; otherwise we refresh it from the live
@@ -1860,7 +1867,9 @@ impl FractalApp {
             ui.colored_label(egui::Color32::LIGHT_YELLOW, "computing reference…");
         }
 
+        ui.add_space(4.);
         ui.separator();
+        ui.add_space(4.);
         let exporting = self.export.is_some();
         ui.horizontal(|ui| {
             if ui.button("Copy link").clicked() {
@@ -1903,7 +1912,9 @@ impl FractalApp {
             ui.small(status);
         }
 
+        ui.add_space(4.);
         ui.separator();
+        ui.add_space(4.);
         if ui.button("Reset view").clicked() {
             self.view = Self::default_view_for(self.mode, self.kind);
         }
@@ -2091,7 +2102,7 @@ impl FractalApp {
             }
         }
 
-        if self.buddhabrot {
+        if self.mode == FractalMode::Buddhabrot {
             // No reference orbit / perturbation machinery: iterate directly in
             // f32 from the live view. Progressive accumulation means this
             // needs its own continuous repaint, separate from the escape-time
