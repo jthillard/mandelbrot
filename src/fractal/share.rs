@@ -25,6 +25,8 @@ pub struct ShareState {
     pub phoenix_p: (f64, f64),
     /// Distortion constant for the Lambda kind (ignored by others).
     pub lambda_l: (f64, f64),
+    /// Complex exponent for the Complex Multibrot kind (ignored by others).
+    pub complex_power: (f64, f64),
     pub color_scale: f32,
     pub color_offset: f32,
     /// Palette index (`palette_id` in the shader).
@@ -49,6 +51,7 @@ impl ShareState {
                 FractalKind::Buffalo => "buffalo",
                 FractalKind::Phoenix => "phoenix",
                 FractalKind::Lambda => "lambda",
+                FractalKind::ComplexMultibrot => "cmulti",
             }
         ));
         s.push_str(&format!("&pw={}", self.power));
@@ -60,8 +63,12 @@ impl ShareState {
         s.push_str(&format!("&px={}&py={}", self.phoenix_p.0, self.phoenix_p.1));
         s.push_str(&format!("&lx={}&ly={}", self.lambda_l.0, self.lambda_l.1));
         s.push_str(&format!(
-            "&cs={}&co={}&pal={}",
-            self.color_scale, self.color_offset, self.palette
+            "&cpr={}&cpi={}",
+            self.complex_power.0, self.complex_power.1
+        ));
+        s.push_str(&format!(
+            "&cs={}&co={}&pal={}&spal={}",
+            self.color_scale, self.color_offset, self.palette, self.shadow_palette
         ));
         s
     }
@@ -89,6 +96,7 @@ impl ShareState {
                     "buffalo" => FractalKind::Buffalo,
                     "phoenix" => FractalKind::Phoenix,
                     "lambda" => FractalKind::Lambda,
+                    "cmulti" => FractalKind::ComplexMultibrot,
                     _ => FractalKind::Mandelbrot,
                 })
                 .unwrap_or(FractalKind::Mandelbrot),
@@ -108,6 +116,10 @@ impl ShareState {
             lambda_l: (
                 map.get("lx").and_then(|s| s.parse().ok()).unwrap_or(-0.5),
                 map.get("ly").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            ),
+            complex_power: (
+                map.get("cpr").and_then(|s| s.parse().ok()).unwrap_or(2.0),
+                map.get("cpi").and_then(|s| s.parse().ok()).unwrap_or(0.0),
             ),
             color_scale: map.get("cs").and_then(|s| s.parse().ok()).unwrap_or(0.02),
             color_offset: map.get("co").and_then(|s| s.parse().ok()).unwrap_or(0.0),
@@ -134,6 +146,7 @@ mod tests {
             julia_c: (-0.123, 0.745),
             phoenix_p: (-0.5, 0.1),
             lambda_l: (-0.5, 0.0),
+            complex_power: (2.5, 0.3),
             color_scale: 0.02,
             color_offset: 0.25,
             palette: 3,
@@ -149,6 +162,7 @@ mod tests {
         assert_eq!(d.iterations, s.iterations);
         assert_eq!(d.julia_c, s.julia_c);
         assert_eq!(d.phoenix_p, s.phoenix_p);
+        assert_eq!(d.complex_power, s.complex_power);
         assert_eq!(d.palette, s.palette);
         assert_eq!(d.shadow_palette, s.shadow_palette);
     }

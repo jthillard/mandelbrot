@@ -27,6 +27,7 @@ struct Uniforms {
     dc_offset: vec2<f32>,
     phoenix_p: vec2<f32>,
     lambda_l: vec2<f32>,
+    complex_power: vec2<f32>,
     de_coloring: u32,
     shadow: u32,
 };

@@ -35,6 +35,9 @@ pub enum FractalKind {
     Phoenix = 7,
     /// `z -> lambda·z(1 - z)` (logistic map).
     Lambda = 8,
+    /// `z -> z^power + c`, where `power` is a complex constant (the
+    /// `complex_power` argument), via the principal branch `z^p = exp(p·ln z)`.
+    ComplexMultibrot = 9,
 }
 
 impl FractalKind {
@@ -53,6 +56,7 @@ impl FractalKind {
             FractalKind::Buffalo => "",
             FractalKind::Phoenix => "",
             FractalKind::Lambda => "",
+            FractalKind::ComplexMultibrot => "Like Multibrot, but the exponent itself is a complex number instead of a plain integer, via z^p = exp(p·ln z).",
         }
     }
 }
@@ -77,6 +81,7 @@ pub fn compute_reference(
     power: u32,
     phoenix_p: (f64, f64),
     lambda_l: (f64, f64),
+    complex_power: (f64, f64),
 ) -> Vec<[f32; 2]> {
     let cr = c_re.clone().with_precision(precision).value();
     let ci = c_im.clone().with_precision(precision).value();
@@ -92,6 +97,9 @@ pub fn compute_reference(
     // Lambda distortion constant `l` (a small fixed complex number).
     let lr = big_from_f64(lambda_l.0, precision);
     let li = big_from_f64(lambda_l.1, precision);
+    // Complex Multibrot exponent (a fixed complex number).
+    let cpow_re = big_from_f64(complex_power.0, precision);
+    let cpow_im = big_from_f64(complex_power.1, precision);
 
     let mut points: Vec<[f32; 2]> = Vec::with_capacity(max_iter as usize + 1);
 
@@ -162,6 +170,10 @@ pub fn compute_reference(
                 let lzi = &lr * &zi + &li * &zr;
                 (&lzr * &re2 - &lzi * &im2, re2 * lzi + lzr * im2)
             }
+            FractalKind::ComplexMultibrot => {
+                let (pr, pi) = complex_pow_complex(&zr, &zi, &cpow_re, &cpow_im, precision);
+                (pr + &cr, pi + &ci)
+            }
         };
 
         // Shift the previous iterate (only the Phoenix arm reads it).
@@ -198,6 +210,32 @@ fn complex_pow(zr: &Big, zi: &Big, power: u32, precision: usize) -> (Big, Big) {
     (rr, ri)
 }
 
+/// `true` if `x` is (numerically) zero. The f64 check is exact for a true
+/// zero; only matters here to special-case `ln(0)`.
+fn is_big_zero(x: &Big) -> bool {
+    x.to_f64().value() == 0.0
+}
+
+/// `(zr + i zi)^(pr + i pi)` for a complex exponent, via the principal branch
+/// `z^p = exp(p·ln z)` where `ln z = ln|z| + i·arg(z)`. Used by
+/// `ComplexMultibrot`; must be kept in sync with the shader's `cpow`.
+/// `z = 0` is special-cased to `0` (the formula's `ln(0)` would otherwise
+/// panic; this is the correct limit for the `Re(p) > 0` region the UI
+/// exposes).
+fn complex_pow_complex(zr: &Big, zi: &Big, pr: &Big, pi: &Big, precision: usize) -> (Big, Big) {
+    if is_big_zero(zr) && is_big_zero(zi) {
+        return (big_zero(precision), big_zero(precision));
+    }
+    let r2 = &zr.sqr() + &zi.sqr();
+    let ln_r = r2.ln() >> 1; // 0.5 * ln(r2) = ln(sqrt(r2)); exact halving.
+    let theta = zi.atan2(zr);
+    let exp_re = (pr * &ln_r - pi * &theta).with_precision(precision).value();
+    let exp_im = (pr * &theta + pi * &ln_r).with_precision(precision).value();
+    let mag = exp_re.exp();
+    let (sin_a, cos_a) = exp_im.sin_cos();
+    (&mag * &cos_a, &mag * &sin_a)
+}
+
 /// Convenience: parameter-plane ("Mandelbrot-set") reference (`z0 = 0`,
 /// `c = center`) for any `kind`.
 #[allow(clippy::too_many_arguments)]
@@ -210,10 +248,21 @@ pub fn compute_set_reference(
     power: u32,
     phoenix_p: (f64, f64),
     lambda_l: (f64, f64),
+    complex_power: (f64, f64),
 ) -> Vec<[f32; 2]> {
     let zero = big_zero(precision);
     compute_reference(
-        &zero, &zero, center_re, center_im, max_iter, precision, kind, power, phoenix_p, lambda_l,
+        &zero,
+        &zero,
+        center_re,
+        center_im,
+        max_iter,
+        precision,
+        kind,
+        power,
+        phoenix_p,
+        lambda_l,
+        complex_power,
     )
 }
 
@@ -234,6 +283,7 @@ mod tests {
             200,
             FractalKind::Mandelbrot,
             2,
+            (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
         );
@@ -275,6 +325,7 @@ mod tests {
             2,
             (0.0, 0.0),
             (0.0, 0.0),
+            (0.0, 0.0),
         );
         assert_eq!(points.len(), 501, "interior orbit should not escape");
     }
@@ -291,6 +342,7 @@ mod tests {
             200,
             FractalKind::BurningShip,
             2,
+            (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
         );
@@ -320,6 +372,7 @@ mod tests {
             200,
             FractalKind::Multibrot,
             3,
+            (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
         );
@@ -357,6 +410,7 @@ mod tests {
             2,
             (0.0, 0.0),
             (0.0, 0.0),
+            (0.0, 0.0),
         );
 
         let (mut zr, mut zi) = (0.15_f64, -0.1_f64);
@@ -384,6 +438,7 @@ mod tests {
             200,
             FractalKind::Celtic,
             2,
+            (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
         );
@@ -416,6 +471,7 @@ mod tests {
             2,
             (0.0, 0.0),
             (0.0, 0.0),
+            (0.0, 0.0),
         );
 
         let (c_re, c_im) = (-0.7_f64, -0.2_f64);
@@ -446,6 +502,7 @@ mod tests {
             2,
             (0.0, 0.0),
             (0.0, 0.0),
+            (0.0, 0.0),
         );
 
         let (c_re, c_im) = (-1.2_f64, -0.35_f64);
@@ -468,8 +525,17 @@ mod tests {
         let cr = Big::try_from(0.5667_f64).unwrap();
         let ci = Big::try_from(0.0_f64).unwrap();
         let p = (-0.5_f64, 0.0_f64);
-        let points =
-            compute_set_reference(&cr, &ci, 60, 200, FractalKind::Phoenix, 2, p, (0.0, 0.0));
+        let points = compute_set_reference(
+            &cr,
+            &ci,
+            60,
+            200,
+            FractalKind::Phoenix,
+            2,
+            p,
+            (0.0, 0.0),
+            (0.0, 0.0),
+        );
 
         let (c_re, c_im) = (0.5667_f64, 0.0_f64);
         let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
@@ -485,6 +551,52 @@ mod tests {
             let nzi = 2.0 * zr * zi + c_im + pzi;
             pr = zr;
             pi = zi;
+            zr = nzr;
+            zi = nzi;
+        }
+    }
+
+    /// Complex Multibrot (power 2.5 + 0.3i) reference matches a naive f64
+    /// iteration of `z^p = exp(p·ln z)`.
+    #[test]
+    fn complex_multibrot_reference_matches_naive_f64() {
+        let cr = Big::try_from(0.1_f64).unwrap();
+        let ci = Big::try_from(-0.2_f64).unwrap();
+        let power = (2.5_f64, 0.3_f64);
+        let points = compute_set_reference(
+            &cr,
+            &ci,
+            60,
+            200,
+            FractalKind::ComplexMultibrot,
+            2,
+            (0.0, 0.0),
+            (0.0, 0.0),
+            power,
+        );
+
+        // Naive f64 complex power via z^p = exp(p * ln z), ln z = ln|z| + i*arg(z).
+        fn naive_cpow(zr: f64, zi: f64, pr: f64, pi: f64) -> (f64, f64) {
+            if zr == 0.0 && zi == 0.0 {
+                return (0.0, 0.0);
+            }
+            let ln_r = 0.5 * (zr * zr + zi * zi).ln();
+            let theta = zi.atan2(zr);
+            let exp_re = pr * ln_r - pi * theta;
+            let exp_im = pr * theta + pi * ln_r;
+            let mag = exp_re.exp();
+            (mag * exp_im.cos(), mag * exp_im.sin())
+        }
+
+        let (c_re, c_im) = (0.1_f64, -0.2_f64);
+        let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
+        for point in &points {
+            let tol = 1e-4 * (1.0 + zr.abs().max(zi.abs()));
+            assert!((point[0] as f64 - zr).abs() < tol, "re: {point:?} vs {zr}");
+            assert!((point[1] as f64 - zi).abs() < tol, "im: {point:?} vs {zi}");
+            let (pr, pi) = naive_cpow(zr, zi, power.0, power.1);
+            let nzr = pr + c_re;
+            let nzi = pi + c_im;
             zr = nzr;
             zi = nzi;
         }

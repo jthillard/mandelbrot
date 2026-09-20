@@ -17,6 +17,10 @@ pub struct Cli {
     #[arg(long)]
     pub power: Option<u32>,
 
+    /// Complex exponent for the Complex Multibrot kind (z -> z^power + c).
+    #[arg(long, value_name = "RE,IM")]
+    pub complex_power: Option<String>,
+
     /// Start in Julia mode with this seed constant.
     #[arg(long, value_name = "RE,IM")]
     pub julia: Option<String>,
@@ -79,6 +83,8 @@ pub enum KindArg {
     Buffalo,
     Phoenix,
     Lambda,
+    #[value(alias = "cmulti")]
+    ComplexMultibrot,
 }
 
 impl From<KindArg> for FractalKind {
@@ -93,6 +99,7 @@ impl From<KindArg> for FractalKind {
             KindArg::Buffalo => FractalKind::Buffalo,
             KindArg::Phoenix => FractalKind::Phoenix,
             KindArg::Lambda => FractalKind::Lambda,
+            KindArg::ComplexMultibrot => FractalKind::ComplexMultibrot,
         }
     }
 }

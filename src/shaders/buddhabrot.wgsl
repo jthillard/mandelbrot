@@ -47,14 +47,15 @@ struct Uniforms {
     // Tonemap colour style: 0 = classic (R/G/B = raw caps), 1 = nebula
     // (yellow core, blue halo), 2 = grayscale.
     palette: u32,
-    // Padding to a 16-byte multiple. NOT vec3<u32> — that type aligns to 16
-    // bytes in WGSL (unlike Rust's `[u32; 3]`, which aligns to 4), which
-    // silently added 32 bytes instead of 16 and mismatched the Rust struct's
-    // size (a wgpu validation error at dispatch time: "size 96 where the
-    // shader expects 112").
+    // Padding so `complex_power` (a vec2, 8-byte aligned) starts on an
+    // 8-byte boundary. NOT vec3<u32> — that type aligns to 16 bytes in WGSL
+    // (unlike Rust's `[u32; 3]`, which aligns to 4), which silently added 32
+    // bytes instead of 16 and mismatched the Rust struct's size (a wgpu
+    // validation error at dispatch time: "size 96 where the shader expects
+    // 112").
     _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    // Complex exponent for the Complex Multibrot kind; unused by other kinds.
+    complex_power: vec2<f32>,
 };
 
 const PALETTE_NEBULA: u32 = 0u;
@@ -70,6 +71,7 @@ const KIND_PERPENDICULAR: u32 = 5u;
 const KIND_BUFFALO: u32 = 6u;
 const KIND_PHOENIX: u32 = 7u;
 const KIND_LAMBDA: u32 = 8u;
+const KIND_COMPLEX_MULTIBROT: u32 = 9u;
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 // Compute pass: read-write atomic histogram (3 planes of width*height, R/G/B).
@@ -103,6 +105,21 @@ fn complex_pow(z: vec2<f32>, p: u32) -> vec2<f32> {
     return r;
 }
 
+// z^p for a complex exponent p, via the principal branch z^p = exp(p * ln z),
+// ln z = ln|z| + i*arg(z). z = 0 maps to 0 (the correct limit for the
+// Re(p) > 0 region the UI exposes; ln(0) would otherwise be -inf).
+fn cpow(z: vec2<f32>, p: vec2<f32>) -> vec2<f32> {
+    let r2 = dot(z, z);
+    if r2 < 1e-30 {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let ln_r = 0.5 * log(r2);
+    let theta = atan2(z.y, z.x);
+    let mag = exp(p.x * ln_r - p.y * theta);
+    let ang = p.x * theta + p.y * ln_r;
+    return mag * vec2<f32>(cos(ang), sin(ang));
+}
+
 // One iteration step z_n -> z_{n+1} for the current kind. `zp` is the
 // previous iterate (z_{n-1}), used only by the Phoenix two-term recurrence.
 // Must match `FractalKind` in reference.rs (the direct, non-perturbative form
@@ -126,6 +143,8 @@ fn advance(z: vec2<f32>, zp: vec2<f32>, c: vec2<f32>) -> vec2<f32> {
     } else if u.kind == KIND_LAMBDA {
         // l * z * (1 - z); c is unused (see file doc comment above).
         return cmul(u.lambda_l, cmul(z, vec2<f32>(1.0 - z.x, -z.y)));
+    } else if u.kind == KIND_COMPLEX_MULTIBROT {
+        return cpow(z, u.complex_power) + c;
     }
     return vec2<f32>(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c; // Mandelbrot
 }

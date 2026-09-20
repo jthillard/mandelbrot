@@ -46,7 +46,11 @@ pub struct BuddhabrotUniforms {
     /// (yellow core, blue halo), 2 = grayscale. Display-only, like `exposure`
     /// — excluded from `ContentKey` so changing it doesn't reset accumulation.
     pub palette: u32,
-    pub _pad: [u32; 3],
+    /// Padding so `complex_power` (a vec2, 8-byte aligned in the shader)
+    /// starts on an 8-byte boundary.
+    pub _pad0: u32,
+    /// Complex exponent for the Complex Multibrot kind; ignored by other kinds.
+    pub complex_power: [f32; 2],
 }
 
 /// The subset of `BuddhabrotUniforms` that determines the *content* of the
@@ -62,6 +66,7 @@ struct ContentKey {
     bailout_sq: f32,
     kind: u32,
     power: u32,
+    complex_power: [f32; 2],
     r_cap: u32,
     g_cap: u32,
     b_cap: u32,
@@ -78,6 +83,7 @@ impl From<&BuddhabrotUniforms> for ContentKey {
             bailout_sq: u.bailout_sq,
             kind: u.kind,
             power: u.power,
+            complex_power: u.complex_power,
             r_cap: u.r_cap,
             g_cap: u.g_cap,
             b_cap: u.b_cap,

@@ -26,6 +26,8 @@ pub struct RefRequest {
     pub phoenix_p: (f64, f64),
     /// Distortion constant for the Lambda map (ignored by other kinds).
     pub lambda_l: (f64, f64),
+    /// Complex exponent for the Complex Multibrot kind (ignored by other kinds).
+    pub complex_power: (f64, f64),
 }
 
 pub struct RefResult {
@@ -107,6 +109,7 @@ fn compute(req: &RefRequest) -> Vec<[f32; 2]> {
             req.power,
             req.phoenix_p,
             req.lambda_l,
+            req.complex_power,
         )
     } else {
         compute_set_reference(
@@ -118,6 +121,7 @@ fn compute(req: &RefRequest) -> Vec<[f32; 2]> {
             req.power,
             req.phoenix_p,
             req.lambda_l,
+            req.complex_power,
         )
     }
 }

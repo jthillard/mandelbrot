@@ -37,6 +37,7 @@ fn geom_differs(a: &Uniforms, b: &Uniforms) -> bool {
         || a.aa_level != b.aa_level
         || a.kind != b.kind
         || a.power != b.power
+        || a.complex_power != b.complex_power
         || a.dc_offset != b.dc_offset
         || a.phoenix_p != b.phoenix_p
         || a.de_coloring != b.de_coloring
@@ -87,6 +88,9 @@ pub struct Uniforms {
     /// Distortion constant `l` for the Lambda map (`l·z(1 - z)`);
     /// ignored by other kinds.
     pub lambda_l: [f32; 2],
+    /// Complex exponent for the Complex Multibrot kind (`z^power + c`);
+    /// ignored by other kinds.
+    pub complex_power: [f32; 2],
     /// 0 = escape-time coloring, 1 = distance-estimation shading.
     pub de_coloring: u32,
     // 0 = classic colors, 1 = shadows

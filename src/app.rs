@@ -56,6 +56,7 @@ const KINDS: &[(FractalKind, &str)] = &[
     (FractalKind::Buffalo, "Buffalo"),
     (FractalKind::Phoenix, "Phoenix"),
     (FractalKind::Lambda, "Lambda"),
+    (FractalKind::ComplexMultibrot, "Complex Multibrot"),
 ];
 
 /// UI label for a fractal kind.
@@ -69,8 +70,8 @@ fn kind_label(kind: FractalKind) -> &'static str {
 
 /// The iteration formula for a kind, in human-readable notation (mirrors the
 /// doc comments on `FractalKind`'s variants). `power` is only used by
-/// Multibrot.
-fn kind_formula(kind: FractalKind, power: u32) -> String {
+/// Multibrot; `complex_power` only by Complex Multibrot.
+fn kind_formula(kind: FractalKind, power: u32, complex_power: (f64, f64)) -> String {
     match kind {
         FractalKind::Mandelbrot => "z = z² + c".to_string(),
         FractalKind::BurningShip => "z = (|Re(z)| + i|Im(z)|)² + c".to_string(),
@@ -81,13 +82,16 @@ fn kind_formula(kind: FractalKind, power: u32) -> String {
         FractalKind::Buffalo => "z = |Re(z²)| − i|Im(z²)| + c".to_string(),
         FractalKind::Phoenix => "z = z² + c + p·z_prev".to_string(),
         FractalKind::Lambda => "z = λ·z(1 − z)".to_string(),
+        FractalKind::ComplexMultibrot => {
+            format!("z = z^({:.3}{:+.3}i) + c", complex_power.0, complex_power.1)
+        }
     }
 }
 
 type JuliaPreset = (&'static str, f64, f64, u32, Option<(f64, f64)>);
 
 /// Nice-looking Julia constants offered as presets.
-const JULIA_PRESETS: [&[JuliaPreset]; FractalKind::Lambda as usize + 1] = [
+const JULIA_PRESETS: [&[JuliaPreset]; FractalKind::ComplexMultibrot as usize + 1] = [
     &[
         ("dendrite", -0.8, 0.156, 400, None),
         ("rabbit", -0.123, 0.745, 400, None),
@@ -106,6 +110,7 @@ const JULIA_PRESETS: [&[JuliaPreset]; FractalKind::Lambda as usize + 1] = [
         ("archipelago 2", -0.556, 0.253, 500, Some((-0.415, -0.267))),
     ],
     &[],
+    &[],
 ];
 
 type SetPreset = (
@@ -120,7 +125,7 @@ type SetPreset = (
 /// Curated beautiful locations offered as one-click presets.
 /// Each is `(name, center_re, center_im, half_height, iterations)`; the centers
 /// are decimals parsed at full precision so deep places stay sharp.
-const SET_PRESETS: [&[SetPreset]; FractalKind::Lambda as usize + 1] = [
+const SET_PRESETS: [&[SetPreset]; FractalKind::ComplexMultibrot as usize + 1] = [
     &[
         (
             "Seahorse Valley",
@@ -171,6 +176,7 @@ const SET_PRESETS: [&[SetPreset]; FractalKind::Lambda as usize + 1] = [
         Some((-0.9, -0.49)),
     )],
     &[],
+    &[],
 ];
 
 /// Parameters a reference orbit was (or will be) computed for. Used to decide
@@ -186,6 +192,7 @@ struct RequestKey {
     iter: u32,
     kind: FractalKind,
     power: u32,
+    complex_power: (f64, f64),
 }
 
 /// Shared state for an in-progress PNG export. The worker (a background thread
@@ -273,6 +280,8 @@ pub struct FractalApp {
     kind: FractalKind,
     /// Exponent for the Multibrot kind.
     power: u32,
+    /// Complex exponent for the Complex Multibrot kind (`z^power + c`).
+    complex_power: (f64, f64),
     julia_c: (f64, f64),
     /// Distortion constant `p` for the Phoenix kind (`z^2 + c + p·z_{n-1}`).
     phoenix_p: (f64, f64),
@@ -452,6 +461,7 @@ impl FractalApp {
             mode: FractalMode::Mandelbrot,
             kind: FractalKind::Mandelbrot,
             power: 3,
+            complex_power: (2.0, 0.5),
             julia_c: (-0.8, 0.156),
             phoenix_p: (-0.5, 0.0),
             lambda_l: (-0.5, 0.0),
@@ -512,6 +522,15 @@ impl FractalApp {
             self.kind = k.into();
             if let Some(p) = cli.power {
                 self.power = p.clamp(2, 8);
+            }
+            if let Some(cp) = &cli.complex_power {
+                let p: Vec<&str> = cp.split(',').collect();
+                if let (Some(Ok(re)), Some(Ok(im))) = (
+                    p.first().map(|s| s.trim().parse::<f64>()),
+                    p.get(1).map(|s| s.trim().parse::<f64>()),
+                ) {
+                    self.complex_power = (re, im);
+                }
             }
             self.view = Self::default_view_for(self.mode, self.kind);
         }
@@ -618,6 +637,7 @@ impl FractalApp {
             julia_c: self.julia_c,
             phoenix_p: self.phoenix_p,
             lambda_l: self.lambda_l,
+            complex_power: self.complex_power,
             color_scale: self.color_scale,
             color_offset: self.color_offset,
             palette: self.palette,
@@ -637,6 +657,7 @@ impl FractalApp {
         self.julia_c = s.julia_c;
         self.phoenix_p = s.phoenix_p;
         self.lambda_l = s.lambda_l;
+        self.complex_power = s.complex_power;
         self.color_scale = s.color_scale;
         self.color_offset = s.color_offset;
         self.palette = (s.palette as usize).min(PALETTE_NAMES.len() - 1) as u32;
@@ -688,6 +709,7 @@ impl FractalApp {
             FractalKind::Buffalo => (-0.5, -0.5, 1.5),
             FractalKind::Phoenix => (0.0, 0.0, 1.6),
             FractalKind::Lambda => (0.0, 0.0, 1.6),
+            FractalKind::ComplexMultibrot => (0.0, 0.0, 1.5),
         };
         ViewState::with_center(big_from_f64(cr, 53), big_from_f64(ci, 53), hh)
     }
@@ -704,6 +726,7 @@ impl FractalApp {
             iter: self.max_iterations,
             kind: self.kind,
             power: self.power,
+            complex_power: self.complex_power,
         }
     }
 
@@ -729,6 +752,7 @@ impl FractalApp {
             || key.iter != self.max_iterations
             || key.kind != self.kind
             || key.power != self.power
+            || key.complex_power != self.complex_power
         {
             return true;
         }
@@ -797,6 +821,7 @@ impl FractalApp {
                     power: key.power,
                     phoenix_p: key.phoenix_p,
                     lambda_l: key.lambda_l,
+                    complex_power: key.complex_power,
                 });
                 self.pending = true;
             }
@@ -816,6 +841,7 @@ impl FractalApp {
                         key.power,
                         key.phoenix_p,
                         key.lambda_l,
+                        key.complex_power,
                     )
                 } else {
                     compute_set_reference(
@@ -827,6 +853,7 @@ impl FractalApp {
                         key.power,
                         key.phoenix_p,
                         key.lambda_l,
+                        key.complex_power,
                     )
                 };
                 self.apply_reference(
@@ -881,6 +908,7 @@ impl FractalApp {
                 key.power,
                 key.phoenix_p,
                 key.lambda_l,
+                key.complex_power,
             )
         } else {
             compute_set_reference(
@@ -892,6 +920,7 @@ impl FractalApp {
                 key.power,
                 key.phoenix_p,
                 key.lambda_l,
+                key.complex_power,
             )
         };
         self.apply_reference(
@@ -921,6 +950,7 @@ impl FractalApp {
             dc_offset: self.dc_offset(),
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
+            complex_power: [self.complex_power.0 as f32, self.complex_power.1 as f32],
             de_coloring: (self.de_coloring | self.shadow) as u32,
             shadow: self.shadow as u32,
             _pad: [0; _],
@@ -941,6 +971,7 @@ impl FractalApp {
             aspect: aspect as f32,
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
+            complex_power: [self.complex_power.0 as f32, self.complex_power.1 as f32],
             bailout_sq: BAILOUT_SQ,
             kind: self.kind as u32,
             power: self.power,
@@ -954,7 +985,7 @@ impl FractalApp {
             height: 0,          // set by the callback from size_px
             total_samples: 0.0, // tracked by the renderer across frames
             palette: self.buddha_palette,
-            _pad: [0; 3],
+            _pad0: 0,
         }
     }
 
@@ -1246,6 +1277,12 @@ impl FractalApp {
                         self.lambda_l.0, self.lambda_l.1
                     ));
                 }
+                if self.kind == FractalKind::ComplexMultibrot {
+                    ui.label(format!(
+                        "power = {:.6} {:+.6}i",
+                        self.complex_power.0, self.complex_power.1
+                    ));
+                }
                 ui.separator();
 
                 ui.label(self.kind.description());
@@ -1270,7 +1307,8 @@ impl FractalApp {
                         ui.label(
                             "A deep-zoom fractal explorer. It renders the Mandelbrot set \
                              and several related fractals (Burning Ship, Tricorn, \
-                             Multibrot, Celtic, Perpendicular, Buffalo, Phoenix, Lambda).",
+                             Multibrot, Complex Multibrot, Celtic, Perpendicular, Buffalo, \
+                             Phoenix, Lambda).",
                         );
                         ui.add_space(4.0);
                         ui.label(
@@ -1507,6 +1545,22 @@ impl FractalApp {
                     egui::DragValue::new(&mut self.lambda_l.1)
                         .speed(0.001)
                         .range(-2.0..=2.0),
+                );
+                ui.label("i");
+            });
+        }
+        if self.kind == FractalKind::ComplexMultibrot {
+            ui.horizontal(|ui| {
+                ui.label("power =");
+                ui.add(
+                    egui::DragValue::new(&mut self.complex_power.0)
+                        .speed(0.01)
+                        .range(-8.0..=8.0),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.complex_power.1)
+                        .speed(0.01)
+                        .range(-8.0..=8.0),
                 );
                 ui.label("i");
             });

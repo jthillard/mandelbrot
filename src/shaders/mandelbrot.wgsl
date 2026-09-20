@@ -34,6 +34,9 @@ struct Uniforms {
     // Distortion constant l for the Lambda map (l*z(1 - z_{n-1})); unused
     // by other kinds.
     lambda_l: vec2<f32>,
+    // Complex exponent for the Complex Multibrot kind (z^power + c); unused
+    // by other kinds.
+    complex_power: vec2<f32>,
     // 0 = escape-time coloring, 1 = distance-estimation shading.
     de_coloring: u32,
     // 0 = classic colors, 1 = shadows
@@ -49,6 +52,7 @@ const KIND_PERPENDICULAR: u32 = 5u;
 const KIND_BUFFALO: u32 = 6u;
 const KIND_PHOENIX: u32 = 7u;
 const KIND_LAMBDA: u32 = 8u;
+const KIND_COMPLEX_MULTIBROT: u32 = 9u;
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> ref_orbit: array<vec2<f32>>;
@@ -82,6 +86,27 @@ fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 // Complex conjugate.
 fn conj(a: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x, -a.y);
+}
+
+// Complex division a / b.
+fn cdiv(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    let d = dot(b, b);
+    return vec2<f32>(a.x * b.x + a.y * b.y, a.y * b.x - a.x * b.y) / d;
+}
+
+// z^p for a complex exponent p, via the principal branch z^p = exp(p * ln z),
+// ln z = ln|z| + i*arg(z). z = 0 maps to 0 (the correct limit for the
+// Re(p) > 0 region the UI exposes; ln(0) would otherwise be -inf).
+fn cpow(z: vec2<f32>, p: vec2<f32>) -> vec2<f32> {
+    let r2 = dot(z, z);
+    if r2 < 1e-30 {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let ln_r = 0.5 * log(r2);
+    let theta = atan2(z.y, z.x);
+    let mag = exp(p.x * ln_r - p.y * theta);
+    let ang = p.x * theta + p.y * ln_r;
+    return mag * vec2<f32>(cos(ang), sin(ang));
 }
 
 // |c + d| - |c|, evaluated exactly (no catastrophic cancellation even when the
@@ -121,6 +146,47 @@ fn multibrot_delta(z: vec2<f32>, e: vec2<f32>, p: u32) -> vec2<f32> {
         acc = acc + binom(p, k) * cmul(zp[p - k], ek);
     }
     return acc;
+}
+
+// Number of terms kept in `complex_multibrot_delta`'s series. Truncation, not
+// exactness: unlike `multibrot_delta` (a finite binomial sum for an integer
+// power), a complex power has no finite expansion, so this converges rather
+// than terminates. Fine as long as perturbation's usual invariant (|e| << |z|,
+// kept true by rebasing) holds, since each extra term is O(w^k) smaller.
+const COMPLEX_MULTIBROT_TERMS: u32 = 16u;
+
+// Perturbation delta for z -> z^p with a complex p: (Z+e)^p - Z^p.
+//
+// When |e| << |Z| (the common case: it's the whole reason perturbation
+// works), forming Z+e directly would round e away in f32, so instead expand
+// = Z^p * ((1+w)^p - 1), w = e/Z, as a Taylor series in w: (1+w)^p - 1 =
+// sum_{k=1}^N C(p,k) w^k, with the complex binomial coefficient built up
+// incrementally: C(p,k) = C(p,k-1) * (p-(k-1)) / k. Unlike `multibrot_delta`
+// (a finite binomial sum for an integer power), this only *converges* — and
+// only for |w| < 1 — rather than terminating exactly.
+//
+// Right after a rebase (or near a reference point close to zero, where w is
+// singular), e is *not* small relative to Z — that's normal perturbation
+// dynamics, not a deep-zoom edge case — and the series above would diverge.
+// But forming Z+e directly is numerically safe exactly there (e isn't many
+// orders of magnitude smaller than Z), so fall back to a plain subtraction.
+fn complex_multibrot_delta(z: vec2<f32>, e: vec2<f32>, p: vec2<f32>) -> vec2<f32> {
+    // |w|^2 = |e|^2 / |Z|^2; inf or nan (Z ~ 0, or both ~ 0) correctly fails
+    // the `< 0.25` test below and falls through to the direct branch.
+    let w2 = dot(e, e) / dot(z, z);
+    if w2 < 0.25 {
+        let w = cdiv(e, z);
+        var wk = vec2<f32>(1.0, 0.0); // w^0
+        var coef = vec2<f32>(1.0, 0.0); // C(p,0)
+        var acc = vec2<f32>(0.0, 0.0);
+        for (var k: u32 = 1u; k <= COMPLEX_MULTIBROT_TERMS; k = k + 1u) {
+            coef = cdiv(cmul(coef, p - vec2<f32>(f32(k - 1u), 0.0)), vec2<f32>(f32(k), 0.0));
+            wk = cmul(wk, w);
+            acc = acc + cmul(coef, wk);
+        }
+        return cmul(cpow(z, p), acc);
+    }
+    return cpow(z + e, p) - cpow(z, p);
 }
 
 // One perturbation step of the current fractal's delta: e -> f(Z+e) - f(Z),
@@ -163,6 +229,8 @@ fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
         // Lambda map: z^{n+1} = λ·z·(1-z). Delta: e = λ·e·(1-2z-e).
         let one_minus_2z_minus_e = vec2<f32>(1.0 - 2.0 * z.x - e.x, -2.0 * z.y - e.y);
         return cmul(u.lambda_l, cmul(e, one_minus_2z_minus_e));
+    } else if u.kind == KIND_COMPLEX_MULTIBROT {
+        return complex_multibrot_delta(z, e, u.complex_power);
     }
     return 2.0 * cmul(z, e) + cmul(e, e); // Mandelbrot (and Phoenix square part)
 }
@@ -183,6 +251,9 @@ fn fprime(z: vec2<f32>) -> vec2<f32> {
     } else if u.kind == KIND_LAMBDA {
         // Lambda: f'(z) = λ·(1-2z).
         return cmul(u.lambda_l, vec2<f32>(1.0 - 2.0 * z.x, -2.0 * z.y));
+    } else if u.kind == KIND_COMPLEX_MULTIBROT {
+        // f'(z) = p * z^(p-1).
+        return cmul(u.complex_power, cpow(z, u.complex_power - vec2<f32>(1.0, 0.0)));
     }
     return 2.0 * z;
 }
