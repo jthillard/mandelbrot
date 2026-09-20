@@ -160,7 +160,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let interior_frac = d.b;
 
         let t = fract(ci * u.color_scale + u.color_offset);
-        var col = palette(u.palette_id, t) * de;
+        var col = palette(u.palette_id, t) * sqrt(de);
         // Anti-alias the set boundary: fade toward black by the fraction of the
         // pixel's sub-samples that landed in the interior.
         col = col * (1.0 - interior_frac);
