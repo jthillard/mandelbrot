@@ -1826,10 +1826,11 @@ impl FractalApp {
             ui.add(
                 egui::DragValue::new(&mut self.export_scale)
                     .range(1.0..=16.0)
-                    .speed(0.5),
+                    .speed(0.25)
+                    .custom_formatter(|x, _| format!("x{:.1}", x)),
             );
             ui.label(format!(
-                "→ {}×{}",
+                "= {}×{}",
                 (self.last_size_px.x * self.export_scale) as u32,
                 (self.last_size_px.y * self.export_scale) as u32,
             ));
