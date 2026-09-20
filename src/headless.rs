@@ -48,6 +48,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         height,
         uniforms,
         app.reference_points(),
+        app.lights(),
     );
 
     eprintln!("rendering {width}×{height}…");

@@ -791,6 +791,13 @@ impl FractalApp {
         &self.reference
     }
 
+    /// The configured shadow-style lights, for headless export's `ExportRender`
+    /// (which has no `FractalCallback` to source them from).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn lights(&self) -> &[Light] {
+        &self.lights
+    }
+
     /// Recompute the reference orbit when needed. Native: dispatch to a worker
     /// thread and pick up completed results. Web: compute inline.
     fn ensure_reference(&mut self) {
@@ -1024,6 +1031,7 @@ impl FractalApp {
             renderer.export_handles()
         };
         let reference = Arc::clone(&self.reference);
+        let lights = self.lights.clone();
 
         let shared = Arc::new(Mutex::new(ExportShared {
             fraction: 0.0,
@@ -1050,6 +1058,7 @@ impl FractalApp {
                     h,
                     uniforms,
                     reference.as_slice(),
+                    &lights,
                 );
                 let sh = Arc::clone(&shared);
                 let png =
@@ -1079,6 +1088,7 @@ impl FractalApp {
                     h,
                     uniforms,
                     reference.as_slice(),
+                    &lights,
                 );
 
                 // Render tile by tile, awaiting each submission so the browser

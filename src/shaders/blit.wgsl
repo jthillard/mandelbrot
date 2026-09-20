@@ -13,12 +13,7 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
-    var verts = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(3.0, -1.0),
-        vec2<f32>(-1.0, 3.0),
-    );
-    let p = verts[idx];
+    let p = fullscreen_triangle_pos(idx);
     var out: VsOut;
     out.pos = vec4<f32>(p, 0.0, 1.0);
     // Map NDC to texture UV. v is flipped so the cache's top row (rendered at

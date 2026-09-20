@@ -164,7 +164,14 @@ impl FractalRenderer {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mandelbrot"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/mandelbrot.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(
+                    include_str!("../shaders/common.wgsl"),
+                    include_str!("../shaders/iterate_uniforms.wgsl"),
+                    include_str!("../shaders/mandelbrot.wgsl"),
+                )
+                .into(),
+            ),
         });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -211,6 +218,19 @@ impl FractalRenderer {
                     },
                     count: None,
                 },
+                // Only read by the export pipeline's shadow branch (`fs_color`
+                // with the custom-lights palette); the iterate pipeline
+                // (`fs_data`) ignores it, but both pipelines share this layout.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -225,6 +245,10 @@ impl FractalRenderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: ref_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: lights_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -292,7 +316,14 @@ impl FractalRenderer {
         // Colourise pass: data texture + colour uniforms → colour texture.
         let colorize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("colorize"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/colorize.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(
+                    include_str!("../shaders/common.wgsl"),
+                    include_str!("../shaders/iterate_uniforms.wgsl"),
+                    include_str!("../shaders/colorize.wgsl"),
+                )
+                .into(),
+            ),
         });
         let colorize_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -366,7 +397,13 @@ impl FractalRenderer {
         // Blit pipeline: samples the cache texture onto egui's surface.
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blit.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(
+                    include_str!("../shaders/common.wgsl"),
+                    include_str!("../shaders/blit.wgsl"),
+                )
+                .into(),
+            ),
         });
 
         let blit_bind_group_layout =
@@ -592,6 +629,7 @@ impl ExportRender {
         height: u32,
         uniforms: Uniforms,
         reference: &[[f32; 2]],
+        lights: &[Light],
     ) -> Self {
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("export uniforms"),
@@ -612,6 +650,19 @@ impl ExportRender {
             queue.write_buffer(&ref_buffer, 0, bytemuck::cast_slice(&reference[..count]));
         }
 
+        // Only read by the shadow branch's custom-lights palette; harmless
+        // (zeroed) for every other coloring mode.
+        let lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("export lights"),
+            size: (MAX_LIGHT_COUNT * std::mem::size_of::<Light>()) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut light_bytes = [0u8; size_of::<Light>() * MAX_LIGHT_COUNT];
+        let n = lights.len().min(MAX_LIGHT_COUNT);
+        light_bytes[..n * size_of::<Light>()].copy_from_slice(bytemuck::cast_slice(&lights[..n]));
+        queue.write_buffer(&lights_buffer, 0, &light_bytes);
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("export bind group"),
             layout: bind_group_layout,
@@ -623,6 +674,10 @@ impl ExportRender {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: ref_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: lights_buffer.as_entire_binding(),
                 },
             ],
         });

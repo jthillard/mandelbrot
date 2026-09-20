@@ -12,50 +12,11 @@
 // the reference index to 0 and carry the full value as the new delta (valid
 // because X_0 = 0).
 
-struct Uniforms {
-    span: vec2<f32>,
-    max_iter: u32,
-    ref_len: u32,
-    color_offset: f32,
-    color_scale: f32,
-    bailout_sq: f32,
-    is_julia: u32,
-    palette_id: u32,
-    shadow_palette_id: u32,
-    aa_level: u32,
-    // Iteration formula (see the KIND_* constants below).
-    kind: u32,
-    // Exponent for the Multibrot kind.
-    power: u32,
-    dc_offset: vec2<f32>,
-    // Distortion constant p for the Phoenix map (z^2 + c + p*z_{n-1}); unused
-    // by other kinds. Placed by dc_offset so both vec2s stay 8-byte aligned.
-    phoenix_p: vec2<f32>,
-    // Distortion constant l for the Lambda map (l*z(1 - z_{n-1})); unused
-    // by other kinds.
-    lambda_l: vec2<f32>,
-    // Complex exponent for the Complex Multibrot kind (z^power + c); unused
-    // by other kinds.
-    complex_power: vec2<f32>,
-    // 0 = escape-time coloring, 1 = distance-estimation shading.
-    de_coloring: u32,
-    // 0 = classic colors, 1 = shadows
-    shadow: u32,
-};
-
-const KIND_MANDELBROT: u32 = 0u;
-const KIND_BURNING_SHIP: u32 = 1u;
-const KIND_TRICORN: u32 = 2u;
-const KIND_MULTIBROT: u32 = 3u;
-const KIND_CELTIC: u32 = 4u;
-const KIND_PERPENDICULAR: u32 = 5u;
-const KIND_BUFFALO: u32 = 6u;
-const KIND_PHOENIX: u32 = 7u;
-const KIND_LAMBDA: u32 = 8u;
-const KIND_COMPLEX_MULTIBROT: u32 = 9u;
-
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> ref_orbit: array<vec2<f32>>;
+// Only read by `fs_color`'s shadow branch (custom-lights palette); the
+// iteration pass (`fs_data`) never touches it.
+@group(0) @binding(2) var<uniform> lights: array<Light, 16>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -65,22 +26,12 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
-    var verts = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(3.0, -1.0),
-        vec2<f32>(-1.0, 3.0),
-    );
-    let ndc = verts[idx];
+    let ndc = fullscreen_triangle_pos(idx);
     var out: VsOut;
     out.pos = vec4<f32>(ndc, 0.0, 1.0);
     // Flip y so +imaginary points up the screen.
     out.centered = vec2<f32>(ndc.x, -ndc.y) * 0.5;
     return out;
-}
-
-// Complex multiply.
-fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
 // Complex conjugate.
@@ -92,21 +43,6 @@ fn conj(a: vec2<f32>) -> vec2<f32> {
 fn cdiv(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     let d = dot(b, b);
     return vec2<f32>(a.x * b.x + a.y * b.y, a.y * b.x - a.x * b.y) / d;
-}
-
-// z^p for a complex exponent p, via the principal branch z^p = exp(p * ln z),
-// ln z = ln|z| + i*arg(z). z = 0 maps to 0 (the correct limit for the
-// Re(p) > 0 region the UI exposes; ln(0) would otherwise be -inf).
-fn cpow(z: vec2<f32>, p: vec2<f32>) -> vec2<f32> {
-    let r2 = dot(z, z);
-    if r2 < 1e-30 {
-        return vec2<f32>(0.0, 0.0);
-    }
-    let ln_r = 0.5 * log(r2);
-    let theta = atan2(z.y, z.x);
-    let mag = exp(p.x * ln_r - p.y * theta);
-    let ang = p.x * theta + p.y * ln_r;
-    return mag * vec2<f32>(cos(ang), sin(ang));
 }
 
 // |c + d| - |c|, evaluated exactly (no catastrophic cancellation even when the
@@ -258,26 +194,6 @@ fn fprime(z: vec2<f32>) -> vec2<f32> {
     return 2.0 * z;
 }
 
-// Smooth cyclic palettes (Inigo Quilez cosine palettes), selected by id.
-fn palette(id: u32, t: f32) -> vec3<f32> {
-    if id == 4u {
-        return vec3<f32>(t, t, t); // grayscale
-    }
-    let a = vec3<f32>(0.5, 0.5, 0.5);
-    let b = vec3<f32>(0.5, 0.5, 0.5);
-    var c = vec3<f32>(1.0, 1.0, 1.0);
-    var d = vec3<f32>(0.00, 0.10, 0.20); // 0: amber / blue
-    if id == 1u {
-        d = vec3<f32>(0.00, 0.33, 0.67); // rainbow
-    } else if id == 2u {
-        d = vec3<f32>(0.30, 0.20, 0.20); // warm ember
-    } else if id == 3u {
-        c = vec3<f32>(1.0, 1.0, 0.5);
-        d = vec3<f32>(0.80, 0.90, 0.30); // lime / magenta
-    }
-    return a + b * cos(6.28318530718 * (c * t + d));
-}
-
 // Escape data for one sample: `ci` is the (color-independent) palette parameter,
 // `de` the distance-estimate darkening factor in [0,1], `escaped` false for the
 // interior of the set. Splitting iteration from coloring lets a colour change be
@@ -416,22 +332,15 @@ fn color_sample(s: Sample) -> vec3<f32> {
     if !s.escaped {
         return vec3<f32>(0.0, 0.0, 0.0);
     }
-    let t = fract(s.ci * u.color_scale + u.color_offset);
-    return palette(u.palette_id, t) * s.de;
+    return classic_color(s.ci, s.de);
 }
 
-// Iteration pass: write per-pixel escape data (color-independent) so a colour
-// change is remapped by the cheap colourise pass without re-iterating.
-//   R = ci (palette parameter), G = DE factor, B = interior fraction (for AA).
-// AA is grid-supersampled here; the interior fraction lets the colourise pass
-// anti-alias the set boundary (blend toward black) after the fact.
-@fragment
-fn fs_data(in: VsOut) -> @location(0) vec4<f32> {
-    let base = in.centered * u.span + u.dc_offset;
-    let dx = dpdx(base);
-    let dy = dpdy(base);
-    let px = length(abs(dx) + abs(dy));
-
+// Supersampled escape data at one point: average (ci, DE factor) over the
+// AA grid's escaped sub-samples, plus the fraction that landed in the
+// interior. Shared by `fs_data` (writes it straight to the data texture) and
+// `fs_color`'s shadow branch (used both at the pixel and at its two
+// neighbours, to build a DE height field without a texture round-trip).
+fn aggregate_sample(base: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, px: f32) -> vec3<f32> {
     let aa = max(u.aa_level, 1u);
     let inv = 1.0 / f32(aa);
     var ci_sum = 0.0;
@@ -453,7 +362,22 @@ fn fs_data(in: VsOut) -> @location(0) vec4<f32> {
     let ci_avg = select(0.0, ci_sum / f32(escaped_n), escaped_n > 0u);
     let de_avg = select(1.0, de_sum / f32(escaped_n), escaped_n > 0u);
     let interior_frac = 1.0 - f32(escaped_n) / total;
-    return vec4<f32>(ci_avg, de_avg, interior_frac, 1.0);
+    return vec3<f32>(ci_avg, de_avg, interior_frac);
+}
+
+// Iteration pass: write per-pixel escape data (color-independent) so a colour
+// change is remapped by the cheap colourise pass without re-iterating.
+//   R = ci (palette parameter), G = DE factor, B = interior fraction (for AA).
+// AA is grid-supersampled here; the interior fraction lets the colourise pass
+// anti-alias the set boundary (blend toward black) after the fact.
+@fragment
+fn fs_data(in: VsOut) -> @location(0) vec4<f32> {
+    let base = in.centered * u.span + u.dc_offset;
+    let dx = dpdx(base);
+    let dy = dpdy(base);
+    let px = length(abs(dx) + abs(dy));
+
+    return vec4<f32>(aggregate_sample(base, dx, dy, px), 1.0);
 }
 
 // Combined iterate + colour in a single pass, for PNG export (which never needs
@@ -465,6 +389,21 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
     let dx = dpdx(base);
     let dy = dpdy(base);
     let px = length(abs(dx) + abs(dy));
+
+    if u.shadow != 0u {
+        // No data texture to sample neighbours from (this pass never runs
+        // one), so build the same DE height field colorize.wgsl reads from
+        // the texture by aggregating live, at the pixel and its two
+        // neighbours a `dx`/`dy` step away.
+        let here = aggregate_sample(base, dx, dy, px);
+        if here.z != 0.0 {
+            return vec4<f32>(0.1, 0.1, 0.1, 1.0);
+        }
+        let right = aggregate_sample(base + dx, dx, dy, px);
+        let down = aggregate_sample(base + dy, dx, dy, px);
+        let normal = normal_from_heights(here.y, right.y, down.y);
+        return vec4<f32>(shadow_color(normal), 1.0);
+    }
 
     let aa = max(u.aa_level, 1u);
     let inv = 1.0 / f32(aa);

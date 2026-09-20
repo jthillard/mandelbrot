@@ -66,6 +66,18 @@ pixel is a handful of `f32` complex multiplies.
   `compute_reference`/`compute_set_reference`: iterate the chosen formula at
   high precision on the CPU, emitting `Z_n` as `f32` pairs — that's the
   reference orbit the GPU perturbs from.
+- `src/shaders/*.wgsl` — none of these are standalone WGSL modules; WGSL has
+  no `#include`, so each is compiled by concatenating plain-text fragments
+  with `concat!`/`include_str!` at the `create_shader_module` call site (see
+  `renderer.rs`, `buddhabrot.rs`, and `tests/shader_valid.rs`, which must
+  concatenate the same pieces to validate what actually gets built).
+  `common.wgsl` (fullscreen-triangle vertex helper, `cmul`/`cpow`, `KIND_*`
+  constants) is prepended to every shader. `iterate_uniforms.wgsl` (the
+  perturbation-pipeline `Uniforms` struct + `palette()`) is additionally
+  prepended to `mandelbrot.wgsl` and `colorize.wgsl`, which share that layout.
+  Because there's no namespacing, a definition must live in exactly one file
+  among those concatenated together for a given shader — don't redefine a
+  `common.wgsl`/`iterate_uniforms.wgsl` symbol locally.
 - `src/shaders/mandelbrot.wgsl` — the perturbation fragment shader.
   `advance_delta(z, e)` is the per-kind delta step (`z` = reference point,
   `e` = current delta); the caller adds `step_add` (= `dc`) afterward — this
@@ -75,8 +87,8 @@ pixel is a handful of `f32` complex multiplies.
   reference data since the orbit point alone wouldn't be enough to recover an
   exact delta). `fprime(z)` is the derivative used for distance-estimation
   (DE) shading; exact for holomorphic kinds, an approximation (`~2Z`) for the
-  abs-based ones. A `KIND_*` constant here must match the matching
-  `FractalKind` variant's discriminant exactly.
+  abs-based ones. A `KIND_*` constant (from `common.wgsl`) must match the
+  matching `FractalKind` variant's discriminant exactly.
 - `src/fractal/renderer.rs` — `FractalRenderer` (wgpu pipelines, uniform +
   storage buffers, bind groups), `Uniforms` (repr(C) layout that must match
   the WGSL `Uniforms` struct field-for-field, including padding), and
@@ -105,9 +117,10 @@ pixel is a handful of `f32` complex multiplies.
 ### Adding a new `FractalKind`
 
 Touches, in order: `reference.rs` (enum variant + CPU iteration formula, and a
-test comparing against a naive `f64` iteration), `mandelbrot.wgsl` (matching
-`KIND_*` const + `advance_delta`/`fprime` arms), `buddhabrot.wgsl` (matching
-arm in `advance()`, if the kind makes sense as a Buddhabrot), `renderer.rs`
+test comparing against a naive `f64` iteration), `common.wgsl` (matching
+`KIND_*` const), `mandelbrot.wgsl` (matching `advance_delta`/`fprime` arms),
+`buddhabrot.wgsl` (matching arm in `advance()`, if the kind makes sense as a
+Buddhabrot), `renderer.rs`
 `Uniforms` (only if the kind needs a new per-kind constant, e.g. Phoenix's
 `phoenix_p`), `share.rs` (encode/decode string tag), `app.rs` (`KINDS` label,
 `JULIA_PRESETS`/`SET_PRESETS` slot, `default_view_for` entry, and optionally a

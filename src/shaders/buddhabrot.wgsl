@@ -62,17 +62,6 @@ const PALETTE_NEBULA: u32 = 0u;
 const PALETTE_YELLOW: u32 = 1u;
 const PALETTE_GRAYSCALE: u32 = 2u;
 
-const KIND_MANDELBROT: u32 = 0u;
-const KIND_BURNING_SHIP: u32 = 1u;
-const KIND_TRICORN: u32 = 2u;
-const KIND_MULTIBROT: u32 = 3u;
-const KIND_CELTIC: u32 = 4u;
-const KIND_PERPENDICULAR: u32 = 5u;
-const KIND_BUFFALO: u32 = 6u;
-const KIND_PHOENIX: u32 = 7u;
-const KIND_LAMBDA: u32 = 8u;
-const KIND_COMPLEX_MULTIBROT: u32 = 9u;
-
 @group(0) @binding(0) var<uniform> u: Uniforms;
 // Compute pass: read-write atomic histogram (3 planes of width*height, R/G/B).
 @group(0) @binding(1) var<storage, read_write> histogram: array<atomic<u32>>;
@@ -93,31 +82,12 @@ fn rand01(seed: u32) -> f32 {
     return f32(hash_u32(seed)) * (1.0 / 4294967295.0);
 }
 
-fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
-}
-
 fn complex_pow(z: vec2<f32>, p: u32) -> vec2<f32> {
     var r = vec2<f32>(1.0, 0.0);
     for (var i: u32 = 0u; i < p; i = i + 1u) {
         r = cmul(r, z);
     }
     return r;
-}
-
-// z^p for a complex exponent p, via the principal branch z^p = exp(p * ln z),
-// ln z = ln|z| + i*arg(z). z = 0 maps to 0 (the correct limit for the
-// Re(p) > 0 region the UI exposes; ln(0) would otherwise be -inf).
-fn cpow(z: vec2<f32>, p: vec2<f32>) -> vec2<f32> {
-    let r2 = dot(z, z);
-    if r2 < 1e-30 {
-        return vec2<f32>(0.0, 0.0);
-    }
-    let ln_r = 0.5 * log(r2);
-    let theta = atan2(z.y, z.x);
-    let mag = exp(p.x * ln_r - p.y * theta);
-    let ang = p.x * theta + p.y * ln_r;
-    return mag * vec2<f32>(cos(ang), sin(ang));
 }
 
 // One iteration step z_n -> z_{n+1} for the current kind. `zp` is the
@@ -251,12 +221,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-    var verts = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(3.0, -1.0),
-        vec2<f32>(-1.0, 3.0),
-    );
-    return vec4<f32>(verts[idx], 0.0, 1.0);
+    return vec4<f32>(fullscreen_triangle_pos(idx), 0.0, 1.0);
 }
 
 @fragment

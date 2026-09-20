@@ -21,24 +21,44 @@ fn validate(name: &str, src: &str) {
 fn mandelbrot_shader_is_valid() {
     validate(
         "mandelbrot.wgsl",
-        include_str!("../src/shaders/mandelbrot.wgsl"),
+        concat!(
+            include_str!("../src/shaders/common.wgsl"),
+            include_str!("../src/shaders/iterate_uniforms.wgsl"),
+            include_str!("../src/shaders/mandelbrot.wgsl"),
+        ),
     );
 }
 
 #[test]
 fn colorize_shader_is_valid() {
-    validate("colorize.wgsl", include_str!("../src/shaders/colorize.wgsl"));
+    validate(
+        "colorize.wgsl",
+        concat!(
+            include_str!("../src/shaders/common.wgsl"),
+            include_str!("../src/shaders/iterate_uniforms.wgsl"),
+            include_str!("../src/shaders/colorize.wgsl"),
+        ),
+    );
 }
 
 #[test]
 fn blit_shader_is_valid() {
-    validate("blit.wgsl", include_str!("../src/shaders/blit.wgsl"));
+    validate(
+        "blit.wgsl",
+        concat!(
+            include_str!("../src/shaders/common.wgsl"),
+            include_str!("../src/shaders/blit.wgsl"),
+        ),
+    );
 }
 
 #[test]
 fn buddhabrot_shader_is_valid() {
     validate(
         "buddhabrot.wgsl",
-        include_str!("../src/shaders/buddhabrot.wgsl"),
+        concat!(
+            include_str!("../src/shaders/common.wgsl"),
+            include_str!("../src/shaders/buddhabrot.wgsl"),
+        ),
     );
 }
