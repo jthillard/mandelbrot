@@ -550,6 +550,7 @@ impl FractalApp {
         };
         self.view = view;
         if let Some(v) = iterations {
+            self.auto_iterations = false;
             self.max_iterations = v.clamp(32, MAX_REF_POINTS as u32 - 1);
         }
         true
