@@ -50,7 +50,7 @@ fn color_differs(a: &Uniforms, b: &Uniforms) -> bool {
         || a.color_scale != b.color_scale
         || a.palette_id != b.palette_id
         || a.shadow_palette_id != b.shadow_palette_id
-        || a.shadow != b.shadow
+        || a.rendering_mode != b.rendering_mode
 }
 
 /// GPU-side view + coloring parameters. Layout must match `Uniforms` in the
@@ -93,14 +93,11 @@ pub struct Uniforms {
     pub complex_power: [f32; 2],
     /// 0 = escape-time coloring, 1 = distance-estimation shading.
     pub de_coloring: u32,
-    // 0 = classic colors, 1 = shadows
-    pub shadow: u32,
-    // 0 = classic colors, 1 = 3D raymarching rendering
-    pub dimension3: u32,
-    pub _pad2: [u32; 3],
+    // 0 = classic colors, 1 = shadows, 2 = 3D raymarching rendering
+    pub rendering_mode: u32,
     // camera direction vector
     pub camera_direction: [f32; 3],
-    pub _pad3: [u32; 1],
+    pub _pad2: [u32; 1],
     /// Inverse of the camera's view-projection matrix (column-major), for
     /// reconstructing a world-space ray origin per pixel in the raymarcher.
     pub camera_inv_proj: [f32; 16],

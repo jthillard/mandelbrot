@@ -35,23 +35,21 @@ fn shadow_fragment(pos: vec3<f32>) -> vec4<f32> {
 }
 @fragment
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    if u.dimension3 == 0u {
-        if u.shadow != 0u {
-            return shadow_fragment(pos.xyz);
-        } else {
-            let d = textureLoad(data_tex, vec2<i32>(i32(pos.x), i32(pos.y)), 0);
-            let ci = d.r;
-            let de = d.g;
-            let interior_frac = d.b;
-
-            var col = classic_color(ci, de);
-            // Anti-alias the set boundary: fade toward black by the fraction of the
-            // pixel's sub-samples that landed in the interior.
-            col = col * (1.0 - interior_frac);
-            return vec4<f32>(col, 1.0);
-        }
-    } else {
+    if u.shadow == 2u {
         return ray_marching(pos);
+    } else if u.shadow == 1u {
+        return shadow_fragment(pos.xyz);
+    } else {
+        let d = textureLoad(data_tex, vec2<i32>(i32(pos.x), i32(pos.y)), 0);
+        let ci = d.r;
+        let de = d.g;
+        let interior_frac = d.b;
+
+        var col = classic_color(ci, de);
+        // Anti-alias the set boundary: fade toward black by the fraction of the
+        // pixel's sub-samples that landed in the interior.
+        col = col * (1.0 - interior_frac);
+        return vec4<f32>(col, 1.0);
     }
 }
 

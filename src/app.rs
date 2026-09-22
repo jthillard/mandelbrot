@@ -261,9 +261,8 @@ pub struct FractalApp {
     /// orbit derivative, giving crisp filaments at deep zoom instead of speckle.
     de_coloring: bool,
     // Use shadow coloring
-    shadow: bool,
     // Use 3D raymarching rendering
-    dimension3: bool,
+    rendering_mode: u32,
 
     /// List of enabled lights in the world
     lights: Vec<Light>,
@@ -435,8 +434,7 @@ impl FractalApp {
             shadow_palette: 0,
             antialias: false,
             de_coloring: false,
-            shadow: false,
-            dimension3: false,
+            rendering_mode: 0,
             lights: vec![Light::default()],
             buddha_r_cap: 50,
             buddha_g_cap: 500,
@@ -937,14 +935,12 @@ impl FractalApp {
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
             complex_power: [self.complex_power.0 as f32, self.complex_power.1 as f32],
-            de_coloring: (self.de_coloring | self.shadow | self.dimension3) as u32,
-            shadow: self.shadow as u32,
-            dimension3: self.dimension3 as u32,
+            de_coloring: (self.de_coloring | (self.rendering_mode > 0)) as u32,
+            rendering_mode: self.rendering_mode,
             camera_direction: self.camera.direction().to_array(),
+            camera_inv_proj: self.camera.orthographic().inverse().to_cols_array(),
             _pad: [0; _],
             _pad2: [0; _],
-            _pad3: [0; _],
-            camera_inv_proj: self.camera.orthographic().inverse().to_cols_array(),
         }
     }
 
@@ -1632,6 +1628,13 @@ impl FractalApp {
             });
         }
 
+        ui.label("rendering:");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.rendering_mode, 0, "Classic");
+            ui.radio_value(&mut self.rendering_mode, 1, "Shadow");
+            ui.radio_value(&mut self.rendering_mode, 2, "3D");
+        });
+
         ui.add_space(4.);
         ui.separator();
         ui.add_space(4.);
@@ -1646,15 +1649,29 @@ impl FractalApp {
                     .logarithmic(true),
             );
         }
-        ui.add(
-            egui::Slider::new(&mut self.color_scale, 0.01..=1.0)
-                .text("color scale")
-                .logarithmic(true),
-        );
-        ui.add(egui::Slider::new(&mut self.color_offset, 0.0..=1.0).text("color offset"));
-        ui.checkbox(&mut self.shadow, "Shadow rendering");
-        ui.checkbox(&mut self.dimension3, "3D rendering");
-        if !self.shadow {
+        ui.checkbox(&mut self.antialias, "Antialiasing (2×2)")
+            .on_hover_text("Supersample each pixel for smoother edges (~4× slower).");
+        if self.rendering_mode == 0 {
+            ui.checkbox(&mut self.de_coloring, "Distance shading")
+                .on_hover_text(
+                    "Shade by distance to the set boundary (from the orbit derivative) \
+                 for crisp filaments at deep zoom. Exact for the holomorphic kinds \
+                 (Mandelbrot/Multibrot/Phoenix), approximate for the abs-based kinds \
+                 (Burning Ship/Tricorn/Celtic/Perpendicular/Buffalo).",
+                );
+        }
+
+        ui.add_space(4.);
+        ui.separator();
+        ui.add_space(4.);
+
+        if self.rendering_mode == 0 {
+            ui.add(
+                egui::Slider::new(&mut self.color_scale, 0.01..=1.0)
+                    .text("color scale")
+                    .logarithmic(true),
+            );
+            ui.add(egui::Slider::new(&mut self.color_offset, 0.0..=1.0).text("color offset"));
             egui::ComboBox::from_label("palette")
                 .selected_text(PALETTE_NAMES[self.palette as usize])
                 .show_ui(ui, |ui| {
@@ -1671,7 +1688,8 @@ impl FractalApp {
                     }
                 });
         }
-        if self.shadow && self.shadow_palette as usize == SHADOW_PALETTE_NAMES.len() - 1 {
+        if self.rendering_mode > 0 && self.shadow_palette as usize == SHADOW_PALETTE_NAMES.len() - 1
+        {
             ui.horizontal(|ui| {
                 ui.label("lights:");
                 if ui.button("+").clicked() {
@@ -1692,20 +1710,9 @@ impl FractalApp {
         ui.add_space(4.);
         ui.separator();
         ui.add_space(4.);
-        ui.checkbox(&mut self.antialias, "Antialiasing (2×2)")
-            .on_hover_text("Supersample each pixel for smoother edges (~4× slower).");
-        if !self.shadow {
-            ui.checkbox(&mut self.de_coloring, "Distance shading")
-                .on_hover_text(
-                    "Shade by distance to the set boundary (from the orbit derivative) \
-                 for crisp filaments at deep zoom. Exact for the holomorphic kinds \
-                 (Mandelbrot/Multibrot/Phoenix), approximate for the abs-based kinds \
-                 (Burning Ship/Tricorn/Celtic/Perpendicular/Buffalo).",
-                );
-        }
 
         ui.collapsing("Animation", |ui| {
-            if !self.shadow {
+            if self.rendering_mode == 0 {
                 ui.checkbox(&mut self.anim.color, "Cycle colours")
                     .on_hover_text("Scroll the palette offset over time.");
                 if self.anim.color {
@@ -1982,7 +1989,7 @@ impl FractalApp {
         // instead of panning/zooming the 2D fractal view.
         const ROT_SENS: f32 = 0.002; // radians per dragged pixel
         let multi_touch = ui.input(|i| i.multi_touch());
-        if self.dimension3 {
+        if self.rendering_mode == 3 {
             if let Some(mt) = multi_touch {
                 let t = mt.translation_delta;
                 if t.x != 0.0 || t.y != 0.0 {
@@ -2033,7 +2040,7 @@ impl FractalApp {
             && rect.contains(pos)
         {
             let factor = (-scroll_y as f64 * 0.0015).exp();
-            if self.dimension3 {
+            if self.rendering_mode == 3 {
                 self.camera.zoom(factor as f32);
             } else {
                 let off = pos - rect.center();
@@ -2053,7 +2060,7 @@ impl FractalApp {
         if !ui.ctx().egui_wants_keyboard_input() {
             let dt = ui.input(|i| i.stable_dt as f64).clamp(0.0, 0.1);
 
-            if self.dimension3 {
+            if self.rendering_mode == 3 {
                 let (fwd, back, strafe_l, strafe_r, up, down, look_l, look_r, look_u, look_d) = ui
                     .input(|i| {
                         (

@@ -31,10 +31,8 @@ struct Uniforms {
     complex_power: vec2<f32>,
     // 0 = escape-time coloring, 1 = distance-estimation shading.
     de_coloring: u32,
-    // 0 = classic colors, 1 = shadows
+    // 0 = classic colors, 1 = shadows, 2 = 3D raymarching rendering
     shadow: u32,
-    // Use 3D raymarching rendering
-    dimension3: u32,
     // camera direction vector
     camera_direction: vec3<f32>,
     // inverse of the camera's view-projection matrix, for reconstructing a

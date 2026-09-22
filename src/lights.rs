@@ -1,7 +1,7 @@
 use std::f32::consts::PI;
 
 use bytemuck::{Pod, Zeroable};
-use egui::{Color32, Ui};
+use egui::{Button, Color32, Ui};
 
 /// Maximum number of simultaneous lights.
 pub const MAX_LIGHT_COUNT: usize = 16;
@@ -28,7 +28,12 @@ impl Default for Light {
 
 impl Light {
     pub fn widget(&mut self, ui: &mut Ui) -> bool {
-        let formater = |v, _| format!("{}°", ((v as f32 * 180. / PI) as u32));
+        let formater = |v, _| format!("{}°", ((v * 180. / std::f64::consts::PI) as u32));
+        let parser = |s: &str| {
+            s.parse::<u32>()
+                .ok()
+                .map(|x| x as f64 * std::f64::consts::PI / 180.)
+        };
         ui.horizontal(|ui| {
             let del = ui.button("-").clicked();
             ui.label("color:");
@@ -38,6 +43,7 @@ impl Light {
                 egui::DragValue::new(&mut self.azimuth)
                     .range(0.0..=PI * 2.)
                     .custom_formatter(formater)
+                    .custom_parser(parser)
                     .speed(0.02),
             );
             ui.label("φ:");
@@ -45,6 +51,7 @@ impl Light {
                 egui::DragValue::new(&mut self.altitude)
                     .range(0.0..=PI / 2.)
                     .custom_formatter(formater)
+                    .custom_parser(parser)
                     .speed(0.02),
             );
 
