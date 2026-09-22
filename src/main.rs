@@ -124,7 +124,7 @@ fn main() {
                 Ok(_) => loading.remove(),
                 Err(e) => {
                     loading.set_inner_html(
-                        "<p>The app has crashed. See the developer console for details.</p>",
+                        &format!("<p>The app has crashed.</br>{e:?}</p>"),
                     );
                     log::error!("failed to start eframe: {e:?}");
                 }

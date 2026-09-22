@@ -21,6 +21,10 @@ pub struct Cli {
     #[arg(long)]
     pub buddhabrot: bool,
 
+    /// Rendering mode to use.
+    #[arg(long)]
+    pub rendering_kind: Option<RenderingKindArg>,
+
     /// Exponent for the Multibrot kind (z -> z^power + c), clamped to [2, 8].
     #[arg(long)]
     pub power: Option<u32>,
@@ -142,6 +146,14 @@ pub enum KindArg {
     Lambda,
     #[value(alias = "cmulti")]
     ComplexMultibrot,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum RenderingKindArg {
+    Classic,
+    Shadow,
+    #[value(alias = "3d")]
+    Dimension3,
 }
 
 impl From<KindArg> for FractalKind {

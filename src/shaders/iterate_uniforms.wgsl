@@ -38,6 +38,8 @@ struct Uniforms {
     // inverse of the camera's view-projection matrix, for reconstructing a
     // world-space ray origin per pixel in the raymarcher
     camera_inv_proj: mat4x4<f32>,
+    // Screen dimensions
+    screen_dim: vec2<f32>
 };
 
 // Smooth cyclic palettes (Inigo Quilez cosine palettes), selected by id.

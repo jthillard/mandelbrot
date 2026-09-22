@@ -101,6 +101,9 @@ pub struct Uniforms {
     /// Inverse of the camera's view-projection matrix (column-major), for
     /// reconstructing a world-space ray origin per pixel in the raymarcher.
     pub camera_inv_proj: [f32; 16],
+    /// Screen dimension
+    pub screen_dim: [f32; 2],
+    pub _pad3: [u32; 2],
 }
 
 /// Offscreen textures for the two-pass render, recreated whenever the widget's

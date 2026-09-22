@@ -211,6 +211,24 @@ struct Sample {
 fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     let z0 = ref_orbit[0]; // reference start (0 for Mandelbrot, center for Julia)
 
+    // Main cardioid / period-2 bulb bypass: those points never escape, so skip
+    // iterating them (they'd otherwise all burn the full max_iter). `offset` is
+    // relative to the reference center; the absolute c is recovered from the
+    // orbit itself, since X_1 = X_0^2 + C_ref = C_ref. That's only f32-accurate,
+    // so skip the test once a pixel is smaller than that error (deep zoom),
+    // where it could misclassify pixels right at the boundary.
+    if u.kind == KIND_MANDELBROT && u.is_julia == 0u && u.ref_len > 1u && px > 1e-6 {
+        let c = ref_orbit[1] + offset;
+        let xq = c.x - 0.25;
+        let q = xq * xq + c.y * c.y;
+        let in_cardioid = q * (q + xq) <= 0.25 * c.y * c.y;
+        let xb = c.x + 1.0;
+        let in_bulb = xb * xb + c.y * c.y <= 0.0625;
+        if in_cardioid || in_bulb {
+            return Sample(0.0, 1.0, false); // interior of the set
+        }
+    }
+
     var step_add = offset;
     var e = vec2<f32>(0.0, 0.0);
     // Orbit derivative for distance estimation. For the set plane it is d/dc

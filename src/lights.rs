@@ -1,7 +1,7 @@
 use std::f32::consts::PI;
 
 use bytemuck::{Pod, Zeroable};
-use egui::{Button, Color32, Ui};
+use egui::{Color32, Ui};
 
 /// Maximum number of simultaneous lights.
 pub const MAX_LIGHT_COUNT: usize = 16;
