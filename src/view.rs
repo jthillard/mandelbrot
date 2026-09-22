@@ -58,6 +58,11 @@ impl ViewState {
         DEFAULT_HALF_HEIGHT / self.half_height
     }
 
+    /// Current zoom level.
+    pub fn zoom(&self) -> f64 {
+        self.half_height
+    }
+
     /// Bits of precision the center currently needs for this zoom level.
     pub fn precision_bits(&self) -> usize {
         precision_for(self.half_height)
@@ -140,6 +145,30 @@ pub fn parse_view_spec(spec: &str) -> Option<(ViewState, Option<u32>)> {
     Some((ViewState::with_center(re, im, half_height), iterations))
 }
 
+/// Parse a half_height spec. Shared by
+/// `FractalApp::apply_half_height_spec` (the `--zoom` CLI flag) and headless
+/// animation's `--to-zoom`.
+pub fn parse_half_height_spec(spec: &str) -> Option<f64> {
+    let half_height = spec.trim().parse::<f64>().ok()?;
+    if !(half_height > 0.0 && half_height.is_finite()) {
+        return None;
+    }
+    Some(half_height)
+}
+/// Parse a "re,im" spec (re/im decimal, parsed at
+/// full precision) into a view. Shared by
+/// `FractalApp::apply_re_im_spec` (the `--position` CLI flag) and headless
+/// animation's `--to-position`.
+pub fn parse_re_im_spec(spec: &str, bits: usize) -> Option<(Big, Big)> {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let re = big_from_decimal_str(parts[0], bits)?;
+    let im = big_from_decimal_str(parts[1], bits)?;
+    Some((re, im))
+}
+
 /// Interpolate between two views for an animation frame, `t` in `[0, 1]`.
 /// The half-height interpolates geometrically (log-linear), since zoom depth
 /// spans many decades and a linear sweep would crawl at the start and blow
@@ -170,6 +199,10 @@ pub fn interpolate_view(from: &ViewState, to: &ViewState, t: f64) -> ViewState {
     let center_re = &re1 + &(&(&re0 - &re1) * &g_big);
     let center_im = &im1 + &(&(&im0 - &im1) * &g_big);
     ViewState::with_center(center_re, center_im, half_height)
+}
+
+pub fn interpolate_f64(from: f64, to: f64, t: f64) -> f64 {
+    from + (to - from) * t
 }
 
 /// Render a `Big` as a decimal string with `sig_digits` significant digits.

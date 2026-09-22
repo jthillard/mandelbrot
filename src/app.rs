@@ -14,6 +14,8 @@ use crate::fractal::{
     compute_set_reference,
 };
 use crate::lights::Light;
+use crate::view::parse_half_height_spec;
+use crate::view::parse_re_im_spec;
 use crate::view::{
     Big, DEFAULT_HALF_HEIGHT, ViewState, big_from_decimal_str, big_from_f64, big_to_decimal_str,
     parse_view_spec, precision_for,
@@ -356,7 +358,7 @@ fn sig_digits_for(bits: usize) -> usize {
 }
 
 /// Format a magnification for the editable field (compact scientific).
-fn format_magnification(m: f64) -> String {
+fn format_zoom(m: f64) -> String {
     format!("{m:.4e}")
 }
 
@@ -415,7 +417,7 @@ impl FractalApp {
         let sig = sig_digits_for(view.precision_bits());
         let center_re_edit = big_to_decimal_str(&view.center_re, sig);
         let center_im_edit = big_to_decimal_str(&view.center_im, sig);
-        let zoom_edit = format_magnification(view.magnification());
+        let zoom_edit = format_zoom(view.zoom());
 
         Self {
             view,
@@ -532,16 +534,24 @@ impl FractalApp {
         if let Some(spec) = cli.view {
             self.apply_view_spec(&spec);
         }
+        if let Some(iterations) = cli.iterations {
+            self.auto_iterations = false;
+            self.max_iterations = iterations;
+        }
+        if let Some(half_height) = cli.half_height {
+            self.apply_half_height_spec(&half_height);
+        }
+        if let Some(position) = cli.position {
+            self.apply_re_im_spec(&position);
+        }
         if cli.de {
             self.de_coloring = true;
         }
         if cli.buddhabrot {
             self.mode = FractalMode::Buddhabrot;
         }
-        if let Some(p) = cli.buddha_palette {
-            self.buddha_palette = p.min(BUDDHA_PALETTE_NAMES.len() as u32 - 1);
-        }
         if let Some(p) = cli.palette {
+            self.buddha_palette = p.min(BUDDHA_PALETTE_NAMES.len() as u32 - 1);
             self.palette = p.min(PALETTE_NAMES.len() as u32 - 1);
         }
         self.export_path = cli.export_path;
@@ -559,6 +569,27 @@ impl FractalApp {
             self.auto_iterations = false;
             self.max_iterations = v.clamp(32, MAX_REF_POINTS as u32 - 1);
         }
+        true
+    }
+
+    /// Apply a half_height spec. Used by the native debug env var.
+    #[allow(dead_code)]
+    pub fn apply_half_height_spec(&mut self, spec: &str) -> bool {
+        let Some(half_height) = parse_half_height_spec(spec) else {
+            return false;
+        };
+        self.view.half_height = half_height;
+        true
+    }
+    /// Apply a view spec "re,im" (re/im are decimal,
+    /// parsed at full precision). Used by the native debug env var.
+    #[allow(dead_code)]
+    pub fn apply_re_im_spec(&mut self, spec: &str) -> bool {
+        let Some((re, im)) = parse_re_im_spec(spec, self.view.precision_bits()) else {
+            return false;
+        };
+        self.view.center_re = re;
+        self.view.center_im = im;
         true
     }
 
@@ -584,6 +615,19 @@ impl FractalApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn set_auto_iterations(&mut self, v: bool) {
         self.auto_iterations = v;
+    }
+
+    /// Set `max_iterations`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_max_iterations(&mut self, i: u32) {
+        self.auto_iterations = false;
+        self.max_iterations = i;
+    }
+
+    /// Get `max_iterations`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn max_iterations(&mut self) -> u32 {
+        self.max_iterations
     }
 
     /// Jump to a preset Mandelbrot location: decimal center (parsed at the
@@ -1837,7 +1881,7 @@ impl FractalApp {
             self.center_im_edit = big_to_decimal_str(&self.view.center_im, sig);
         }
 
-        ui.label("magnification (×):");
+        ui.label("zoom:");
         let zoom_resp = ui.add(
             egui::TextEdit::singleline(&mut self.zoom_edit)
                 .desired_width(f32::INFINITY)
@@ -1848,18 +1892,17 @@ impl FractalApp {
         }
         if zoom_resp.lost_focus() {
             if self.zoom_edited
-                && let Ok(m) = self.zoom_edit.trim().parse::<f64>()
+                && let Ok(hh) = self.zoom_edit.trim().parse::<f64>()
+                && hh > 0.0
+                && hh.is_finite()
             {
-                let hh = DEFAULT_HALF_HEIGHT / m;
-                if m > 0.0 && hh > 0.0 && hh.is_finite() {
-                    self.view.half_height = hh;
-                    self.view.sync_precision();
-                }
+                self.view.half_height = hh;
+                self.view.sync_precision();
             }
             self.zoom_edited = false;
         }
         if !zoom_resp.has_focus() {
-            self.zoom_edit = format_magnification(self.view.magnification());
+            self.zoom_edit = format_zoom(self.view.zoom());
         }
         ui.label(format!("reference: {} pts", self.reference.len()));
         ui.label(format!("precision: {} bits", self.view.precision_bits()));

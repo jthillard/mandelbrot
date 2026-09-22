@@ -11,7 +11,8 @@ use crate::app::{FractalApp, unix_timestamp};
 use crate::cli::Cli;
 use crate::fractal::{ExportRender, FractalRenderer, ShareState, export_to_png_blocking};
 use crate::view::{
-    ViewState, big_from_decimal_str, interpolate_view, parse_view_spec, precision_for,
+    ViewState, big_from_decimal_str, interpolate_f64, interpolate_view, parse_view_spec,
+    precision_for,
 };
 
 /// Cap on the output image dimension (px), to stay within GPU texture limits.
@@ -29,6 +30,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
     // consumes `cli` to build the start state.
     let to_view = cli.to_view.clone();
     let to_share = cli.to_share.clone();
+    let to_iterations = cli.to_iterations;
     let frames_arg = cli.frames;
     let fps = cli.fps;
     let duration = cli.duration;
@@ -43,6 +45,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
             app,
             to_view,
             to_share,
+            to_iterations,
             frames_arg,
             fps,
             duration,
@@ -97,6 +100,7 @@ fn run_animation(
     mut app: FractalApp,
     to_view: Option<String>,
     to_share: Option<String>,
+    mut to_iterations: Option<u32>,
     frames_arg: Option<u32>,
     fps: f64,
     duration: Option<f64>,
@@ -116,11 +120,20 @@ fn run_animation(
         return Err("animation needs at least 2 frames".into());
     }
 
-    let to = parse_animation_target(to_view.as_deref(), to_share.as_deref())?;
+    let (to, to_iterations_share) =
+        parse_animation_target(to_view.as_deref(), to_share.as_deref())?;
+    if to_iterations.is_none()
+        && let Some(to_iterations_share) = to_iterations_share
+    {
+        to_iterations = Some(to_iterations_share);
+    }
     let from = app.view_state().clone();
-    // Iteration count auto-scales with zoom depth per frame, the same way it
-    // does while zooming interactively — no need to interpolate it by hand.
-    app.set_auto_iterations(true);
+    let from_iterations = app.max_iterations();
+    if to_iterations.is_none() {
+        // Iteration count auto-scales with zoom depth per frame, the same way it
+        // does while zooming interactively — no need to interpolate it by hand.
+        app.set_auto_iterations(true);
+    }
 
     let out_dir = export_path.unwrap_or_else(|| format!("frames-{}", unix_timestamp()));
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create {out_dir}: {e}"))?;
@@ -133,6 +146,11 @@ fn run_animation(
     for i in 0..frames {
         let raw_t = i as f64 / (frames - 1) as f64;
         let t = if linear { raw_t } else { smoothstep(raw_t) };
+        if let Some(to) = to_iterations {
+            app.set_max_iterations(
+                interpolate_f64(from_iterations as f64, to as f64, t).round() as u32,
+            );
+        }
         app.set_view(interpolate_view(&from, &to, t));
 
         eprintln!("[{:>4}/{frames}] computing reference orbit…", i + 1);
@@ -180,11 +198,9 @@ fn run_animation(
 fn parse_animation_target(
     to_view: Option<&str>,
     to_share: Option<&str>,
-) -> Result<ViewState, String> {
+) -> Result<(ViewState, Option<u32>), String> {
     if let Some(spec) = to_view {
-        return parse_view_spec(spec)
-            .map(|(view, _)| view)
-            .ok_or_else(|| format!("invalid --to-view spec: {spec}"));
+        return parse_view_spec(spec).ok_or_else(|| format!("invalid --to-view spec: {spec}"));
     }
     let frag = to_share.expect("run_animation only called with one of to_view/to_share set");
     let state =
@@ -194,7 +210,10 @@ fn parse_animation_target(
         big_from_decimal_str(&state.center_re, bits).ok_or("invalid --to-share center (re)")?;
     let im =
         big_from_decimal_str(&state.center_im, bits).ok_or("invalid --to-share center (im)")?;
-    Ok(ViewState::with_center(re, im, state.half_height))
+    Ok((
+        ViewState::with_center(re, im, state.half_height),
+        Some(state.iterations),
+    ))
 }
 
 /// Ease-in/ease-out pacing: slow at both ends, fast through the middle.

@@ -13,6 +13,14 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub kind: Option<KindArg>,
 
+    /// Start in Julia mode with this seed constant.
+    #[arg(long, value_name = "RE,IM")]
+    pub julia: Option<String>,
+
+    /// Switch to the Buddhabrot renderer.
+    #[arg(long)]
+    pub buddhabrot: bool,
+
     /// Exponent for the Multibrot kind (z -> z^power + c), clamped to [2, 8].
     #[arg(long)]
     pub power: Option<u32>,
@@ -20,14 +28,6 @@ pub struct Cli {
     /// Complex exponent for the Complex Multibrot kind (z -> z^power + c).
     #[arg(long, value_name = "RE,IM")]
     pub complex_power: Option<String>,
-
-    /// Start in Julia mode with this seed constant.
-    #[arg(long, value_name = "RE,IM")]
-    pub julia: Option<String>,
-
-    /// Coloring palette index.
-    #[arg(long, value_name = "INDEX")]
-    pub palette: Option<u32>,
 
     /// Phoenix constant p for the Phoenix kind (z -> z^2 + c + p*z_prev).
     #[arg(long, value_name = "RE,IM")]
@@ -45,17 +45,25 @@ pub struct Cli {
     #[arg(long, value_name = "RE,IM,HALF_HEIGHT[,ITERATIONS]")]
     pub view: Option<String>,
 
+    /// Jump to a specific position on startup.
+    #[arg(long, short('p'), value_name = "RE,IM")]
+    pub position: Option<String>,
+
+    /// Set a maximum iterations count on startup.
+    #[arg(long, short('i'))]
+    pub iterations: Option<u32>,
+
+    /// Set the zoom level on startup.
+    #[arg(long("zoom"), short('z'))]
+    pub half_height: Option<String>,
+
     /// Enable distance-estimation shading.
     #[arg(long)]
     pub de: bool,
 
-    /// Switch to the Buddhabrot renderer.
-    #[arg(long)]
-    pub buddhabrot: bool,
-
-    /// Buddhabrot tonemap palette index.
+    /// Coloring palette index.
     #[arg(long, value_name = "INDEX")]
-    pub buddha_palette: Option<u32>,
+    pub palette: Option<u32>,
 
     /// Output path for --headless (default: fractal-<timestamp>.png). When
     /// animating (--to-view/--to-share), this is a directory of
@@ -76,6 +84,10 @@ pub struct Cli {
     /// pasting a location copied from the app's "Copy share link").
     #[arg(long, value_name = "FRAGMENT")]
     pub to_share: Option<String>,
+
+    /// Set a maximum iterations count at animation end.
+    #[arg(long)]
+    pub to_iterations: Option<u32>,
 
     /// Number of frames to render for an animation. Alternative to --fps +
     /// --duration.
