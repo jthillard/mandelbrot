@@ -33,6 +33,13 @@ struct Uniforms {
     de_coloring: u32,
     // 0 = classic colors, 1 = shadows
     shadow: u32,
+    // Use 3D raymarching rendering
+    dimension3: u32,
+    // camera direction vector
+    camera_direction: vec3<f32>,
+    // inverse of the camera's view-projection matrix, for reconstructing a
+    // world-space ray origin per pixel in the raymarcher
+    camera_inv_proj: mat4x4<f32>,
 };
 
 // Smooth cyclic palettes (Inigo Quilez cosine palettes), selected by id.
@@ -146,10 +153,10 @@ fn shadow_color(normal: vec3<f32>) -> vec3<f32> {
         for (var i = 0u; i < 16; i++) {
             let light_color = unpack4x8unorm(lights[i].color);
             if any(light_color != vec4<f32>(0)) {
-                light_count += 1;
+                light_count   += 1;
             }
 
-            color += compute_light(normal, vec3<f32>(
+            color   += compute_light(normal, vec3<f32>(
                 cos(lights[i].azimuth) * cos(lights[i].altitude),
                 sin(lights[i].azimuth) * cos(lights[i].altitude),
                 sin(lights[i].altitude))) * light_color.xyz * light_color.a;

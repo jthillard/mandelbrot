@@ -95,6 +95,15 @@ pub struct Uniforms {
     pub de_coloring: u32,
     // 0 = classic colors, 1 = shadows
     pub shadow: u32,
+    // 0 = classic colors, 1 = 3D raymarching rendering
+    pub dimension3: u32,
+    pub _pad2: [u32; 3],
+    // camera direction vector
+    pub camera_direction: [f32; 3],
+    pub _pad3: [u32; 1],
+    /// Inverse of the camera's view-projection matrix (column-major), for
+    /// reconstructing a world-space ray origin per pixel in the raymarcher.
+    pub camera_inv_proj: [f32; 16],
 }
 
 /// Offscreen textures for the two-pass render, recreated whenever the widget's

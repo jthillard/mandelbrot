@@ -5,6 +5,7 @@ use eframe::egui_wgpu;
 #[cfg(target_arch = "wasm32")]
 use eframe::egui_wgpu::wgpu;
 
+use crate::camera::Camera;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::cli::Cli;
 use crate::fractal::{
@@ -261,6 +262,8 @@ pub struct FractalApp {
     de_coloring: bool,
     // Use shadow coloring
     shadow: bool,
+    // Use 3D raymarching rendering
+    dimension3: bool,
 
     /// List of enabled lights in the world
     lights: Vec<Light>,
@@ -343,6 +346,9 @@ pub struct FractalApp {
     /// through the display format and drift the zoom.
     zoom_edit: String,
     zoom_edited: bool,
+
+    /// The camera used to render 3D fractals
+    camera: Camera,
 }
 
 /// Significant decimal digits to show for a center at the given precision (bits).
@@ -430,6 +436,7 @@ impl FractalApp {
             antialias: false,
             de_coloring: false,
             shadow: false,
+            dimension3: false,
             lights: vec![Light::default()],
             buddha_r_cap: 50,
             buddha_g_cap: 500,
@@ -465,6 +472,7 @@ impl FractalApp {
             center_im_edit,
             zoom_edit,
             zoom_edited: false,
+            camera: Camera::new(),
         }
     }
 
@@ -929,9 +937,14 @@ impl FractalApp {
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
             complex_power: [self.complex_power.0 as f32, self.complex_power.1 as f32],
-            de_coloring: (self.de_coloring | self.shadow) as u32,
+            de_coloring: (self.de_coloring | self.shadow | self.dimension3) as u32,
             shadow: self.shadow as u32,
+            dimension3: self.dimension3 as u32,
+            camera_direction: self.camera.direction().to_array(),
             _pad: [0; _],
+            _pad2: [0; _],
+            _pad3: [0; _],
+            camera_inv_proj: self.camera.orthographic().inverse().to_cols_array(),
         }
     }
 
@@ -1639,7 +1652,8 @@ impl FractalApp {
                 .logarithmic(true),
         );
         ui.add(egui::Slider::new(&mut self.color_offset, 0.0..=1.0).text("color offset"));
-        ui.checkbox(&mut self.shadow, "Shadow");
+        ui.checkbox(&mut self.shadow, "Shadow rendering");
+        ui.checkbox(&mut self.dimension3, "3D rendering");
         if !self.shadow {
             egui::ComboBox::from_label("palette")
                 .selected_text(PALETTE_NAMES[self.palette as usize])
@@ -1964,8 +1978,30 @@ impl FractalApp {
 
         // Touch: pinch to zoom (toward the gesture center) and two-finger pan.
         // Takes precedence over single-finger drag while two fingers are down.
+        // In 3D mode the same gestures orbit/dolly the raymarch camera
+        // instead of panning/zooming the 2D fractal view.
+        const ROT_SENS: f32 = 0.002; // radians per dragged pixel
         let multi_touch = ui.input(|i| i.multi_touch());
-        if let Some(mt) = multi_touch {
+        if self.dimension3 {
+            if let Some(mt) = multi_touch {
+                let t = mt.translation_delta;
+                if t.x != 0.0 || t.y != 0.0 {
+                    self.camera.rotate(t.x * ROT_SENS, -t.y * ROT_SENS);
+                    interacted = true;
+                }
+                if mt.zoom_delta != 1.0 {
+                    self.camera.zoom(1.0 / mt.zoom_delta);
+                    interacted = true;
+                }
+                ui.ctx().request_repaint();
+            } else if response.dragged() {
+                let d = response.drag_delta();
+                if d.x != 0.0 || d.y != 0.0 {
+                    self.camera.rotate(d.x * ROT_SENS, -d.y * ROT_SENS);
+                    interacted = true;
+                }
+            }
+        } else if let Some(mt) = multi_touch {
             let t = mt.translation_delta;
             if t.x != 0.0 || t.y != 0.0 {
                 self.view.pan_pixels(t.x as f64, t.y as f64, height_px);
@@ -1989,75 +2025,165 @@ impl FractalApp {
             }
         }
 
-        // Mouse wheel / trackpad: zoom toward the cursor.
+        // Mouse wheel / trackpad: zoom toward the cursor (2D), or dolly the
+        // camera's ortho volume (3D).
         let (scroll_y, hover) = ui.input(|i| (i.smooth_scroll_delta.y, i.pointer.hover_pos()));
         if scroll_y != 0.0
             && let Some(pos) = hover
             && rect.contains(pos)
         {
-            let off = pos - rect.center();
             let factor = (-scroll_y as f64 * 0.0015).exp();
-            self.view
-                .zoom_at_pixel(off.x as f64, off.y as f64, height_px, factor);
+            if self.dimension3 {
+                self.camera.zoom(factor as f32);
+            } else {
+                let off = pos - rect.center();
+                self.view
+                    .zoom_at_pixel(off.x as f64, off.y as f64, height_px, factor);
+            }
             interacted = true;
             ui.ctx().request_repaint();
         }
 
         // Keyboard: arrows pan, z/s zoom in/out, +/- adjust iterations, R
-        // resets the view, H/I toggle the Help/Info windows. Skipped while a
-        // text field (e.g. the center/zoom edit boxes) has focus.
+        // resets the view, H/I toggle the Help/Info windows. In 3D mode,
+        // ZQSD move the camera (forward/left/back/right), space/ctrl move it
+        // up/down, and the arrow keys look around instead of panning.
+        // Skipped while a text field (e.g. the center/zoom edit boxes) has
+        // focus.
         if !ui.ctx().egui_wants_keyboard_input() {
             let dt = ui.input(|i| i.stable_dt as f64).clamp(0.0, 0.1);
-            let (left, right, up, down, zoom_in, zoom_out) = ui.input(|i| {
-                (
-                    i.key_down(egui::Key::ArrowLeft),
-                    i.key_down(egui::Key::ArrowRight),
-                    i.key_down(egui::Key::ArrowUp),
-                    i.key_down(egui::Key::ArrowDown),
-                    i.key_down(egui::Key::Z),
-                    i.key_down(egui::Key::S),
-                )
-            });
 
-            // Pixels/sec pan speed — matches a brisk mouse drag regardless of
-            // frame rate. See `pan_pixels`'s screen-space (+x right, +y down)
-            // convention: Right/Down pan the *camera* right/down, which is
-            // the opposite delta sign from a drag that would show the same
-            // content (a drag grabs the canvas; these keys move the camera).
-            const PAN_SPEED_PX: f64 = 700.0;
-            let mut dx = 0.0;
-            let mut dy = 0.0;
-            if left {
-                dx += PAN_SPEED_PX * dt;
-            }
-            if right {
-                dx -= PAN_SPEED_PX * dt;
-            }
-            if down {
-                dy -= PAN_SPEED_PX * dt;
-            }
-            if up {
-                dy += PAN_SPEED_PX * dt;
-            }
-            if dx != 0.0 || dy != 0.0 {
-                self.view.pan_pixels(dx, dy, height_px);
-                interacted = true;
-            }
+            if self.dimension3 {
+                let (fwd, back, strafe_l, strafe_r, up, down, look_l, look_r, look_u, look_d) = ui
+                    .input(|i| {
+                        (
+                            i.key_down(egui::Key::Z),
+                            i.key_down(egui::Key::S),
+                            i.key_down(egui::Key::Q),
+                            i.key_down(egui::Key::D),
+                            i.key_down(egui::Key::Space),
+                            i.modifiers.ctrl || i.modifiers.command,
+                            i.key_down(egui::Key::ArrowLeft),
+                            i.key_down(egui::Key::ArrowRight),
+                            i.key_down(egui::Key::ArrowUp),
+                            i.key_down(egui::Key::ArrowDown),
+                        )
+                    });
 
-            // e-folds/sec, same scale as the auto-zoom animation.
-            const ZOOM_SPEED: f64 = 1.0;
-            if zoom_in != zoom_out {
-                let rate = if zoom_in { ZOOM_SPEED } else { -ZOOM_SPEED };
-                let factor = (-rate * dt).exp();
-                self.view.zoom_at_pixel(0.0, 0.0, height_px, factor);
-                interacted = true;
-            }
-            if left || right || up || down || zoom_in || zoom_out {
-                ui.ctx().request_repaint();
+                // Units/sec move speed and radians/sec look speed.
+                const MOVE_SPEED: f32 = 0.1;
+                const LOOK_SPEED: f32 = 0.05;
+                let mut mv_fwd = 0.0f32;
+                let mut mv_right = 0.0f32;
+                let mut mv_up = 0.0f32;
+                if fwd {
+                    mv_fwd += MOVE_SPEED * dt as f32;
+                }
+                if back {
+                    mv_fwd -= MOVE_SPEED * dt as f32;
+                }
+                if strafe_r {
+                    mv_right += MOVE_SPEED * dt as f32;
+                }
+                if strafe_l {
+                    mv_right -= MOVE_SPEED * dt as f32;
+                }
+                if up {
+                    mv_up += MOVE_SPEED * dt as f32;
+                }
+                if down {
+                    mv_up -= MOVE_SPEED * dt as f32;
+                }
+                if mv_fwd != 0.0 || mv_right != 0.0 || mv_up != 0.0 {
+                    self.camera.translate(mv_fwd, mv_right, mv_up);
+                    interacted = true;
+                }
+
+                let mut dyaw = 0.0f32;
+                let mut dpitch = 0.0f32;
+                if look_r {
+                    dyaw += LOOK_SPEED * dt as f32;
+                }
+                if look_l {
+                    dyaw -= LOOK_SPEED * dt as f32;
+                }
+                if look_u {
+                    dpitch += LOOK_SPEED * dt as f32;
+                }
+                if look_d {
+                    dpitch -= LOOK_SPEED * dt as f32;
+                }
+                if dyaw != 0.0 || dpitch != 0.0 {
+                    self.camera.rotate(dyaw, dpitch);
+                    interacted = true;
+                }
+
+                if fwd
+                    || back
+                    || strafe_l
+                    || strafe_r
+                    || up
+                    || down
+                    || look_l
+                    || look_r
+                    || look_u
+                    || look_d
+                {
+                    ui.ctx().request_repaint();
+                }
+            } else {
+                let (left, right, up, down, zoom_in, zoom_out) = ui.input(|i| {
+                    (
+                        i.key_down(egui::Key::ArrowLeft),
+                        i.key_down(egui::Key::ArrowRight),
+                        i.key_down(egui::Key::ArrowUp),
+                        i.key_down(egui::Key::ArrowDown),
+                        i.key_down(egui::Key::Z),
+                        i.key_down(egui::Key::S),
+                    )
+                });
+
+                // Pixels/sec pan speed — matches a brisk mouse drag regardless of
+                // frame rate. See `pan_pixels`'s screen-space (+x right, +y down)
+                // convention: Right/Down pan the *camera* right/down, which is
+                // the opposite delta sign from a drag that would show the same
+                // content (a drag grabs the canvas; these keys move the camera).
+                const PAN_SPEED_PX: f64 = 700.0;
+                let mut dx = 0.0;
+                let mut dy = 0.0;
+                if left {
+                    dx += PAN_SPEED_PX * dt;
+                }
+                if right {
+                    dx -= PAN_SPEED_PX * dt;
+                }
+                if down {
+                    dy -= PAN_SPEED_PX * dt;
+                }
+                if up {
+                    dy += PAN_SPEED_PX * dt;
+                }
+                if dx != 0.0 || dy != 0.0 {
+                    self.view.pan_pixels(dx, dy, height_px);
+                    interacted = true;
+                }
+
+                // e-folds/sec, same scale as the auto-zoom animation.
+                const ZOOM_SPEED: f64 = 1.0;
+                if zoom_in != zoom_out {
+                    let rate = if zoom_in { ZOOM_SPEED } else { -ZOOM_SPEED };
+                    let factor = (-rate * dt).exp();
+                    self.view.zoom_at_pixel(0.0, 0.0, height_px, factor);
+                    interacted = true;
+                }
+                if left || right || up || down || zoom_in || zoom_out {
+                    ui.ctx().request_repaint();
+                }
             }
 
             if ui.input(|i| i.key_pressed(egui::Key::R)) {
                 self.view = Self::default_view_for(self.mode, self.kind);
+                self.camera = Camera::new();
                 interacted = true;
             }
             if ui.input(|i| i.key_pressed(egui::Key::H)) {
@@ -2152,6 +2278,7 @@ impl FractalApp {
             (((rect.height() * ppp).round() as u32) / downscale).max(1),
         ];
 
+        self.camera.set_aspect_ratio(aspect as f32);
         let mut uniforms = self.make_uniforms(aspect);
         if interacting {
             uniforms.aa_level = 1; // supersampling is wasted on the low-res pass
