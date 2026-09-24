@@ -34,7 +34,8 @@ python3 -m http.server -d dist 8080
 Native CLI flags (`src/cli.rs`, applied in `FractalApp::apply_cli`): `--kind`,
 `--power`, `--julia re,im`, `--phoenix-p re,im`, `--lambda-l re,im`,
 `--palette`, `--share <fragment>`,
-`--view re,im,half_height[,iterations]`, `--de`, `--buddhabrot`,
+`--view re,im,half_height[,iterations]`, `--rendering-kind`,
+`--yaw`/`--pitch` (3D camera, degrees), `--de`, `--buddhabrot`,
 `--buddha-palette`. `--headless` (`src/headless.rs`) skips the window
 entirely: it builds the same view from the other flags, creates its own
 offscreen wgpu device, and renders straight to a PNG (`--width`/`--height`,
@@ -42,20 +43,27 @@ default 1920×1080, `--export-path out.png`) without needing a GPU-backed
 window/event loop. Not yet supported with `--buddhabrot`. Run
 `mandelbrot --help` for the full list.
 
-`--headless` also has an animation mode, for feeding into `ffmpeg`: add
-`--to-view re,im,half_height[,iterations]` (or `--to-share <fragment>`, which
-only pulls position/zoom/iterations out of the link) alongside a start view
-(`--view`/`--share`/`--kind`/`--julia`), plus `--frames N` or
-`--fps`/`--duration`. `--export-path` then names an output *directory* of
-`frame-00001.png`, `frame-00002.png`, ... instead of a single file. Only the
-camera (center + half-height) is animated — kind, colors, and per-kind
-constants stay fixed at whatever the start flags set. `view::interpolate_view`
-does the interpolation: half-height geometrically (log-linear, since zoom
-spans many decades), center linearly through the complex plane at full
-`Big` precision; `--linear` swaps the default smoothstep easing for constant
-pacing. Iteration count auto-scales with zoom depth per frame (same
-`auto_iteration_count` the interactive app uses while zooming), overriding
-any iteration count from `--view`/`--share`/`--to-view`/`--to-share`.
+`--headless` also has an animation mode, for feeding into `ffmpeg`: give any
+end-state flag alongside the start flags (`--view`/`--share`/`--kind`/
+`--julia`/...), plus `--frames N` or `--fps`/`--duration`. End-state flags:
+`--to-view re,im,half_height[,iterations]` or `--to-share <fragment>` (only
+position/zoom/iterations are pulled out of the link), `--to-iterations`,
+`--to-julia`, `--to-phoenix-p`, `--to-lambda-l`, `--to-complex-power`
+(or `--to-complex-power-re`/`--to-complex-power-im` to move one component),
+and `--to-kind` (per-step formula blend via `KindMorph`, camera untouched).
+Anything without a target stays at its start value; colors stay fixed.
+`--export-path` then names an output *directory* of `frame-00001.png`,
+`frame-00002.png`, ... instead of a single file. `headless.rs::AnimTargets`
+collects the targets; the export pipeline is rebuilt only when the
+`PipelineKey` changes between frames (kind morph). `view::interpolate_view`
+does the camera: half-height geometrically (log-linear, since zoom spans many
+decades), center linearly through the complex plane at full `Big` precision;
+constants interpolate linearly. `--linear` swaps the default smoothstep
+easing for constant pacing. Without `--to-iterations` (or a share link's),
+iteration count auto-scales with zoom depth per frame (same
+`auto_iteration_count` the interactive app uses while zooming).
+`--to-yaw`/`--to-pitch` (degrees, from `--yaw`/`--pitch`, yaw unwrapped so
+`--to-yaw 720` is two turns) orbit the 3D camera with `--rendering-kind 3d`.
 
 There's no GPU in most sandboxes: `cargo check`/`cargo test --test shader_valid`
 are the fast, headless way to validate a change. `cargo test` also runs but
@@ -158,7 +166,10 @@ pixel is a handful of `f32` complex multiplies.
 - `src/app.rs` — `FractalApp` (the egui app + all UI). Key methods:
   `should_request`/`ensure_reference` (decide when the reference is stale and
   dispatch/collect it), `make_uniforms` (assemble the per-frame `Uniforms`),
-  `tick_animations` (drives the "morph c/p/λ" and auto-zoom animations),
+  `tick_animations` (drives the interactive animations: colour cycle,
+auto-zoom, c/p/λ circle drift via `ConstOrbit`, per-component complex-power
+oscillation via `AxisOsc`, 3D camera orbit, kind cycling through
+`switch_kind`),
   `default_view_for` (wraps `FractalKind::default_set_view`, adding the
   kind-independent Julia case). `JULIA_PRESETS` and `SET_PRESETS` are sized as
   `[T; FractalKind::<last variant> as usize + 1]` — adding a new `FractalKind`
@@ -211,7 +222,10 @@ sample per pixel. When AA is on, `fs_refine` reads that texture and runs the
 2×2 grid only on pixels whose 4-neighbours differ (interior/exterior edge, or
 `ci`/DE beyond `AA_CI_EPS`/`AA_DE_EPS`), copying the rest. Colourise then
 reads the refined texture. PNG export (`fs_color`) still supersamples every
-pixel.
+pixel, except in 3D: the raymarcher needs the whole height field, so a 3D
+`ExportRender` (`RaymarchExport`) runs the interactive chain instead, with
+its tiles iterating `fs_data` into its own data texture and the last tile adding
+refine + colourise into the target.
 
 The 3D view (`colorize.wgsl::ray_marching`) sphere-traces the DE height
 field straight from the data texture. It's cheap: rays start on the z = 0

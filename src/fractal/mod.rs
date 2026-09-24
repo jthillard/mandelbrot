@@ -10,6 +10,8 @@ pub mod share;
 pub use buddhabrot::{BuddhabrotCallback, BuddhabrotRenderer, BuddhabrotUniforms};
 pub use kind::FractalKind;
 pub use reference::{compute_reference, compute_set_reference};
+#[cfg(not(target_arch = "wasm32"))]
+pub use renderer::PipelineKey;
 #[cfg(target_arch = "wasm32")]
 pub use renderer::encode_png_with_progress;
 #[cfg(not(target_arch = "wasm32"))]

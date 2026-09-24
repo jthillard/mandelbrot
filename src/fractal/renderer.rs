@@ -759,15 +759,11 @@ impl FractalRenderer {
     /// a combined iterate + colour pipeline (`fs_color`) specialized for
     /// `uniforms` (built fresh — exports are rare, and this only needs a read
     /// lock on the renderer), its bind-group layout, and the target format.
-    pub fn export_handles(
-        &self,
-        device: &wgpu::Device,
-        uniforms: &Uniforms,
-    ) -> (
-        wgpu::RenderPipeline,
-        wgpu::BindGroupLayout,
-        wgpu::TextureFormat,
-    ) {
+    /// In 3D mode (`rendering_mode == 2`) also the interactive iterate →
+    /// refine → colourise chain, since the raymarcher needs a whole data
+    /// texture to march over and `fs_color` has no 3D path.
+    pub fn export_handles(&self, device: &wgpu::Device, uniforms: &Uniforms) -> ExportHandles {
+        let constants = PipelineKey::from_uniforms(uniforms).constants();
         let pipeline = fullscreen_pipeline(
             device,
             "fractal export pipeline",
@@ -775,10 +771,72 @@ impl FractalRenderer {
             &self.pipeline_layout,
             "fs_color",
             self.target_format,
-            &PipelineKey::from_uniforms(uniforms).constants(),
+            &constants,
         );
-        (pipeline, self.bind_group_layout.clone(), self.target_format)
+        let raymarch = (uniforms.rendering_mode == 2).then(|| RaymarchHandles {
+            iterate: fullscreen_pipeline(
+                device,
+                "fractal export iterate pipeline",
+                &self.shader,
+                &self.pipeline_layout,
+                "fs_data",
+                DATA_FORMAT,
+                &constants,
+            ),
+            refine: fullscreen_pipeline(
+                device,
+                "fractal export AA refine pipeline",
+                &self.shader,
+                &self.refine_pipeline_layout,
+                "fs_refine",
+                DATA_FORMAT,
+                &constants,
+            ),
+            colorize: self.colorize_pipeline.clone(),
+            refine_bind_group_layout: self.refine_bind_group_layout.clone(),
+            colorize_bind_group_layout: self.colorize_bind_group_layout.clone(),
+        });
+        ExportHandles {
+            pipeline,
+            bind_group_layout: self.bind_group_layout.clone(),
+            format: self.target_format,
+            raymarch,
+        }
     }
+}
+
+/// Everything an [`ExportRender`] needs from the [`FractalRenderer`], cloned
+/// out so the export can run off the UI thread (see `export_handles`).
+#[derive(Clone)]
+pub struct ExportHandles {
+    /// Combined iterate + colour pipeline (`fs_color`), for 2D modes.
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+    /// The two-pass chain, for 3D mode only.
+    raymarch: Option<RaymarchHandles>,
+}
+
+/// The interactive two-pass pipelines, for a 3D export.
+#[derive(Clone)]
+struct RaymarchHandles {
+    iterate: wgpu::RenderPipeline,
+    refine: wgpu::RenderPipeline,
+    colorize: wgpu::RenderPipeline,
+    refine_bind_group_layout: wgpu::BindGroupLayout,
+    colorize_bind_group_layout: wgpu::BindGroupLayout,
+}
+
+/// A 3D export's own data textures and the passes that fill them: the tiles
+/// iterate into `data_view`, then one refine (if AA) + colourise pass
+/// raymarches the finished height field into the export target.
+struct RaymarchExport {
+    iterate: wgpu::RenderPipeline,
+    /// Refine pipeline, output view and input bind group, when AA is on.
+    refine: Option<(wgpu::RenderPipeline, wgpu::TextureView, wgpu::BindGroup)>,
+    colorize: wgpu::RenderPipeline,
+    colorize_bind_group: wgpu::BindGroup,
+    data_view: wgpu::TextureView,
 }
 
 /// A self-contained render of one export image. It owns its own uniform and
@@ -799,6 +857,8 @@ pub struct ExportRender {
     /// Number of horizontal tiles the render is split into.
     pub tiles: u32,
     pub swap_rb: bool,
+    /// 3D mode: tiles fill a data texture instead of the target.
+    raymarch: Option<RaymarchExport>,
 }
 
 impl ExportRender {
@@ -807,9 +867,7 @@ impl ExportRender {
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        pipeline: wgpu::RenderPipeline,
-        bind_group_layout: &wgpu::BindGroupLayout,
-        target_format: wgpu::TextureFormat,
+        handles: &ExportHandles,
         width: u32,
         height: u32,
         uniforms: Uniforms,
@@ -846,9 +904,10 @@ impl ExportRender {
         let (gpu_lights, _) = gpu_lights(lights);
         queue.write_buffer(&lights_buffer, 0, bytemuck::cast_slice(&gpu_lights));
 
+        let target_format = handles.format;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("export bind group"),
-            layout: bind_group_layout,
+            layout: &handles.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -899,8 +958,73 @@ impl ExportRender {
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
         );
 
+        let raymarch = handles.raymarch.as_ref().map(|rm| {
+            let data_texture = |label| {
+                device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: DATA_FORMAT,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    })
+                    .create_view(&wgpu::TextureViewDescriptor::default())
+            };
+            let data_view = data_texture("export data");
+            let refine = (uniforms.aa_level > 1).then(|| {
+                let refine_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("export refine bind group"),
+                    layout: &rm.refine_bind_group_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&data_view),
+                    }],
+                });
+                (
+                    rm.refine.clone(),
+                    data_texture("export data (AA)"),
+                    refine_bind_group,
+                )
+            });
+            // Colourise reads the refined texture when AA is on.
+            let colorize_input = refine.as_ref().map_or(&data_view, |(_, v, _)| v);
+            let colorize_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("export colorize bind group"),
+                layout: &rm.colorize_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(colorize_input),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: lights_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            RaymarchExport {
+                iterate: rm.iterate.clone(),
+                refine,
+                colorize: rm.colorize.clone(),
+                colorize_bind_group,
+                data_view,
+            }
+        });
+
         Self {
-            pipeline,
+            pipeline: handles.pipeline.clone(),
             bind_group,
             texture,
             view,
@@ -910,6 +1034,7 @@ impl ExportRender {
             height,
             tiles,
             swap_rb,
+            raymarch,
         }
     }
 
@@ -922,7 +1047,9 @@ impl ExportRender {
     }
 
     /// Render one horizontal tile into the export texture and submit it. Tile 0
-    /// clears the whole attachment; later tiles preserve earlier ones.
+    /// clears the whole attachment; later tiles preserve earlier ones. In 3D
+    /// mode the tiles iterate into the data texture instead, and the last one
+    /// also runs the (whole-image) refine + raymarching colourise passes.
     pub fn render_tile(&self, device: &wgpu::Device, queue: &wgpu::Queue, t: u32) {
         let (y0, y1) = self.tile_rows(t);
         if y1 <= y0 {
@@ -937,11 +1064,15 @@ impl ExportRender {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("export tile"),
         });
+        let (target, pipeline) = match &self.raymarch {
+            Some(rm) => (&rm.data_view, &rm.iterate),
+            None => (&self.view, &self.pipeline),
+        };
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("export tile pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.view,
+                    view: target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -957,9 +1088,29 @@ impl ExportRender {
             // Full-viewport triangle (so pixel→plane mapping matches the whole
             // image), scissored to this tile's rows.
             pass.set_scissor_rect(0, y0, self.width, y1 - y0);
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
+        }
+        if let Some(rm) = &self.raymarch
+            && y1 == self.height
+        {
+            if let Some((refine, aa_view, refine_bind_group)) = &rm.refine {
+                data_pass(
+                    &mut encoder,
+                    "export AA refine pass",
+                    aa_view,
+                    refine,
+                    &[&self.bind_group, refine_bind_group],
+                );
+            }
+            data_pass(
+                &mut encoder,
+                "export colorize pass",
+                &self.view,
+                &rm.colorize,
+                &[&rm.colorize_bind_group],
+            );
         }
         queue.submit(std::iter::once(encoder.finish()));
     }

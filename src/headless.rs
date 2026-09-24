@@ -7,9 +7,11 @@
 
 use eframe::egui_wgpu::wgpu;
 
-use crate::app::{FractalApp, unix_timestamp};
+use crate::app::{FractalApp, parse_complex_pair, unix_timestamp};
 use crate::cli::Cli;
-use crate::fractal::{ExportRender, FractalRenderer, ShareState, export_to_png_blocking};
+use crate::fractal::{
+    ExportRender, FractalKind, FractalRenderer, PipelineKey, ShareState, export_to_png_blocking,
+};
 use crate::view::{
     ViewState, big_from_decimal_str, interpolate_f64, interpolate_view, parse_view_spec,
     precision_for,
@@ -28,32 +30,15 @@ pub fn run(cli: Cli) -> Result<(), String> {
 
     // These drive the animation path below; grab them before `apply_cli`
     // consumes `cli` to build the start state.
-    let to_view = cli.to_view.clone();
-    let to_share = cli.to_share.clone();
-    let to_iterations = cli.to_iterations;
-    let frames_arg = cli.frames;
-    let fps = cli.fps;
-    let duration = cli.duration;
-    let linear = cli.linear;
+    let targets = AnimTargets::from_cli(&cli)?;
     let export_path = cli.export_path.clone();
 
     let mut app = FractalApp::default_state();
     app.apply_cli(cli);
+    app.set_output_size(width, height);
 
-    if to_view.is_some() || to_share.is_some() {
-        return run_animation(
-            app,
-            to_view,
-            to_share,
-            to_iterations,
-            frames_arg,
-            fps,
-            duration,
-            linear,
-            width,
-            height,
-            export_path,
-        );
+    if targets.any() {
+        return run_animation(app, targets, width, height, export_path);
     }
 
     let export_path = export_path.unwrap_or_else(|| format!("fractal-{}.png", unix_timestamp()));
@@ -65,14 +50,12 @@ pub fn run(cli: Cli) -> Result<(), String> {
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let renderer = FractalRenderer::new(&device, format);
     let uniforms = app.make_uniforms(width as f64 / height as f64);
-    let (pipeline, bind_group_layout, format) = renderer.export_handles(&device, &uniforms);
+    let handles = renderer.export_handles(&device, &uniforms);
 
     let er = ExportRender::new(
         &device,
         &queue,
-        pipeline,
-        &bind_group_layout,
-        format,
+        &handles,
         width,
         height,
         uniforms,
@@ -91,28 +74,90 @@ pub fn run(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
-/// Render a sequence of frames sweeping the camera from the app's current
-/// (start) view to an end view, for feeding into ffmpeg. Everything other
-/// than the view (kind, colors, iteration cap policy, ...) stays fixed at
-/// whatever `apply_cli` set up for the start; only the camera moves.
-#[allow(clippy::too_many_arguments)]
-fn run_animation(
-    mut app: FractalApp,
+/// The `--to-*` end state of a headless animation, plus its pacing. Each
+/// target is optional; anything left unset stays at its start value.
+struct AnimTargets {
     to_view: Option<String>,
     to_share: Option<String>,
-    mut to_iterations: Option<u32>,
-    frames_arg: Option<u32>,
+    to_iterations: Option<u32>,
+    to_julia: Option<(f64, f64)>,
+    to_phoenix_p: Option<(f64, f64)>,
+    to_lambda_l: Option<(f64, f64)>,
+    /// Complex Multibrot exponent, per component (either may move alone).
+    to_cpow_re: Option<f64>,
+    to_cpow_im: Option<f64>,
+    to_kind: Option<FractalKind>,
+    /// 3D camera, degrees.
+    to_yaw: Option<f32>,
+    to_pitch: Option<f32>,
+    frames: Option<u32>,
     fps: f64,
     duration: Option<f64>,
     linear: bool,
+}
+
+impl AnimTargets {
+    fn from_cli(cli: &Cli) -> Result<Self, String> {
+        let pair = |flag: &str, v: &Option<String>| -> Result<Option<(f64, f64)>, String> {
+            v.as_deref()
+                .map(|s| parse_complex_pair(s).ok_or_else(|| format!("invalid --{flag}: {s}")))
+                .transpose()
+        };
+        let to_cpow = pair("to-complex-power", &cli.to_complex_power)?;
+        Ok(Self {
+            to_view: cli.to_view.clone(),
+            to_share: cli.to_share.clone(),
+            to_iterations: cli.to_iterations,
+            to_julia: pair("to-julia", &cli.to_julia)?,
+            to_phoenix_p: pair("to-phoenix-p", &cli.to_phoenix_p)?,
+            to_lambda_l: pair("to-lambda-l", &cli.to_lambda_l)?,
+            to_cpow_re: cli.to_complex_power_re.or(to_cpow.map(|p| p.0)),
+            to_cpow_im: cli.to_complex_power_im.or(to_cpow.map(|p| p.1)),
+            to_kind: cli.to_kind.map(Into::into),
+            to_yaw: cli.to_yaw,
+            to_pitch: cli.to_pitch,
+            frames: cli.frames,
+            fps: cli.fps,
+            duration: cli.duration,
+            linear: cli.linear,
+        })
+    }
+
+    /// Whether any end state was given, i.e. this is an animation.
+    fn any(&self) -> bool {
+        self.to_view.is_some()
+            || self.to_share.is_some()
+            || self.to_iterations.is_some()
+            || self.to_julia.is_some()
+            || self.to_phoenix_p.is_some()
+            || self.to_lambda_l.is_some()
+            || self.to_cpow_re.is_some()
+            || self.to_cpow_im.is_some()
+            || self.to_kind.is_some()
+            || self.to_yaw.is_some()
+            || self.to_pitch.is_some()
+    }
+}
+
+/// Render a sequence of frames interpolating from the app's current (start)
+/// state to `targets`, for feeding into ffmpeg: the camera, iteration count,
+/// per-kind constants (c, p, λ, complex power) and, through a kind morph,
+/// the iteration formula, and the 3D camera angles. Everything else (colors, ...) stays fixed at
+/// whatever `apply_cli` set up for the start.
+fn run_animation(
+    mut app: FractalApp,
+    targets: AnimTargets,
     width: u32,
     height: u32,
     export_path: Option<String>,
 ) -> Result<(), String> {
-    let frames = match frames_arg {
+    let fps = targets.fps;
+    let frames = match targets.frames {
         Some(n) => n,
         None => {
-            let dur = duration.ok_or("animation needs --frames, or --duration (with --fps)")?;
+            let dur = targets
+                .duration
+                .ok_or("animation needs --frames, or --duration (with --fps)")?;
             ((fps * dur).round() as u32).max(2)
         }
     };
@@ -120,14 +165,11 @@ fn run_animation(
         return Err("animation needs at least 2 frames".into());
     }
 
-    let (to, to_iterations_share) =
-        parse_animation_target(to_view.as_deref(), to_share.as_deref())?;
-    if to_iterations.is_none()
-        && let Some(to_iterations_share) = to_iterations_share
-    {
-        to_iterations = Some(to_iterations_share);
-    }
     let from = app.view_state().clone();
+    let (to, to_iterations_share) =
+        parse_animation_target(targets.to_view.as_deref(), targets.to_share.as_deref())?
+            .unwrap_or_else(|| (from.clone(), None));
+    let to_iterations = targets.to_iterations.or(to_iterations_share);
     let from_iterations = app.max_iterations();
     if to_iterations.is_none() {
         // Iteration count auto-scales with zoom depth per frame, the same way it
@@ -135,37 +177,71 @@ fn run_animation(
         app.set_auto_iterations(true);
     }
 
+    let from_consts = app.constants();
+    let [c0, p0, l0, cp0] = from_consts;
+    let to_consts = [
+        targets.to_julia.unwrap_or(c0),
+        targets.to_phoenix_p.unwrap_or(p0),
+        targets.to_lambda_l.unwrap_or(l0),
+        (
+            targets.to_cpow_re.unwrap_or(cp0.0),
+            targets.to_cpow_im.unwrap_or(cp0.1),
+        ),
+    ];
+    let from_kind = app.kind();
+    let to_kind = targets.to_kind.unwrap_or(from_kind);
+    let (yaw0, pitch0) = app.camera_angles();
+    let yaw1 = targets.to_yaw.map_or(yaw0, f32::to_radians);
+    let pitch1 = targets.to_pitch.map_or(pitch0, f32::to_radians);
+
     let out_dir = export_path.unwrap_or_else(|| format!("frames-{}", unix_timestamp()));
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create {out_dir}: {e}"))?;
 
     let (device, queue) = pollster::block_on(request_device())?;
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let renderer = FractalRenderer::new(&device, format);
-    // Only the camera animates, so the shader specialization (kind, Julia,
-    // DE) is the same for every frame.
-    let (pipeline, bind_group_layout, format) =
-        renderer.export_handles(&device, &app.make_uniforms(width as f64 / height as f64));
+    // The shader specialization (kind, Julia, DE, morph) can change between
+    // frames during a kind morph; rebuild the pipeline only when it does.
+    let mut pipeline_cache: Option<(PipelineKey, _)> = None;
 
     for i in 0..frames {
         let raw_t = i as f64 / (frames - 1) as f64;
-        let t = if linear { raw_t } else { smoothstep(raw_t) };
+        let t = if targets.linear {
+            raw_t
+        } else {
+            smoothstep(raw_t)
+        };
         if let Some(to) = to_iterations {
             app.set_max_iterations(
                 interpolate_f64(from_iterations as f64, to as f64, t).round() as u32,
             );
         }
         app.set_view(interpolate_view(&from, &to, t));
+        app.set_constants(std::array::from_fn(|k| {
+            (
+                interpolate_f64(from_consts[k].0, to_consts[k].0, t),
+                interpolate_f64(from_consts[k].1, to_consts[k].1, t),
+            )
+        }));
+        app.set_kind_morph(from_kind, to_kind, t);
+        app.set_camera_angles(
+            interpolate_f64(yaw0 as f64, yaw1 as f64, t) as f32,
+            interpolate_f64(pitch0 as f64, pitch1 as f64, t) as f32,
+        );
 
         eprintln!("[{:>4}/{frames}] computing reference orbit…", i + 1);
         app.compute_reference_blocking();
 
         let uniforms = app.make_uniforms(width as f64 / height as f64);
+        let key = PipelineKey::from_uniforms(&uniforms);
+        if pipeline_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+            pipeline_cache = Some((key, renderer.export_handles(&device, &uniforms)));
+        }
+        let (_, handles) = pipeline_cache.as_ref().unwrap();
         let er = ExportRender::new(
             &device,
             &queue,
-            pipeline.clone(),
-            &bind_group_layout,
-            format,
+            handles,
             width,
             height,
             uniforms,
@@ -193,19 +269,23 @@ fn run_animation(
     Ok(())
 }
 
-/// Parse `--to-view`/`--to-share` (exactly one must be set) into the end
-/// view of an animation. Only position/zoom/iterations are pulled from a
+/// Parse `--to-view`/`--to-share` (at most one is used) into the end view
+/// of an animation, or `None` if neither is set (the camera stays put). Only position/zoom/iterations are pulled from a
 /// share fragment — the rest of its state (kind, colors, ...) is ignored, so
 /// pasting a link from the app doesn't unexpectedly change the fractal kind
 /// mid-animation.
 fn parse_animation_target(
     to_view: Option<&str>,
     to_share: Option<&str>,
-) -> Result<(ViewState, Option<u32>), String> {
+) -> Result<Option<(ViewState, Option<u32>)>, String> {
     if let Some(spec) = to_view {
-        return parse_view_spec(spec).ok_or_else(|| format!("invalid --to-view spec: {spec}"));
+        return parse_view_spec(spec)
+            .map(Some)
+            .ok_or_else(|| format!("invalid --to-view spec: {spec}"));
     }
-    let frag = to_share.expect("run_animation only called with one of to_view/to_share set");
+    let Some(frag) = to_share else {
+        return Ok(None);
+    };
     let state =
         ShareState::decode(frag).ok_or_else(|| format!("invalid --to-share fragment: {frag}"))?;
     let bits = precision_for(state.half_height);
@@ -213,10 +293,10 @@ fn parse_animation_target(
         big_from_decimal_str(&state.center_re, bits).ok_or("invalid --to-share center (re)")?;
     let im =
         big_from_decimal_str(&state.center_im, bits).ok_or("invalid --to-share center (im)")?;
-    Ok((
+    Ok(Some((
         ViewState::with_center(re, im, state.half_height),
         Some(state.iterations),
-    ))
+    )))
 }
 
 /// Ease-in/ease-out pacing: slow at both ends, fast through the middle.

@@ -2,6 +2,10 @@ use std::f32::consts::{PI, TAU};
 
 use glam::Vec3;
 
+/// Pitch is kept just short of straight up/down so the view never flips past
+/// the pole (and the raymarcher's rays always have `z > 0`).
+const PITCH_LIMIT: f32 = PI / 2.0 - 0.01;
+
 #[derive(Default, Clone)]
 pub struct Camera {
     pub position: glam::Vec3,
@@ -35,9 +39,18 @@ impl Camera {
     /// Yaw is wrapped to [-π, π) so the 2D <-> 3D transition (which scales
     /// yaw by `t`) always unwinds the short way instead of every past turn.
     pub fn rotate(&mut self, dyaw: f32, dpitch: f32) {
-        const PITCH_LIMIT: f32 = PI / 2.0 - 0.01;
         self.yaw = (self.yaw + dyaw + PI).rem_euclid(TAU) - PI;
         self.pitch = (self.pitch + dpitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    }
+
+    /// Set yaw/pitch (radians) outright. Pitch is clamped as in `rotate`,
+    /// but yaw is left unwrapped: only a camera that stays in 3D (headless
+    /// animation, which interpolates yaw across several turns) should use
+    /// this; `rotate(0., 0.)` afterwards wraps it for the 2D <-> 3D transition.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_angles(&mut self, yaw: f32, pitch: f32) {
+        self.yaw = yaw;
+        self.pitch = pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
     pub fn orthographic(&self, t: f32) -> glam::Mat4 {

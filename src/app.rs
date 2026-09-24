@@ -202,6 +202,126 @@ struct ExportShared {
     result: Option<Result<String, String>>,
 }
 
+/// Drift of a complex constant around a circle in its plane (Julia `c`,
+/// Phoenix `p`, Lambda `λ`).
+#[derive(Clone)]
+struct ConstOrbit {
+    on: bool,
+    /// Revolutions per second.
+    speed: f32,
+    /// Circle radius.
+    radius: f64,
+    /// Circle center, captured when the animation is enabled.
+    base: (f64, f64),
+    angle: f64,
+}
+
+impl Default for ConstOrbit {
+    fn default() -> Self {
+        Self {
+            on: false,
+            speed: 0.05,
+            radius: 0.08,
+            base: (0.0, 0.0),
+            angle: 0.0,
+        }
+    }
+}
+
+impl ConstOrbit {
+    /// Start orbiting around `current`.
+    fn enable(&mut self, current: (f64, f64)) {
+        self.base = current;
+        self.angle = 0.0;
+    }
+
+    /// Advance by `dt` seconds and return the new value.
+    fn step(&mut self, dt: f64) -> (f64, f64) {
+        self.angle += std::f64::consts::TAU * self.speed as f64 * dt;
+        let (s, c) = self.angle.sin_cos();
+        (self.base.0 + self.radius * c, self.base.1 + self.radius * s)
+    }
+
+    /// Checkbox + speed/radius sliders; (re)centers the orbit on `current`
+    /// when switched on.
+    fn ui(&mut self, ui: &mut egui::Ui, name: &str, current: (f64, f64)) {
+        if ui.checkbox(&mut self.on, format!("Morph {name}")).changed() && self.on {
+            self.enable(current);
+        }
+        if self.on {
+            ui.add(
+                egui::Slider::new(&mut self.speed, 0.005..=0.5)
+                    .text(format!("{name} rev/s"))
+                    .logarithmic(true),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.radius, 0.005..=0.5)
+                    .text(format!("{name} radius"))
+                    .logarithmic(true),
+            );
+        }
+    }
+}
+
+/// Sine oscillation of one real parameter around a base value (used for each
+/// component of the Complex Multibrot exponent, independently).
+#[derive(Clone)]
+struct AxisOsc {
+    on: bool,
+    /// Oscillation center, captured when the animation is enabled.
+    base: f64,
+    amplitude: f64,
+    /// Oscillations per second.
+    speed: f32,
+    phase: f64,
+}
+
+impl Default for AxisOsc {
+    fn default() -> Self {
+        Self {
+            on: false,
+            base: 0.0,
+            amplitude: 0.5,
+            speed: 0.05,
+            phase: 0.0,
+        }
+    }
+}
+
+impl AxisOsc {
+    fn enable(&mut self, current: f64) {
+        self.base = current;
+        self.phase = 0.0;
+    }
+
+    fn step(&mut self, dt: f64) -> f64 {
+        self.phase += std::f64::consts::TAU * self.speed as f64 * dt;
+        self.base + self.amplitude * self.phase.sin()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, name: &str, current: f64) {
+        if ui
+            .checkbox(&mut self.on, format!("Animate {name}"))
+            .changed()
+            && self.on
+        {
+            self.enable(current);
+        }
+        if self.on {
+            ui.add(
+                egui::Slider::new(&mut self.amplitude, 0.01..=4.0)
+                    .text(format!("{name} amplitude"))
+                    .logarithmic(true),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.speed, 0.005..=0.5)
+                    .text(format!("{name} Hz"))
+                    .logarithmic(true),
+            );
+        }
+    }
+}
+
 /// Time-based animation of a few view/coloring parameters. Each toggle drives
 /// continuous repaints while on; orbit-affecting ones (Julia c, Phoenix p, zoom)
 /// recompute the reference each frame and render the cheap low-res pass so they
@@ -214,28 +334,15 @@ struct AnimState {
     color_speed: f32,
 
     /// Drift the Julia constant `c` around a circle to morph the Julia set.
-    julia: bool,
-    /// Revolutions per second.
-    julia_speed: f32,
-    /// Circle radius in the c-plane.
-    julia_radius: f64,
-    /// Circle center, captured when the animation is enabled.
-    julia_base: (f64, f64),
-    julia_angle: f64,
-
+    julia: ConstOrbit,
     /// Drift the Phoenix distortion `p` around a circle.
-    phoenix: bool,
-    phoenix_speed: f32,
-    phoenix_radius: f64,
-    phoenix_base: (f64, f64),
-    phoenix_angle: f64,
-
+    phoenix: ConstOrbit,
     /// Drift the Lambda distortion `λ` around a circle.
-    lambda: bool,
-    lambda_speed: f32,
-    lambda_radius: f64,
-    lambda_base: (f64, f64),
-    lambda_angle: f64,
+    lambda: ConstOrbit,
+    /// Oscillate the Complex Multibrot exponent's real part.
+    cpow_re: AxisOsc,
+    /// Oscillate the Complex Multibrot exponent's imaginary part.
+    cpow_im: AxisOsc,
 
     /// Continuously zoom toward the current center.
     zoom: bool,
@@ -247,6 +354,26 @@ struct AnimState {
     kind_morph: bool,
     /// Kind-switch morph duration, in seconds.
     kind_morph_duration: f32,
+
+    /// Step through every fractal kind in turn (each switch morphs if
+    /// `kind_morph` is on).
+    kind_cycle: bool,
+    /// Seconds to rest on each kind before switching to the next.
+    kind_cycle_hold: f32,
+    /// Seconds spent on the current kind since the last cycle step.
+    kind_cycle_timer: f32,
+
+    /// Orbit the 3D camera: spin the yaw and bob the pitch.
+    cam_orbit: bool,
+    /// Yaw rate, degrees per second.
+    cam_yaw_speed: f32,
+    /// Pitch bob amplitude, degrees (0 = constant pitch).
+    cam_pitch_amp: f32,
+    /// Pitch bob frequency, Hz.
+    cam_pitch_speed: f32,
+    /// Pitch the bob oscillates around, captured when the orbit is enabled.
+    cam_pitch_base: f32,
+    cam_pitch_phase: f32,
 
     /// Linear 2D <-> 3D transition progress in [0, 1], advanced at a constant
     /// rate; `camera_state` is its smoothstep-eased value.
@@ -260,29 +387,35 @@ impl Default for AnimState {
         Self {
             color: false,
             color_speed: 0.15,
-            julia: false,
-            julia_speed: 0.05,
-            julia_radius: 0.08,
-            julia_base: (0.0, 0.0),
-            julia_angle: 0.0,
-            phoenix: false,
-            phoenix_speed: 0.05,
-            phoenix_radius: 0.08,
-            phoenix_base: (0.0, 0.0),
-            phoenix_angle: 0.0,
-            lambda: false,
-            lambda_speed: 0.05,
-            lambda_radius: 0.08,
-            lambda_base: (0.0, 0.0),
-            lambda_angle: 0.0,
+            julia: ConstOrbit::default(),
+            phoenix: ConstOrbit::default(),
+            lambda: ConstOrbit::default(),
+            cpow_re: AxisOsc::default(),
+            cpow_im: AxisOsc::default(),
             zoom: false,
             zoom_speed: 0.5,
             kind_morph: true,
             kind_morph_duration: 1.5,
+            kind_cycle: false,
+            kind_cycle_hold: 3.0,
+            kind_cycle_timer: 0.0,
+            cam_orbit: false,
+            cam_yaw_speed: 15.0,
+            cam_pitch_amp: 0.0,
+            cam_pitch_speed: 0.05,
+            cam_pitch_base: 0.0,
+            cam_pitch_phase: 0.0,
             camera_progress: 0.,
             camera_state: 0.,
         }
     }
+}
+
+/// Parse a "re,im" pair of plain `f64`s (per-kind constants on the CLI).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn parse_complex_pair(spec: &str) -> Option<(f64, f64)> {
+    let (re, im) = spec.split_once(',')?;
+    Some((re.trim().parse().ok()?, im.trim().parse().ok()?))
 }
 
 /// Top-level egui application.
@@ -554,15 +687,6 @@ impl FractalApp {
             if let Some(p) = cli.power {
                 self.power = p.clamp(2, 8);
             }
-            if let Some(cp) = &cli.complex_power {
-                let p: Vec<&str> = cp.split(',').collect();
-                if let (Some(Ok(re)), Some(Ok(im))) = (
-                    p.first().map(|s| s.trim().parse::<f64>()),
-                    p.get(1).map(|s| s.trim().parse::<f64>()),
-                ) {
-                    self.complex_power = (re, im);
-                }
-            }
             self.view = Self::default_view_for(self.mode, self.kind);
         }
         if let Some(k) = cli.rendering_kind {
@@ -573,6 +697,17 @@ impl FractalApp {
                 RenderingKindArg::Shadow => self.rendering_mode = 1,
                 RenderingKindArg::Dimension3 => self.rendering_mode = 2,
             }
+            // Start fully in 3D rather than transitioning in from top-down
+            // (headless renders a single frame, with no transition to run).
+            let p = if self.rendering_mode == 2 { 1.0 } else { 0.0 };
+            self.anim.camera_progress = p;
+            self.anim.camera_state = p;
+        }
+        if cli.yaw.is_some() || cli.pitch.is_some() {
+            let yaw = cli.yaw.map_or(self.camera.yaw, f32::to_radians);
+            let pitch = cli.pitch.map_or(self.camera.pitch, f32::to_radians);
+            self.camera.set_angles(yaw, pitch);
+            self.camera.rotate(0.0, 0.0); // wrap yaw
         }
         if let Some(jc) = cli.julia {
             let p: Vec<&str> = jc.split(',').collect();
@@ -607,6 +742,10 @@ impl FractalApp {
             && let Some(state) = ShareState::decode(&frag)
         {
             self.apply_share(&state);
+        }
+        // After --share so it can override the link's exponent.
+        if let Some(cp) = cli.complex_power.as_deref().and_then(parse_complex_pair) {
+            self.complex_power = cp;
         }
         if let Some(spec) = cli.view {
             self.apply_view_spec(&spec);
@@ -699,6 +838,75 @@ impl FractalApp {
     pub(crate) fn set_max_iterations(&mut self, i: u32) {
         self.auto_iterations = false;
         self.max_iterations = i;
+    }
+
+    /// Per-kind constants `(julia_c, phoenix_p, lambda_l, complex_power)`.
+    /// Used by headless animation to snapshot their start values.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn constants(&self) -> [(f64, f64); 4] {
+        [
+            self.julia_c,
+            self.phoenix_p,
+            self.lambda_l,
+            self.complex_power,
+        ]
+    }
+
+    /// Set the per-kind constants, in the order `constants` returns them.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_constants(&mut self, [c, p, l, cp]: [(f64, f64); 4]) {
+        self.julia_c = c;
+        self.phoenix_p = p;
+        self.lambda_l = l;
+        self.complex_power = cp;
+    }
+
+    /// 3D camera `(yaw, pitch)`, radians.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn camera_angles(&self) -> (f32, f32) {
+        (self.camera.yaw, self.camera.pitch)
+    }
+
+    /// Set the 3D camera angles (radians; yaw unwrapped, see
+    /// `Camera::set_angles`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_camera_angles(&mut self, yaw: f32, pitch: f32) {
+        self.camera.set_angles(yaw, pitch);
+    }
+
+    /// Size the 3D camera and raymarcher for a `width`×`height` render with
+    /// no window (they normally follow the widget rect each frame).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_output_size(&mut self, width: u32, height: u32) {
+        self.screen_dim = [width as f32, height as f32];
+        self.camera.set_aspect_ratio(width as f32 / height as f32);
+    }
+
+    /// The current fractal kind.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn kind(&self) -> FractalKind {
+        self.kind
+    }
+
+    /// Render a fraction `t` in [0, 1] of the way through a kind morph from
+    /// `from` to `to`: the per-step formula blend, without touching the
+    /// camera. `t >= 1` (or `from == to`) is plain `to`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_kind_morph(&mut self, from: FractalKind, to: FractalKind, t: f64) {
+        self.kind = to;
+        self.morph = (from != to && t < 1.0).then(|| {
+            // `KindMorph` eases its progress with smoothstep; invert that so
+            // the blend follows `t` (already eased or not by the caller).
+            let e = t.clamp(0.0, 1.0);
+            let progress = 0.5 - ((1.0 - 2.0 * e).asin() / 3.0).sin();
+            KindMorph {
+                from,
+                progress: progress as f32,
+                from_view: self.view.clone(),
+                to_view: self.view.clone(),
+                camera: false,
+            }
+        });
     }
 
     /// Get `max_iterations`.
@@ -1218,7 +1426,7 @@ impl FractalApp {
 
         let device = rs.device.clone();
         let queue = rs.queue.clone();
-        let (pipeline, bind_group_layout, format) = {
+        let handles = {
             let guard = rs.renderer.read();
             let Some(renderer) = guard.callback_resources.get::<FractalRenderer>() else {
                 self.status = Some("export unavailable".into());
@@ -1247,9 +1455,7 @@ impl FractalApp {
                 let er = ExportRender::new(
                     &device,
                     &queue,
-                    pipeline,
-                    &bind_group_layout,
-                    format,
+                    &handles,
                     w,
                     h,
                     uniforms,
@@ -1277,9 +1483,7 @@ impl FractalApp {
                 let er = ExportRender::new(
                     &device,
                     &queue,
-                    pipeline,
-                    &bind_group_layout,
-                    format,
+                    &handles,
                     w,
                     h,
                     uniforms,
@@ -1646,9 +1850,13 @@ impl FractalApp {
     /// trigger the interaction low-res pass).
     fn tick_animations(&mut self, ui: &egui::Ui) {
         // Julia c only matters in Julia mode; Phoenix p only for the Phoenix kind; Lambda λ only for Lambda kind.
-        let julia_on = self.anim.julia && self.mode == FractalMode::Julia;
-        let phoenix_on = self.anim.phoenix && self.kind == FractalKind::Phoenix;
-        let lambda_on = self.anim.lambda && self.kind == FractalKind::Lambda;
+        let julia_on = self.anim.julia.on && self.mode == FractalMode::Julia;
+        let phoenix_on = self.anim.phoenix.on && self.kind == FractalKind::Phoenix;
+        let lambda_on = self.anim.lambda.on && self.kind == FractalKind::Lambda;
+        let cmulti = self.kind == FractalKind::ComplexMultibrot;
+        let cpow_on = cmulti && (self.anim.cpow_re.on || self.anim.cpow_im.on);
+        let cam_on = self.anim.cam_orbit && self.rendering_mode == 2;
+        let cycle_on = self.anim.kind_cycle && self.mode != FractalMode::Buddhabrot;
 
         // Clamp dt so a stall (tab hidden, first frame) can't jump the animation.
         let dt = ui.input(|i| i.stable_dt as f64).clamp(0.0, 0.1);
@@ -1688,7 +1896,15 @@ impl FractalApp {
             ui.ctx().request_repaint();
         }
 
-        if !(self.anim.color || self.anim.zoom || julia_on || phoenix_on || lambda_on) {
+        if !(self.anim.color
+            || self.anim.zoom
+            || julia_on
+            || phoenix_on
+            || lambda_on
+            || cpow_on
+            || cam_on
+            || cycle_on)
+        {
             return;
         }
 
@@ -1697,29 +1913,47 @@ impl FractalApp {
                 (self.color_offset + self.anim.color_speed * dt as f32).rem_euclid(1.0);
         }
         if julia_on {
-            self.anim.julia_angle += std::f64::consts::TAU * self.anim.julia_speed as f64 * dt;
-            let (s, c) = self.anim.julia_angle.sin_cos();
-            self.julia_c = (
-                self.anim.julia_base.0 + self.anim.julia_radius * c,
-                self.anim.julia_base.1 + self.anim.julia_radius * s,
-            );
+            self.julia_c = self.anim.julia.step(dt);
         }
         if phoenix_on {
-            self.anim.phoenix_angle += std::f64::consts::TAU * self.anim.phoenix_speed as f64 * dt;
-            let (s, c) = self.anim.phoenix_angle.sin_cos();
-            self.phoenix_p = (
-                self.anim.phoenix_base.0 + self.anim.phoenix_radius * c,
-                self.anim.phoenix_base.1 + self.anim.phoenix_radius * s,
-            );
+            self.phoenix_p = self.anim.phoenix.step(dt);
         }
-        let lambda_on = self.anim.lambda && self.kind == FractalKind::Lambda;
         if lambda_on {
-            self.anim.lambda_angle += std::f64::consts::TAU * self.anim.lambda_speed as f64 * dt;
-            let (s, c) = self.anim.lambda_angle.sin_cos();
-            self.lambda_l = (
-                self.anim.lambda_base.0 + self.anim.lambda_radius * c,
-                self.anim.lambda_base.1 + self.anim.lambda_radius * s,
-            );
+            self.lambda_l = self.anim.lambda.step(dt);
+        }
+        if cmulti && self.anim.cpow_re.on {
+            self.complex_power.0 = self.anim.cpow_re.step(dt).clamp(-8.0, 8.0);
+        }
+        if cmulti && self.anim.cpow_im.on {
+            self.complex_power.1 = self.anim.cpow_im.step(dt).clamp(-8.0, 8.0);
+        }
+        if cam_on {
+            let dyaw = self.anim.cam_yaw_speed.to_radians() * dt as f32;
+            self.anim.cam_pitch_phase +=
+                std::f32::consts::TAU * self.anim.cam_pitch_speed * dt as f32;
+            // With no bob, leave pitch alone so it stays draggable mid-orbit.
+            let dpitch = if self.anim.cam_pitch_amp > 0.0 {
+                self.anim.cam_pitch_base
+                    + self.anim.cam_pitch_amp.to_radians() * self.anim.cam_pitch_phase.sin()
+                    - self.camera.pitch
+            } else {
+                0.0
+            };
+            // `rotate` wraps yaw and clamps pitch.
+            self.camera.rotate(dyaw, dpitch);
+        }
+        if cycle_on && self.morph.is_none() {
+            self.anim.kind_cycle_timer += dt as f32;
+            if self.anim.kind_cycle_timer >= self.anim.kind_cycle_hold {
+                self.anim.kind_cycle_timer = 0.0;
+                let prev = self.kind;
+                let i = FractalKind::ALL
+                    .iter()
+                    .position(|&k| k == prev)
+                    .unwrap_or(0);
+                self.kind = FractalKind::ALL[(i + 1) % FractalKind::ALL.len()];
+                self.switch_kind(prev);
+            }
         }
         if self.anim.zoom && self.anim.zoom_speed != 0.0 {
             let min_hh = DEFAULT_HALF_HEIGHT * 1.0e-26; // practical f32-perturbation depth
@@ -1734,6 +1968,25 @@ impl FractalApp {
         }
 
         ui.ctx().request_repaint();
+    }
+
+    /// React to `self.kind` having just changed from `prev`: jump (or, with
+    /// kind morphing on, glide) to the new kind's default view.
+    fn switch_kind(&mut self, prev: FractalKind) {
+        let to_view = Self::default_view_for(self.mode, self.kind);
+        // Buddhabrot has its own pipeline without the blended formula, so
+        // it keeps the instant switch.
+        self.morph =
+            (self.anim.kind_morph && self.mode != FractalMode::Buddhabrot).then(|| KindMorph {
+                from: prev,
+                progress: 0.0,
+                from_view: self.view.clone(),
+                to_view: to_view.clone(),
+                camera: true,
+            });
+        if self.morph.is_none() {
+            self.view = to_view;
+        }
     }
 
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
@@ -1803,20 +2056,7 @@ impl FractalApp {
             });
         }
         if self.kind != prev_kind {
-            let to_view = Self::default_view_for(self.mode, self.kind);
-            // Buddhabrot has its own pipeline without the blended formula, so
-            // it keeps the instant switch.
-            self.morph =
-                (self.anim.kind_morph && self.mode != FractalMode::Buddhabrot).then(|| KindMorph {
-                    from: prev_kind,
-                    progress: 0.0,
-                    from_view: self.view.clone(),
-                    to_view: to_view.clone(),
-                    camera: true,
-                });
-            if self.morph.is_none() {
-                self.view = to_view;
-            }
+            self.switch_kind(prev_kind);
         }
 
         let prev_mode = self.mode;
@@ -2013,60 +2253,68 @@ impl FractalApp {
                 );
             }
 
-            // Julia c only affects Julia mode; Phoenix p only the Phoenix kind.
+            if self.mode != FractalMode::Buddhabrot {
+                if ui
+                    .checkbox(&mut self.anim.kind_cycle, "Cycle kinds")
+                    .on_hover_text("Step through every fractal kind in turn.")
+                    .changed()
+                {
+                    self.anim.kind_cycle_timer = 0.0;
+                }
+                if self.anim.kind_cycle {
+                    ui.add(
+                        egui::Slider::new(&mut self.anim.kind_cycle_hold, 0.5..=30.0)
+                            .text("hold s")
+                            .logarithmic(true),
+                    );
+                }
+            }
+
+            if self.rendering_mode == 2 {
+                if ui
+                    .checkbox(&mut self.anim.cam_orbit, "Orbit camera")
+                    .on_hover_text(
+                        "Spin the 3D camera around the view, optionally bobbing its pitch.",
+                    )
+                    .changed()
+                    && self.anim.cam_orbit
+                {
+                    self.anim.cam_pitch_base = self.camera.pitch;
+                    self.anim.cam_pitch_phase = 0.0;
+                }
+                if self.anim.cam_orbit {
+                    ui.add(
+                        egui::Slider::new(&mut self.anim.cam_yaw_speed, -90.0..=90.0)
+                            .text("yaw °/s"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.anim.cam_pitch_amp, 0.0..=30.0)
+                            .text("pitch bob °"),
+                    );
+                    if self.anim.cam_pitch_amp > 0.0 {
+                        ui.add(
+                            egui::Slider::new(&mut self.anim.cam_pitch_speed, 0.005..=0.5)
+                                .text("bob Hz")
+                                .logarithmic(true),
+                        );
+                    }
+                }
+            }
+
+            // Julia c only affects Julia mode; Phoenix p / λ / complex power
+            // only their own kinds.
             if self.mode == FractalMode::Julia {
-                if ui.checkbox(&mut self.anim.julia, "Morph c").changed() && self.anim.julia {
-                    self.anim.julia_base = self.julia_c; // orbit around the current c
-                    self.anim.julia_angle = 0.0;
-                }
-                if self.anim.julia {
-                    ui.add(
-                        egui::Slider::new(&mut self.anim.julia_speed, 0.005..=0.5)
-                            .text("c rev/s")
-                            .logarithmic(true),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.anim.julia_radius, 0.005..=0.5)
-                            .text("c radius")
-                            .logarithmic(true),
-                    );
-                }
+                self.anim.julia.ui(ui, "c", self.julia_c);
             }
             if self.kind == FractalKind::Phoenix {
-                if ui.checkbox(&mut self.anim.phoenix, "Morph p").changed() && self.anim.phoenix {
-                    self.anim.phoenix_base = self.phoenix_p;
-                    self.anim.phoenix_angle = 0.0;
-                }
-                if self.anim.phoenix {
-                    ui.add(
-                        egui::Slider::new(&mut self.anim.phoenix_speed, 0.005..=0.5)
-                            .text("p rev/s")
-                            .logarithmic(true),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.anim.phoenix_radius, 0.005..=0.5)
-                            .text("p radius")
-                            .logarithmic(true),
-                    );
-                }
+                self.anim.phoenix.ui(ui, "p", self.phoenix_p);
             }
             if self.kind == FractalKind::Lambda {
-                if ui.checkbox(&mut self.anim.lambda, "Morph λ").changed() && self.anim.lambda {
-                    self.anim.lambda_base = self.lambda_l;
-                    self.anim.lambda_angle = 0.0;
-                }
-                if self.anim.lambda {
-                    ui.add(
-                        egui::Slider::new(&mut self.anim.lambda_speed, 0.005..=0.5)
-                            .text("λ rev/s")
-                            .logarithmic(true),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.anim.lambda_radius, 0.005..=0.5)
-                            .text("λ radius")
-                            .logarithmic(true),
-                    );
-                }
+                self.anim.lambda.ui(ui, "λ", self.lambda_l);
+            }
+            if self.kind == FractalKind::ComplexMultibrot {
+                self.anim.cpow_re.ui(ui, "Re(power)", self.complex_power.0);
+                self.anim.cpow_im.ui(ui, "Im(power)", self.complex_power.1);
             }
         });
 

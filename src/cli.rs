@@ -61,6 +61,15 @@ pub struct Cli {
     #[arg(long("zoom"), short('z'))]
     pub half_height: Option<String>,
 
+    /// 3D camera yaw in degrees (with --rendering-kind 3d).
+    #[arg(long, value_name = "DEG", allow_hyphen_values = true)]
+    pub yaw: Option<f32>,
+
+    /// 3D camera pitch in degrees (with --rendering-kind 3d); negative tilts
+    /// the view down toward the fractal. Clamped short of ±90.
+    #[arg(long, value_name = "DEG", allow_hyphen_values = true)]
+    pub pitch: Option<f32>,
+
     /// Enable distance-estimation shading.
     #[arg(long)]
     pub de: bool,
@@ -93,6 +102,49 @@ pub struct Cli {
     #[arg(long)]
     pub to_iterations: Option<u32>,
 
+    /// End Julia constant for an animation: c is interpolated from --julia
+    /// to this over the frames.
+    #[arg(long, value_name = "RE,IM", allow_hyphen_values = true)]
+    pub to_julia: Option<String>,
+
+    /// End Phoenix constant p for an animation (from --phoenix-p).
+    #[arg(long, value_name = "RE,IM", allow_hyphen_values = true)]
+    pub to_phoenix_p: Option<String>,
+
+    /// End Lambda constant λ for an animation (from --lambda-l).
+    #[arg(long, value_name = "RE,IM", allow_hyphen_values = true)]
+    pub to_lambda_l: Option<String>,
+
+    /// End Complex Multibrot exponent for an animation (from
+    /// --complex-power). Shorthand for --to-complex-power-re +
+    /// --to-complex-power-im.
+    #[arg(long, value_name = "RE,IM", allow_hyphen_values = true)]
+    pub to_complex_power: Option<String>,
+
+    /// End real part of the Complex Multibrot exponent for an animation;
+    /// the imaginary part stays put unless --to-complex-power-im is given.
+    #[arg(long, value_name = "RE", allow_hyphen_values = true)]
+    pub to_complex_power_re: Option<f64>,
+
+    /// End imaginary part of the Complex Multibrot exponent for an animation;
+    /// the real part stays put unless --to-complex-power-re is given.
+    #[arg(long, value_name = "IM", allow_hyphen_values = true)]
+    pub to_complex_power_im: Option<f64>,
+
+    /// End 3D camera yaw for an animation, in degrees (from --yaw). Not
+    /// wrapped: --yaw 0 --to-yaw 720 orbits twice.
+    #[arg(long, value_name = "DEG", allow_hyphen_values = true)]
+    pub to_yaw: Option<f32>,
+
+    /// End 3D camera pitch for an animation, in degrees (from --pitch).
+    #[arg(long, value_name = "DEG", allow_hyphen_values = true)]
+    pub to_pitch: Option<f32>,
+
+    /// Morph the iteration formula from the start kind (--kind) to this one
+    /// over the animation. The camera is unaffected (use --to-view for that).
+    #[arg(long, value_enum)]
+    pub to_kind: Option<KindArg>,
+
     /// Number of frames to render for an animation. Alternative to --fps +
     /// --duration.
     #[arg(long, value_name = "N")]
@@ -115,8 +167,8 @@ pub struct Cli {
 
     /// Run without opening a window: render the current view to a PNG and
     /// exit. Combine with --kind/--julia/--share/--view etc. to pick what to
-    /// render, or --to-view/--to-share to render an animation instead of a
-    /// single frame. Not yet supported with --buddhabrot.
+    /// render, or any --to-* flag (--to-view, --to-julia, --to-kind, ...) to
+    /// render an animation instead of a single frame. Not yet supported with --buddhabrot.
     #[arg(long)]
     pub headless: bool,
 
