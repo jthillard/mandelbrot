@@ -58,6 +58,12 @@ struct Uniforms {
     complex_power: vec2<f32>,
 };
 
+// Fractal kind, as a pipeline-overridable constant (set per compute pipeline
+// from `u.kind`, see `BuddhabrotRenderer::compute_pipeline`): every kind
+// branch in the iteration loop folds away at pipeline creation. Read this,
+// never `u.kind`.
+override KIND: u32 = 0u;
+
 const PALETTE_NEBULA: u32 = 0u;
 const PALETTE_YELLOW: u32 = 1u;
 const PALETTE_GRAYSCALE: u32 = 2u;
@@ -95,25 +101,25 @@ fn complex_pow(z: vec2<f32>, p: u32) -> vec2<f32> {
 // Must match `FractalKind` in reference.rs (the direct, non-perturbative form
 // of the same formulas).
 fn advance(z: vec2<f32>, zp: vec2<f32>, c: vec2<f32>) -> vec2<f32> {
-    if u.kind == KIND_BURNING_SHIP {
+    if KIND == KIND_BURNING_SHIP {
         return vec2<f32>(z.x * z.x - z.y * z.y, 2.0 * abs(z.x * z.y)) + c;
-    } else if u.kind == KIND_TRICORN {
+    } else if KIND == KIND_TRICORN {
         return vec2<f32>(z.x * z.x - z.y * z.y, -2.0 * z.x * z.y) + c;
-    } else if u.kind == KIND_MULTIBROT {
+    } else if KIND == KIND_MULTIBROT {
         return complex_pow(z, clamp(u.power, 2u, 8u)) + c;
-    } else if u.kind == KIND_CELTIC {
+    } else if KIND == KIND_CELTIC {
         return vec2<f32>(abs(z.x * z.x - z.y * z.y), 2.0 * z.x * z.y) + c;
-    } else if u.kind == KIND_PERPENDICULAR {
+    } else if KIND == KIND_PERPENDICULAR {
         return vec2<f32>(z.x * z.x - z.y * z.y, -2.0 * z.x * abs(z.y)) + c;
-    } else if u.kind == KIND_BUFFALO {
+    } else if KIND == KIND_BUFFALO {
         return vec2<f32>(abs(z.x * z.x - z.y * z.y), -abs(2.0 * z.x * z.y)) + c;
-    } else if u.kind == KIND_PHOENIX {
+    } else if KIND == KIND_PHOENIX {
         let sq = vec2<f32>(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y);
         return sq + c + cmul(u.phoenix_p, zp);
-    } else if u.kind == KIND_LAMBDA {
+    } else if KIND == KIND_LAMBDA {
         // l * z * (1 - z); c is unused (see file doc comment above).
         return cmul(u.lambda_l, cmul(z, vec2<f32>(1.0 - z.x, -z.y)));
-    } else if u.kind == KIND_COMPLEX_MULTIBROT {
+    } else if KIND == KIND_COMPLEX_MULTIBROT {
         return cpow(z, u.complex_power) + c;
     }
     return vec2<f32>(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c; // Mandelbrot
@@ -176,7 +182,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var c = sample;
     var z0 = vec2<f32>(0.0, 0.0);
-    if u.kind == KIND_LAMBDA {
+    if KIND == KIND_LAMBDA {
         c = vec2<f32>(0.0, 0.0); // unused by the Lambda step
         z0 = sample;
     }

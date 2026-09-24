@@ -17,6 +17,20 @@
 // Only read by `fs_color`'s shadow branch (custom-lights palette); the
 // iteration pass (`fs_data`) never touches it.
 @group(0) @binding(2) var<uniform> lights: array<Light, 16>;
+// Only read by the adaptive-AA refine pass (`fs_refine`): the 1-sample-per-
+// pixel data texture written by `fs_data`, which decides where to supersample.
+@group(1) @binding(0) var coarse_tex: texture_2d<f32>;
+
+// Pipeline-overridable specialization constants, set per pipeline from the
+// uniforms' `kind` / `is_julia` / `de_coloring` (see `PipelineKey` in
+// renderer.rs). Every per-iteration branch on them folds away at pipeline
+// creation, so the hot loop only contains the current kind's math instead of
+// testing all of them on every step. The matching uniform fields are still
+// uploaded (the layout is shared with colorize.wgsl) but this shader must read
+// these constants, never `u.kind` / `u.is_julia` / `u.de_coloring`.
+override KIND: u32 = 0u;
+override IS_JULIA: bool = false;
+override DE: bool = false;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -56,50 +70,47 @@ fn diffabs(c: f32, d: f32) -> f32 {
     return select(-d, 2.0 * c + d, cd > 0.0);
 }
 
-// Binomial coefficient C(n, k) as f32 (exact for the small powers we use).
-fn binom(n: u32, k: u32) -> f32 {
-    var num = 1.0;
-    var den = 1.0;
-    for (var i: u32 = 0u; i < k; i = i + 1u) {
-        num = num * f32(n - i);
-        den = den * f32(i + 1u);
-    }
-    return num / den;
-}
-
-// Perturbation delta for z -> z^p: sum_{k=1}^{p} C(p,k) Z^{p-k} e^k. Expanded so
-// the large z^p term is never formed (that would cancel catastrophically).
+// Perturbation delta for z -> z^p: (Z+e)^p - Z^p = e * sum_{k=0}^{p-1} (Z+e)^k Z^{p-1-k}.
+// The large z^p term is never formed (that would cancel catastrophically), and
+// the sum is evaluated Horner-style (s <- s*(Z+e) + Z^j) so it needs neither a
+// table of powers (a dynamically indexed local array spills to slow memory on
+// most GPUs) nor binomial coefficients. Forming Z+e rounds e away when it's
+// tiny, but that only perturbs `s` by a relative f32 epsilon, and the result
+// is `e * s`, so the delta keeps full relative precision.
 fn multibrot_delta(z: vec2<f32>, e: vec2<f32>, p: u32) -> vec2<f32> {
-    var zp: array<vec2<f32>, 9>; // Z^0 .. Z^8
-    zp[0] = vec2<f32>(1.0, 0.0);
-    for (var j: u32 = 1u; j <= p; j = j + 1u) {
-        zp[j] = cmul(zp[j - 1u], z);
+    let y = z + e;
+    var s = vec2<f32>(1.0, 0.0);
+    var zj = vec2<f32>(1.0, 0.0);
+    for (var j: u32 = 1u; j < p; j = j + 1u) {
+        zj = cmul(zj, z); // Z^j
+        s = cmul(s, y) + zj;
     }
-    var acc = vec2<f32>(0.0, 0.0);
-    var ek = vec2<f32>(1.0, 0.0); // e^0
-    for (var k: u32 = 1u; k <= p; k = k + 1u) {
-        ek = cmul(ek, e); // e^k
-        acc = acc + binom(p, k) * cmul(zp[p - k], ek);
-    }
-    return acc;
+    return cmul(e, s);
 }
 
-// Number of terms kept in `complex_multibrot_delta`'s series. Truncation, not
-// exactness: unlike `multibrot_delta` (a finite binomial sum for an integer
-// power), a complex power has no finite expansion, so this converges rather
-// than terminates. Fine as long as perturbation's usual invariant (|e| << |z|,
+// Maximum number of terms in `complex_multibrot_delta`'s series (matches the
+// `cm_coef` uniform array: 8 vec4s = 16 complex coefficients). Truncation, not
+// exactness: unlike `multibrot_delta` (a finite sum for an integer power), a
+// complex power has no finite expansion, so this converges rather than
+// terminates. Fine as long as perturbation's usual invariant (|e| << |z|,
 // kept true by rebasing) holds, since each extra term is O(w^k) smaller.
 const COMPLEX_MULTIBROT_TERMS: u32 = 16u;
+
+// Complex binomial coefficient C(p, k), k in 1..=16, precomputed on the CPU
+// (they depend only on p; see `complex_binomials` in app.rs).
+fn cm_coef(k: u32) -> vec2<f32> {
+    let v = u.cm_coef[(k - 1u) / 2u];
+    return select(v.xy, v.zw, (k & 1u) == 0u);
+}
 
 // Perturbation delta for z -> z^p with a complex p: (Z+e)^p - Z^p.
 //
 // When |e| << |Z| (the common case: it's the whole reason perturbation
 // works), forming Z+e directly would round e away in f32, so instead expand
 // = Z^p * ((1+w)^p - 1), w = e/Z, as a Taylor series in w: (1+w)^p - 1 =
-// sum_{k=1}^N C(p,k) w^k, with the complex binomial coefficient built up
-// incrementally: C(p,k) = C(p,k-1) * (p-(k-1)) / k. Unlike `multibrot_delta`
-// (a finite binomial sum for an integer power), this only *converges* — and
-// only for |w| < 1 — rather than terminating exactly.
+// sum_{k=1}^N C(p,k) w^k. The series stops as soon as the next w^k is
+// negligible against the running sum (below f32 precision) — at deep zoom w
+// is tiny, so that's typically after 2-3 terms instead of all 16.
 //
 // Right after a rebase (or near a reference point close to zero, where w is
 // singular), e is *not* small relative to Z — that's normal perturbation
@@ -112,13 +123,14 @@ fn complex_multibrot_delta(z: vec2<f32>, e: vec2<f32>, p: vec2<f32>) -> vec2<f32
     let w2 = dot(e, e) / dot(z, z);
     if w2 < 0.25 {
         let w = cdiv(e, z);
-        var wk = vec2<f32>(1.0, 0.0); // w^0
-        var coef = vec2<f32>(1.0, 0.0); // C(p,0)
+        var wk = w; // w^1
         var acc = vec2<f32>(0.0, 0.0);
         for (var k: u32 = 1u; k <= COMPLEX_MULTIBROT_TERMS; k = k + 1u) {
-            coef = cdiv(cmul(coef, p - vec2<f32>(f32(k - 1u), 0.0)), vec2<f32>(f32(k), 0.0));
+            acc = acc + cmul(cm_coef(k), wk);
             wk = cmul(wk, w);
-            acc = acc + cmul(coef, wk);
+            if dot(wk, wk) < 1e-18 * dot(acc, acc) {
+                break;
+            }
         }
         return cmul(cpow(z, p), acc);
     }
@@ -129,7 +141,7 @@ fn complex_multibrot_delta(z: vec2<f32>, e: vec2<f32>, p: vec2<f32>) -> vec2<f32
 // where `z` is the reference orbit value X_m. `step_add` (dc) is added by the
 // caller. Must match `FractalKind` on the CPU side.
 fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
-    if u.kind == KIND_BURNING_SHIP {
+    if KIND == KIND_BURNING_SHIP {
         // (|x| + i|y|)^2 has real part x^2 - y^2 (an ordinary square delta) and
         // imaginary part 2|x y|. The imaginary delta is 2(|x y| - |X Y|); diffabs
         // computes it exactly, even where the product x y changes sign — which the
@@ -138,34 +150,34 @@ fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
         let base = 2.0 * cmul(z, e) + cmul(e, e);
         let dp = z.x * e.y + z.y * e.x + e.x * e.y;
         return vec2<f32>(base.x, 2.0 * diffabs(z.x * z.y, dp));
-    } else if u.kind == KIND_TRICORN {
+    } else if KIND == KIND_TRICORN {
         let cz = conj(z);
         let ce = conj(e);
         return 2.0 * cmul(cz, ce) + cmul(ce, ce);
-    } else if u.kind == KIND_MULTIBROT {
+    } else if KIND == KIND_MULTIBROT {
         return multibrot_delta(z, e, clamp(u.power, 2u, 8u));
-    } else if u.kind == KIND_CELTIC {
+    } else if KIND == KIND_CELTIC {
         // z^2 delta split: sq.x = delta of Re(z^2), sq.y = delta of Im(z^2).
         // Celtic abs the real output, so |Re(z^2)| delta = diffabs(Re(Z^2), sq.x).
         let sq = 2.0 * cmul(z, e) + cmul(e, e);
         return vec2<f32>(diffabs(z.x * z.x - z.y * z.y, sq.x), sq.y);
-    } else if u.kind == KIND_BUFFALO {
+    } else if KIND == KIND_BUFFALO {
         // Abs both outputs: real |Re(z^2)|, imag -|Im(z^2)| (Im(Z^2) = 2 X Y).
         let sq = 2.0 * cmul(z, e) + cmul(e, e);
         return vec2<f32>(diffabs(z.x * z.x - z.y * z.y, sq.x),
                          -diffabs(2.0 * z.x * z.y, sq.y));
-    } else if u.kind == KIND_PERPENDICULAR {
+    } else if KIND == KIND_PERPENDICULAR {
         // real x^2 - y^2 (ordinary square delta), imag -2 x |y|.
         // d(-2 x |y|) = -2[ X·(|Y+ey|-|Y|) + ex·|Y+ey| ]; diffabs gives |Y+ey|-|Y|.
         let sq = 2.0 * cmul(z, e) + cmul(e, e);
         let da = diffabs(z.y, e.y);        // |Y + ey| - |Y|
         let abs_yf = abs(z.y) + da;        // |Y + ey|
         return vec2<f32>(sq.x, -2.0 * (z.x * da + e.x * abs_yf));
-    } else if u.kind == KIND_LAMBDA {
+    } else if KIND == KIND_LAMBDA {
         // Lambda map: z^{n+1} = λ·z·(1-z). Delta: e = λ·e·(1-2z-e).
         let one_minus_2z_minus_e = vec2<f32>(1.0 - 2.0 * z.x - e.x, -2.0 * z.y - e.y);
         return cmul(u.lambda_l, cmul(e, one_minus_2z_minus_e));
-    } else if u.kind == KIND_COMPLEX_MULTIBROT {
+    } else if KIND == KIND_COMPLEX_MULTIBROT {
         return complex_multibrot_delta(z, e, u.complex_power);
     }
     return 2.0 * cmul(z, e) + cmul(e, e); // Mandelbrot (and Phoenix square part)
@@ -177,17 +189,17 @@ fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
 // Burning Ship / Tricorn we use |f'| ~ |2Z|, which keeps the DE magnitude close
 // enough to de-speckle filaments.
 fn fprime(z: vec2<f32>) -> vec2<f32> {
-    if u.kind == KIND_MULTIBROT {
+    if KIND == KIND_MULTIBROT {
         let p = clamp(u.power, 2u, 8u);
-        var zk = vec2<f32>(1.0, 0.0); // Z^0
-        for (var k: u32 = 1u; k < p; k = k + 1u) {
+        var zk = z; // Z^1
+        for (var k: u32 = 2u; k < p; k = k + 1u) {
             zk = cmul(zk, z); // -> Z^{p-1}
         }
         return f32(p) * zk;
-    } else if u.kind == KIND_LAMBDA {
+    } else if KIND == KIND_LAMBDA {
         // Lambda: f'(z) = λ·(1-2z).
         return cmul(u.lambda_l, vec2<f32>(1.0 - 2.0 * z.x, -2.0 * z.y));
-    } else if u.kind == KIND_COMPLEX_MULTIBROT {
+    } else if KIND == KIND_COMPLEX_MULTIBROT {
         // f'(z) = p * z^(p-1).
         return cmul(u.complex_power, cpow(z, u.complex_power - vec2<f32>(1.0, 0.0)));
     }
@@ -209,6 +221,10 @@ struct Sample {
 // starts at 0); for Julia it is the z-plane offset that seeds the initial delta
 // (c is fixed, so nothing is added per step).
 fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
+    // Loop invariants, read once instead of on every iteration.
+    let max_iter = u.max_iter;
+    let bailout_sq = u.bailout_sq;
+    let ref_len = u.ref_len;
     let z0 = ref_orbit[0]; // reference start (0 for Mandelbrot, center for Julia)
 
     // Main cardioid / period-2 bulb bypass: those points never escape, so skip
@@ -217,7 +233,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     // orbit itself, since X_1 = X_0^2 + C_ref = C_ref. That's only f32-accurate,
     // so skip the test once a pixel is smaller than that error (deep zoom),
     // where it could misclassify pixels right at the boundary.
-    if u.kind == KIND_MANDELBROT && u.is_julia == 0u && u.ref_len > 1u && px > 1e-6 {
+    if KIND == KIND_MANDELBROT && !IS_JULIA && ref_len > 1u && px > 1e-6 {
         let c = ref_orbit[1] + offset;
         let xq = c.x - 0.25;
         let q = xq * xq + c.y * c.y;
@@ -229,95 +245,101 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         }
     }
 
+    // Set plane: delta starts at 0 and gains dc every step. Julia: the offset
+    // seeds the delta and nothing is added per step.
     var step_add = offset;
     var e = vec2<f32>(0.0, 0.0);
     // Orbit derivative for distance estimation. For the set plane it is d/dc
     // (starts at 0, gains +1 each step); for Julia it is d/dz0 (starts at 1).
     var dz = vec2<f32>(0.0, 0.0);
-    var dz_seed = vec2<f32>(1.0, 0.0);
+    if IS_JULIA {
+        step_add = vec2<f32>(0.0, 0.0);
+        e = offset;
+        dz = vec2<f32>(1.0, 0.0);
+    }
     // Previous-iterate state for the Phoenix two-term recurrence (delta of
     // y_{n-1}, and its derivative for DE). Both start at 0 (y_{-1} = 0).
     var e_prev = vec2<f32>(0.0, 0.0);
     var dz_prev = vec2<f32>(0.0, 0.0);
-    if u.is_julia != 0u {
-        step_add = vec2<f32>(0.0, 0.0);
-        e = offset;
-        dz = vec2<f32>(1.0, 0.0);
-        dz_seed = vec2<f32>(0.0, 0.0);
-    }
 
-    var m: u32 = 0u;              // reference index; invariant: y_n = X[m] + e
+    var m: u32 = 0u;              // reference index; invariant: y_n = xm + e, xm = X[m]
     var n: u32 = 0u;              // total iteration count
-    var z = vec2<f32>(0.0, 0.0);  // full value y_n, kept for coloring
+    var xm = z0;                  // X[m], carried so each step loads the orbit once
+    var z = xm + e;               // full value y_n, kept for coloring
+    var z2 = dot(z, z);
     var escaped = false;
 
-        loop {
-            let xm = ref_orbit[m];
-            z = xm + e;
-
-            let z2 = dot(z, z);
-            if z2 > u.bailout_sq {
-                escaped = true;
-                break;
-            }
-            if n >= u.max_iter {
-                break; // interior
-            }
+    loop {
+        if z2 > bailout_sq {
+            escaped = true;
+            break;
+        }
+        if n >= max_iter {
+            break; // interior
+        }
 
         // Propagate the derivative of the full orbit (unaffected by rebasing,
         // which only re-expresses the same value). Only when DE is enabled.
         // Phoenix's two-term map adds p·dz_{n-1} and carries the previous dz.
-            if u.de_coloring != 0u {
-                var dz_new = cmul(fprime(z), dz) + dz_seed;
-                if u.kind == KIND_PHOENIX {
-                    dz_new = dz_new + cmul(u.phoenix_p, dz_prev);
-                    dz_prev = dz;
-                }
-                dz = dz_new;
+        if DE {
+            var dz_new = cmul(fprime(z), dz);
+            if !IS_JULIA {
+                dz_new.x = dz_new.x + 1.0;
             }
+            if KIND == KIND_PHOENIX {
+                dz_new = dz_new + cmul(u.phoenix_p, dz_prev);
+                dz_prev = dz;
+            }
+            dz = dz_new;
+        }
 
         // Advance the delta by this fractal's formula (+ dc for the set plane).
         // Phoenix additionally adds p·e_{n-1} and carries the previous delta.
-            let e_old = e;
-            e = advance_delta(xm, e) + step_add;
-            if u.kind == KIND_PHOENIX {
-                e = e + cmul(u.phoenix_p, e_prev);
-                e_prev = e_old;
-            }
-            m = m + 1u;
-            n = n + 1u;
+        let e_old = e;
+        let z_old = z;
+        e = advance_delta(xm, e) + step_add;
+        if KIND == KIND_PHOENIX {
+            e = e + cmul(u.phoenix_p, e_prev);
+            e_prev = e_old;
+        }
+        m = m + 1u;
+        n = n + 1u;
 
         // Keep the reference index valid and the delta small.
-            if m >= u.ref_len {
+        if m >= ref_len {
             // Reference exhausted: any pixel that followed it this far has
             // effectively escaped (interior pixels rebase before reaching here).
-                z = ref_orbit[u.ref_len - 1u] + e;
-                escaped = true;
-                break;
-            }
-            let y = ref_orbit[m] + e;
-            if dot(y, y) < dot(e, e) {
-            // Rebase to index 0: carry the full value as the new delta. Valid
-            // because y_n = X[0] + (y_n - X[0]); for Mandelbrot X[0]=0.
-            // Phoenix: after rebasing the implied previous reference is Y[-1]=0,
-            // so the previous delta becomes the full previous value y_n (= z).
-                if u.kind == KIND_PHOENIX {
-                    e_prev = z;
-                }
-                e = y - z0;
-                m = 0u;
-            }
+            z = xm + e;
+            escaped = true;
+            break;
         }
+        xm = ref_orbit[m];
+        z = xm + e;
+        z2 = dot(z, z);
+        if z2 < dot(e, e) {
+            // Rebase to index 0: carry the full value as the new delta. Valid
+            // because y_n = X[0] + (y_n - X[0]); for Mandelbrot X[0]=0. The
+            // full value `z` (and `z2`) is unchanged by the re-expression.
+            // Phoenix: after rebasing the implied previous reference is Y[-1]=0,
+            // so the previous delta becomes the full previous value y_{n-1}.
+            if KIND == KIND_PHOENIX {
+                e_prev = z_old;
+            }
+            e = z - z0;
+            xm = z0;
+            m = 0u;
+        }
+    }
 
     if !escaped {
         return Sample(0.0, 1.0, false); // interior of the set
     }
 
-    let z2 = dot(z, z);
+    z2 = dot(z, z);
 
     // Continuous (smooth) iteration count.
     let log_zn = 0.5 * log(max(z2, 1.0));
-    let nu = log2(log_zn / log(2.0));
+    let nu = log2(log_zn * INV_LN2);
     let smooth_i = f32(n) + 1.0 - nu;
 
     // sqrt compresses the huge iteration counts of deep zooms so the palette
@@ -325,7 +347,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     let ci = sqrt(max(smooth_i, 0.0));
 
     var de = 1.0;
-    if u.de_coloring != 0u {
+    if DE {
         // Exterior distance estimate (complex-plane units): |z|·ln|z| / |dz|.
         // Divided by the pixel footprint it becomes a distance in pixels; we
         // darken toward the boundary (< ~1 px away) so filaments stay crisp
@@ -334,14 +356,14 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         let zmag = sqrt(max(z2, 1.0));
         let dzmag = sqrt(max(dot(dz, dz), 1e-20));
         let d = zmag * log(zmag) / dzmag;
-        var max_de = 1.;
-        if u.shadow != 0u {
-            max_de = 1000.;
-        }
+        let max_de = select(1.0, 1000.0, u.shadow != 0u);
         de = clamp(d / max(px, 1e-30), 0.0, max_de);
     }
     return Sample(ci, de, true);
 }
+
+// 1 / ln(2), for the smooth iteration count's log2(ln|z| / ln 2).
+const INV_LN2: f32 = 1.4426950408889634;
 
 // Map a sample's escape data through the palette (+ DE darkening). This is the
 // only color-dependent step, so it can be redone without re-iterating. Interior
@@ -353,13 +375,13 @@ fn color_sample(s: Sample) -> vec3<f32> {
     return classic_color(s.ci, s.de);
 }
 
-// Supersampled escape data at one point: average (ci, DE factor) over the
-// AA grid's escaped sub-samples, plus the fraction that landed in the
-// interior. Shared by `fs_data` (writes it straight to the data texture) and
-// `fs_color`'s shadow branch (used both at the pixel and at its two
-// neighbours, to build a DE height field without a texture round-trip).
-fn aggregate_sample(base: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, px: f32) -> vec3<f32> {
-    let aa = max(u.aa_level, 1u);
+// Supersampled escape data at one point: average (ci, DE factor) over an
+// `aa`×`aa` grid's escaped sub-samples, plus the fraction that landed in the
+// interior. Shared by `fs_data` (1 sample), `fs_refine` (the AA grid, only on
+// pixels that need it) and `fs_color`'s shadow branch (used both at the pixel
+// and at its two neighbours, to build a DE height field without a texture
+// round-trip).
+fn aggregate_sample(base: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, px: f32, aa: u32) -> vec3<f32> {
     let inv = 1.0 / f32(aa);
     var ci_sum = 0.0;
     var de_sum = 0.0;
@@ -386,8 +408,8 @@ fn aggregate_sample(base: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, px: f32) -> v
 // Iteration pass: write per-pixel escape data (color-independent) so a colour
 // change is remapped by the cheap colourise pass without re-iterating.
 //   R = ci (palette parameter), G = DE factor, B = interior fraction (for AA).
-// AA is grid-supersampled here; the interior fraction lets the colourise pass
-// anti-alias the set boundary (blend toward black) after the fact.
+// Always one sample per pixel: anti-aliasing is added afterwards, only where
+// it matters, by `fs_refine`.
 @fragment
 fn fs_data(in: VsOut) -> @location(0) vec4<f32> {
     let base = in.centered * u.span + u.dc_offset;
@@ -395,35 +417,82 @@ fn fs_data(in: VsOut) -> @location(0) vec4<f32> {
     let dy = dpdy(base);
     let px = length(abs(dx) + abs(dy));
 
-    return vec4<f32>(aggregate_sample(base, dx, dy, px), 1.0);
+    return vec4<f32>(aggregate_sample(base, dx, dy, px, 1u), 1.0);
+}
+
+// Adaptive-AA thresholds for `fs_refine`: a pixel is supersampled only if a
+// 4-neighbour's 1-spp sample differs from its own by more than this. `ci`
+// steps are palette-phase steps of `ci * color_scale` (color_scale <= 1 in the
+// UI), so 0.02 keeps anything visibly banded; DE is compared relative to its
+// own magnitude (it's in pixels, up to 1000 for shadow/3D height fields).
+const AA_CI_EPS: f32 = 0.02;
+const AA_DE_EPS: f32 = 0.1;
+
+fn aa_differs(c: vec4<f32>, n: vec4<f32>) -> bool {
+    if c.b != n.b {
+        return true; // interior / exterior boundary
+    }
+    if c.b != 0.0 {
+        return false; // both interior: uniformly black
+    }
+    return abs(n.r - c.r) > AA_CI_EPS || abs(n.g - c.g) > AA_DE_EPS * max(c.g, 0.1);
+}
+
+// Adaptive anti-aliasing pass (only run when AA is on): reads `fs_data`'s
+// 1-spp texture and re-iterates the full AA grid only for pixels whose
+// neighbourhood isn't smooth (set boundary, filaments, palette discontinuities).
+// Everywhere else the centre sample already equals the grid average to within
+// the thresholds above, so it's copied — which skips the AA cost entirely for
+// the interior (the most expensive pixels, each burning max_iter) and for the
+// smooth exterior.
+@fragment
+fn fs_refine(in: VsOut) -> @location(0) vec4<f32> {
+    // Derivatives first, while control flow is still uniform.
+    let base = in.centered * u.span + u.dc_offset;
+    let dx = dpdx(base);
+    let dy = dpdy(base);
+    let px = length(abs(dx) + abs(dy));
+
+    let p = vec2<i32>(in.pos.xy);
+    let hi = vec2<i32>(textureDimensions(coarse_tex)) - vec2<i32>(1, 1);
+    let c = textureLoad(coarse_tex, p, 0);
+    let l = textureLoad(coarse_tex, max(p - vec2<i32>(1, 0), vec2<i32>(0, 0)), 0);
+    let r = textureLoad(coarse_tex, min(p + vec2<i32>(1, 0), hi), 0);
+    let t = textureLoad(coarse_tex, max(p - vec2<i32>(0, 1), vec2<i32>(0, 0)), 0);
+    let b = textureLoad(coarse_tex, min(p + vec2<i32>(0, 1), hi), 0);
+    if aa_differs(c, l) || aa_differs(c, r) || aa_differs(c, t) || aa_differs(c, b) {
+        return vec4<f32>(aggregate_sample(base, dx, dy, px, max(u.aa_level, 1u)), 1.0);
+    }
+    return c;
 }
 
 // Combined iterate + colour in a single pass, for PNG export (which never needs
-// incremental recolouring). The interactive path uses fs_data + the colourise
-// pass so colour changes skip iteration.
+// incremental recolouring). The interactive path uses fs_data (+ fs_refine) +
+// the colourise pass so colour changes skip iteration. Export always runs the
+// full AA grid on every pixel, for maximum quality.
 @fragment
 fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
     let base = in.centered * u.span + u.dc_offset;
     let dx = dpdx(base);
     let dy = dpdy(base);
     let px = length(abs(dx) + abs(dy));
+    let aa = max(u.aa_level, 1u);
 
     if u.shadow != 0u {
         // No data texture to sample neighbours from (this pass never runs
         // one), so build the same DE height field colorize.wgsl reads from
         // the texture by aggregating live, at the pixel and its two
         // neighbours a `dx`/`dy` step away.
-        let here = aggregate_sample(base, dx, dy, px);
+        let here = aggregate_sample(base, dx, dy, px, aa);
         if here.z != 0.0 {
             return vec4<f32>(0.1, 0.1, 0.1, 1.0);
         }
-        let right = aggregate_sample(base + dx, dx, dy, px);
-        let down = aggregate_sample(base + dy, dx, dy, px);
+        let right = aggregate_sample(base + dx, dx, dy, px, aa);
+        let down = aggregate_sample(base + dy, dx, dy, px, aa);
         let normal = normal_from_heights(here.y, right.y, down.y);
         return vec4<f32>(shadow_color(normal), 1.0);
     }
 
-    let aa = max(u.aa_level, 1u);
     let inv = 1.0 / f32(aa);
     var acc = vec3<f32>(0.0, 0.0, 0.0);
     for (var sy: u32 = 0u; sy < aa; sy = sy + 1u) {

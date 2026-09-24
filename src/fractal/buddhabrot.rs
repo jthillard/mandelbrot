@@ -3,6 +3,8 @@
 //! to colour by a fragment pass. See `shaders/buddhabrot.wgsl` for the "why"
 //! this is a separate pipeline from the escape-time perturbation renderer.
 
+use std::collections::HashMap;
+
 use eframe::egui_wgpu::{self, wgpu};
 
 /// Random samples dispatched per accumulating frame. Chosen so a frame stays
@@ -101,7 +103,12 @@ struct Histogram {
 }
 
 pub struct BuddhabrotRenderer {
-    compute_pipeline: wgpu::ComputePipeline,
+    shader: wgpu::ShaderModule,
+    compute_pipeline_layout: wgpu::PipelineLayout,
+    /// Accumulation pipelines, specialized per fractal kind (the shader's
+    /// `override KIND`, so `advance()` has no per-step kind branches) and
+    /// built lazily on first use.
+    compute_pipelines: HashMap<u32, wgpu::ComputePipeline>,
     compute_bind_group_layout: wgpu::BindGroupLayout,
     tonemap_pipeline: wgpu::RenderPipeline,
     tonemap_bind_group_layout: wgpu::BindGroupLayout,
@@ -168,14 +175,6 @@ impl BuddhabrotRenderer {
                 bind_group_layouts: &[Some(&compute_bind_group_layout)],
                 immediate_size: 0,
             });
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("buddhabrot compute pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &shader,
-            entry_point: Some("cs_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
 
         let tonemap_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -236,7 +235,9 @@ impl BuddhabrotRenderer {
         });
 
         Self {
-            compute_pipeline,
+            shader,
+            compute_pipeline_layout,
+            compute_pipelines: HashMap::new(),
             compute_bind_group_layout,
             tonemap_pipeline,
             tonemap_bind_group_layout,
@@ -246,6 +247,23 @@ impl BuddhabrotRenderer {
             total_samples: 0.0,
             seed: 0,
         }
+    }
+
+    /// The accumulation pipeline for `kind`, built on first use.
+    fn compute_pipeline(&mut self, device: &wgpu::Device, kind: u32) -> &wgpu::ComputePipeline {
+        self.compute_pipelines.entry(kind).or_insert_with(|| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("buddhabrot compute pipeline"),
+                layout: Some(&self.compute_pipeline_layout),
+                module: &self.shader,
+                entry_point: Some("cs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &[("KIND", kind as f64)],
+                    ..Default::default()
+                },
+                cache: None,
+            })
+        })
     }
 
     /// Ensure the histogram buffer exists at `width`×`height`, recreating (and
@@ -334,6 +352,9 @@ impl egui_wgpu::CallbackTrait for BuddhabrotCallback {
         let width = self.size_px[0].max(1);
         let height = self.size_px[1].max(1);
         renderer.ensure_histogram(device, width, height);
+        let pipeline = renderer
+            .compute_pipeline(device, self.uniforms.kind)
+            .clone();
 
         let content = ContentKey::from(&self.uniforms);
         let content_changed = renderer.last_content != Some(content);
@@ -365,7 +386,7 @@ impl egui_wgpu::CallbackTrait for BuddhabrotCallback {
                     label: Some("buddhabrot accumulate pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&renderer.compute_pipeline);
+                pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &histogram.compute_bind_group, &[]);
                 let workgroups = SAMPLES_PER_DISPATCH.div_ceil(WORKGROUP_SIZE);
                 pass.dispatch_workgroups(workgroups, 1, 1);

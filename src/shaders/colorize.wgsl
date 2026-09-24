@@ -20,34 +20,34 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
 }
 
 fn shadow_fragment(pos: vec2<f32>) -> vec4<f32> {
-
     let x = i32(pos.x);
     let y = i32(pos.y);
     let size = textureDimensions(data_tex);
-    if textureLoad(data_tex, vec2<i32>(x, y), 0).b != 0. {
+    let here = textureLoad(data_tex, vec2<i32>(x, y), 0);
+    if here.b != 0. {
         return vec4<f32>(0.1, 0.1, 0.1, 1.0);
-    } else {
-        // Forward differences, except on the last column/row where x+1 / y+1
-        // is off the texture: fall back to a backward difference, mirrored
-        // (h0 + (h0 - h[-1])) so the slope keeps the sign normal_from_heights
-        // expects — plugging h[-1] in directly would flip the normal there.
-        let h0 = textureLoad(data_tex, vec2<i32>(x, y), 0).g;
-        var h1: f32;
-        if x + 1 < i32(size.x) {
-            h1 = textureLoad(data_tex, vec2<i32>(x + 1, y), 0).g;
-        } else {
-            h1 = 2.0 * h0 - textureLoad(data_tex, vec2<i32>(x - 1, y), 0).g;
-        }
-        var h2: f32;
-        if y + 1 < i32(size.y) {
-            h2 = textureLoad(data_tex, vec2<i32>(x, y + 1), 0).g;
-        } else {
-            h2 = 2.0 * h0 - textureLoad(data_tex, vec2<i32>(x, y - 1), 0).g;
-        }
-        let normal = normal_from_heights(h0, h1, h2);
-        return vec4<f32>(shadow_color(normal), 1.0);
     }
+    // Forward differences, except on the last column/row where x+1 / y+1
+    // is off the texture: fall back to a backward difference, mirrored
+    // (h0 + (h0 - h[-1])) so the slope keeps the sign normal_from_heights
+    // expects — plugging h[-1] in directly would flip the normal there.
+    let h0 = here.g;
+    var h1: f32;
+    if x + 1 < i32(size.x) {
+        h1 = textureLoad(data_tex, vec2<i32>(x + 1, y), 0).g;
+    } else {
+        h1 = 2.0 * h0 - textureLoad(data_tex, vec2<i32>(x - 1, y), 0).g;
+    }
+    var h2: f32;
+    if y + 1 < i32(size.y) {
+        h2 = textureLoad(data_tex, vec2<i32>(x, y + 1), 0).g;
+    } else {
+        h2 = 2.0 * h0 - textureLoad(data_tex, vec2<i32>(x, y - 1), 0).g;
+    }
+    let normal = normal_from_heights(h0, h1, h2);
+    return vec4<f32>(shadow_color(normal), 1.0);
 }
+
 @fragment
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if u.shadow == 2u {
@@ -68,19 +68,25 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 }
 
-fn sdf(pos: vec3<f32>) -> f32 {
-    let aspect_ratio = u.screen_dim.x / u.screen_dim.y;
-    let size = vec2<f32>(textureDimensions(data_tex));
-    var texture_pos_f32 = vec2<f32>(pos.x * size.x / aspect_ratio, pos.y * size.y);
-    var texture_pos = vec2<i32>(i32(texture_pos_f32.x), i32(texture_pos_f32.y));
-    texture_pos.x = clamp(texture_pos.x, 0, i32(size.x) - 1);
-    texture_pos.y = clamp(texture_pos.y, 0, i32(size.y) - 1);
+// Per-frame constants of the raymarch, computed once per pixel in
+// `ray_marching` rather than on each of the up-to-100 `sdf` steps.
+struct MarchConsts {
+    size: vec2<f32>,
+    // (size.x / aspect_ratio, size.y): world xy -> texel scale.
+    to_texel: vec2<f32>,
+    size_i: vec2<i32>,
+    inv_size_y: f32,
+};
 
-    let to_texture = max(-min(texture_pos_f32, vec2(0.)), max(texture_pos_f32 - size, vec2(0.)));
-    let dist_to_texture = length(to_texture) / size.y;
+fn sdf(pos: vec3<f32>, k: MarchConsts) -> f32 {
+    let texture_pos_f32 = pos.xy * k.to_texel;
+    let texture_pos = clamp(vec2<i32>(texture_pos_f32), vec2<i32>(0, 0), k.size_i - vec2<i32>(1, 1));
+
+    let to_texture = max(-min(texture_pos_f32, vec2(0.)), max(texture_pos_f32 - k.size, vec2(0.)));
+    let dist_to_texture = length(to_texture) * k.inv_size_y;
 
     let px = textureLoad(data_tex, texture_pos, 0);
-    let de = (px.g / size.y) * 0.5;
+    let de = (px.g * k.inv_size_y) * 0.5;
     // Height is measured toward -z, the side the camera sits on (it looks
     // along +z), so the terrain is solid on +z: interior plateau at z = 0,
     // exterior sloping away from the camera as `de` grows.
@@ -105,7 +111,11 @@ fn sdf(pos: vec3<f32>) -> f32 {
 }
 
 fn ray_marching(pos: vec4<f32>) -> vec4<f32> {
-    let size = vec2<f32>(textureDimensions(data_tex));
+    let size_i = vec2<i32>(textureDimensions(data_tex));
+    let size = vec2<f32>(size_i);
+    let aspect_ratio = u.screen_dim.x / u.screen_dim.y;
+    let k = MarchConsts(size, vec2<f32>(size.x / aspect_ratio, size.y), size_i, 1.0 / size.y);
+
     let in_texture = vec2<f32>(
         (pos.x / size.x) * 2. - 1.,
         (pos.y / size.y) * 2. - 1.,
@@ -123,22 +133,20 @@ fn ray_marching(pos: vec4<f32>) -> vec4<f32> {
 
     let dist_threshold = 0.000001;
     while i < 100u {
-        if length(p - ray_origin) > 3. {
+        let from_origin = p - ray_origin;
+        if dot(from_origin, from_origin) > 9. {
             break;
         }
-        dist = sdf(p);
+        dist = sdf(p, k);
         if dist < dist_threshold {
             break;
         }
-        p                       += dist * ray_dir;
-        i                       += 1u;
+        p += dist * ray_dir;
+        i += 1u;
     }
 
     if dist < dist_threshold {
-        let aspect_ratio = u.screen_dim.x / u.screen_dim.y;
-        let size = vec2<f32>(textureDimensions(data_tex));
-        let texture_pos_f32 = vec2<f32>(p.x * size.x / aspect_ratio, p.y * size.y);
-        return shadow_fragment(texture_pos_f32);
+        return shadow_fragment(p.xy * k.to_texel);
     }
     return vec4<f32>(1., 0., 0., 1.);
 }

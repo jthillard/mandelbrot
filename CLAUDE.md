@@ -85,7 +85,13 @@ pixel is a handful of `f32` complex multiplies.
   `ALL` array used to enumerate every kind.
 - `src/fractal/reference.rs` — `compute_reference`/`compute_set_reference`:
   iterate the chosen formula at high precision on the CPU, emitting `Z_n` as
-  `f32` pairs — that's the reference orbit the GPU perturbs from.
+  `f32` pairs — that's the reference orbit the GPU perturbs from. At
+  precision ≤ `F64_MAX_PRECISION` (80 bits, i.e. shallow views) it takes a
+  plain-`f64` fast path (`compute_reference_f64`), so each kind's formula
+  exists twice in this file (f64 + `FBig`) and both must stay in sync;
+  `f64_fast_path_matches_big` checks they agree. Requests are made with 1.5×
+  iteration headroom (`reference_iterations` in `app.rs`), so auto-iterations
+  creeping up during a zoom doesn't recompute the orbit every frame.
 - `src/shaders/*.wgsl` — none of these are standalone WGSL modules; WGSL has
   no `#include`, so each is compiled by concatenating plain-text fragments
   with `concat!`/`include_str!` at the `create_shader_module` call site (see
@@ -98,7 +104,15 @@ pixel is a handful of `f32` complex multiplies.
   Because there's no namespacing, a definition must live in exactly one file
   among those concatenated together for a given shader — don't redefine a
   `common.wgsl`/`iterate_uniforms.wgsl` symbol locally.
-- `src/shaders/mandelbrot.wgsl` — the perturbation fragment shader.
+- `src/shaders/mandelbrot.wgsl` — the perturbation fragment shader. It is
+  **specialized per pipeline** through WGSL `override` constants (`KIND`,
+  `IS_JULIA`, `DE`), so the per-iteration kind/Julia/DE branches fold away at
+  pipeline creation. Read those constants in the shader, never `u.kind` /
+  `u.is_julia` / `u.de_coloring` (they're still uploaded for layout reasons).
+  `renderer.rs` builds one pipeline set per `PipelineKey` lazily on first
+  use, and `tests/shader_valid.rs` compiles every kind × Julia × DE variant to
+  SPIR-V. So a new kind needs no pipeline-list change, only its `KIND_*`
+  constant. `buddhabrot.wgsl` does the same with its own `override KIND`.
   `advance_delta(z, e)` is the per-kind delta step (`z` = reference point,
   `e` = current delta); the caller adds `step_add` (= `dc`) afterward — this
   relies on `c` being additive in every current kind's formula (a kind where
@@ -111,7 +125,10 @@ pixel is a handful of `f32` complex multiplies.
   matching `FractalKind` variant's discriminant exactly.
 - `src/fractal/renderer.rs` — `FractalRenderer` (wgpu pipelines, uniform +
   storage buffers, bind groups), `Uniforms` (repr(C) layout that must match
-  the WGSL `Uniforms` struct field-for-field, including padding), and
+  the WGSL `Uniforms` struct field-for-field, including padding; it includes
+  CPU-precomputed data: `cm_coef`, the Complex Multibrot binomial
+  coefficients from `app.rs::complex_binomials`, and `light_count` for the
+  packed `GpuLight` buffer from `lights.rs::gpu_lights`), and
   `FractalCallback` (the `egui_wgpu::CallbackTrait` impl: `prepare()` uploads
   changed buffers and decides whether to re-run the iterate pass, the cheap
   colourise pass, or just blit the cached texture). Also `ExportRender`, a
@@ -168,7 +185,18 @@ histogram buffer, tone-mapped by a fragment pass every frame. Its own
 The interactive path splits iteration (expensive, perturbation) from
 colourising (cheap, palette remap) into separate offscreen textures, so
 palette/color-scale/offset tweaks skip re-iteration entirely (`geom_differs`
-vs `color_differs` in `renderer.rs` decide which pass reruns). While the user
-is actively panning/zooming, the app renders downscaled with AA off
-(`INTERACT_DOWNSCALE`) and snaps back to full resolution once input settles
-(`INTERACT_SETTLE`).
+vs `color_differs` in `renderer.rs` decide which pass reruns). A frame where
+neither differs uploads and renders nothing and only blits. So any new
+uniform field must go into one of those two functions (or the lights
+comparison), or changing it won't redraw.
+
+AA is **adaptive** on the interactive path. `fs_data` always iterates 1
+sample per pixel. When AA is on, `fs_refine` reads that texture and runs the
+2×2 grid only on pixels whose 4-neighbours differ (interior/exterior edge, or
+`ci`/DE beyond `AA_CI_EPS`/`AA_DE_EPS`), copying the rest. Colourise then
+reads the refined texture. PNG export (`fs_color`) still supersamples every
+pixel.
+
+While the user is actively panning/zooming, the app renders downscaled with
+AA off (`INTERACT_DOWNSCALE`) and snaps back to full resolution once input
+settles (`INTERACT_SETTLE`).

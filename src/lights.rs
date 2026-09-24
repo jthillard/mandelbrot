@@ -60,3 +60,35 @@ impl Light {
         .inner
     }
 }
+
+/// GPU-side light, matching WGSL `Light` in `iterate_uniforms.wgsl`: the unit
+/// direction toward the light (precomputed from azimuth/altitude so the
+/// shader does no per-pixel trig) plus the packed RGBA colour, whose alpha is
+/// the intensity. 16 bytes, so `array<Light, 16>` has a uniform-legal stride.
+#[derive(Clone, Copy, PartialEq, Zeroable, Pod, Default)]
+#[repr(C)]
+pub struct GpuLight {
+    pub dir: [f32; 3],
+    pub color: Color32,
+}
+
+/// The light buffer's contents: the UI lights with a non-zero colour (the
+/// only ones that contribute, and the ones the filmic white point counts),
+/// packed to the front, plus how many there are (`Uniforms::light_count`).
+pub fn gpu_lights(lights: &[Light]) -> ([GpuLight; MAX_LIGHT_COUNT], u32) {
+    let mut out = [GpuLight::default(); MAX_LIGHT_COUNT];
+    let mut n = 0;
+    for l in lights.iter().filter(|l| l.color != Color32::TRANSPARENT) {
+        if n == MAX_LIGHT_COUNT {
+            break;
+        }
+        let (sa, ca) = l.altitude.sin_cos();
+        let (sz, cz) = l.azimuth.sin_cos();
+        out[n] = GpuLight {
+            dir: [cz * ca, sz * ca, sa],
+            color: l.color,
+        };
+        n += 1;
+    }
+    (out, n as u32)
+}

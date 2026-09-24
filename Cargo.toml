@@ -41,4 +41,4 @@ opt-level = 1
 opt-level = 3
 
 [dev-dependencies]
-naga = { version = "30", features = ["wgsl-in"] }
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }

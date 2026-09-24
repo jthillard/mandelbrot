@@ -64,9 +64,9 @@ pub fn run(cli: Cli) -> Result<(), String> {
     let (device, queue) = pollster::block_on(request_device())?;
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let renderer = FractalRenderer::new(&device, format);
-    let (pipeline, bind_group_layout, format) = renderer.export_handles();
-
     let uniforms = app.make_uniforms(width as f64 / height as f64);
+    let (pipeline, bind_group_layout, format) = renderer.export_handles(&device, &uniforms);
+
     let er = ExportRender::new(
         &device,
         &queue,
@@ -141,7 +141,10 @@ fn run_animation(
     let (device, queue) = pollster::block_on(request_device())?;
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let renderer = FractalRenderer::new(&device, format);
-    let (pipeline, bind_group_layout, format) = renderer.export_handles();
+    // Only the camera animates, so the shader specialization (kind, Julia,
+    // DE) is the same for every frame.
+    let (pipeline, bind_group_layout, format) =
+        renderer.export_handles(&device, &app.make_uniforms(width as f64 / height as f64));
 
     for i in 0..frames {
         let raw_t = i as f64 / (frames - 1) as f64;

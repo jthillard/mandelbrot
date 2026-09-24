@@ -15,7 +15,7 @@ use crate::fractal::{
     FractalKind, FractalRenderer, MAX_REF_POINTS, ShareState, Uniforms, compute_reference,
     compute_set_reference,
 };
-use crate::lights::Light;
+use crate::lights::{Light, gpu_lights};
 use crate::view::parse_half_height_spec;
 use crate::view::parse_re_im_spec;
 use crate::view::{
@@ -757,6 +757,9 @@ impl FractalApp {
         ViewState::with_center(big_from_f64(cr, 53), big_from_f64(ci, 53), hh)
     }
 
+    /// The request key for the current state. Its `iter` is the reference
+    /// length to compute, which carries headroom over `max_iterations` (see
+    /// [`reference_iterations`]).
     fn current_key(&self) -> RequestKey {
         RequestKey {
             center_re: self.view.center_re.clone(),
@@ -766,7 +769,7 @@ impl FractalApp {
             julia_c: self.julia_c,
             phoenix_p: self.phoenix_p,
             lambda_l: self.lambda_l,
-            iter: self.max_iterations,
+            iter: reference_iterations(self.max_iterations),
             kind: self.kind,
             power: self.power,
             complex_power: self.complex_power,
@@ -792,7 +795,12 @@ impl FractalApp {
             || key.julia_c != self.julia_c
             || key.phoenix_p != self.phoenix_p
             || key.lambda_l != self.lambda_l
-            || key.iter != self.max_iterations
+            // The reference is computed with headroom, so it keeps serving
+            // while auto-iterations creep up during a zoom (the shader clamps
+            // to `max_iterations`); only recompute once it's too short, or
+            // far longer than needed.
+            || self.max_iterations > key.iter
+            || self.max_iterations.saturating_mul(4) < key.iter
             || key.kind != self.kind
             || key.power != self.power
             || key.complex_power != self.complex_power
@@ -935,8 +943,10 @@ impl FractalApp {
             self.max_iterations = self.auto_iteration_count();
         }
         let mut key = self.current_key();
+        // One-shot render: no later frames for iteration headroom to serve.
+        key.iter = self.max_iterations.min(MAX_REF_POINTS as u32 - 1);
         let precision = self.view.precision_bits();
-        let max_iter = key.iter.min(MAX_REF_POINTS as u32 - 1);
+        let max_iter = key.iter;
 
         // Lambda in Set mode has a static fractal centered at origin.
         if key.kind == FractalKind::Lambda && !key.julia {
@@ -1014,8 +1024,9 @@ impl FractalApp {
                 .inverse()
                 .to_cols_array(),
             screen_dim: self.screen_dim,
+            light_count: gpu_lights(&self.lights).1,
+            cm_coef: complex_binomials(self.complex_power),
             _pad: [0; _],
-            _pad2: [0; _],
             _pad3: [0; _],
         }
     }
@@ -1086,7 +1097,7 @@ impl FractalApp {
                 self.status = Some("export unavailable".into());
                 return;
             };
-            renderer.export_handles()
+            renderer.export_handles(&device, &uniforms)
         };
         let reference = Arc::clone(&self.reference);
         let lights = self.lights.clone();
@@ -2387,7 +2398,7 @@ impl FractalApp {
             rect,
             FractalCallback {
                 uniforms,
-                lights: self.lights.clone(),
+                lights: gpu_lights(&self.lights).0,
                 reference: Arc::clone(&self.reference),
                 generation: self.generation,
                 size_px,
@@ -2439,6 +2450,37 @@ impl eframe::App for FractalApp {
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(&mut *self)
     }
+}
+
+/// Reference-orbit length to request for `max_iterations`: 1.5× headroom
+/// (capped at the GPU buffer size). Auto-iterations grows with every zoom
+/// frame, and without headroom each tiny increase re-ran the whole
+/// high-precision orbit (plus a re-upload) on every frame of a zoom.
+fn reference_iterations(max_iterations: u32) -> u32 {
+    let cap = MAX_REF_POINTS as u32 - 1;
+    (max_iterations.saturating_add(max_iterations / 2)).min(cap)
+}
+
+/// Complex binomial coefficients `C(p, k)` for k = 1..16, packed two per row
+/// (odd k in `[0..2]`, even k in `[2..4]`) for `Uniforms::cm_coef`: the
+/// Complex Multibrot delta series' coefficients, which only depend on the
+/// power, so the shader doesn't rebuild them (with a complex division per
+/// term) on every iteration of every pixel. Built up in f64 via
+/// `C(p,k) = C(p,k-1) * (p - (k-1)) / k`.
+fn complex_binomials(p: (f64, f64)) -> [[f32; 4]; 8] {
+    let mut out = [[0.0f32; 4]; 8];
+    let (mut cr, mut ci) = (1.0f64, 0.0f64); // C(p, 0)
+    for k in 1..=16usize {
+        // (cr + i ci) * ((p.0 - (k-1)) + i p.1) / k
+        let (ar, ai) = (p.0 - (k - 1) as f64, p.1);
+        let kf = k as f64;
+        (cr, ci) = ((cr * ar - ci * ai) / kf, (cr * ai + ci * ar) / kf);
+        let row = &mut out[(k - 1) / 2];
+        let col = if k % 2 == 1 { 0 } else { 2 };
+        row[col] = cr as f32;
+        row[col + 1] = ci as f32;
+    }
+    out
 }
 
 /// Update an export's progress (phase label + fraction).

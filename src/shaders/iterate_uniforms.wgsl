@@ -35,11 +35,18 @@ struct Uniforms {
     shadow: u32,
     // camera direction vector
     camera_direction: vec3<f32>,
+    // Number of live entries at the start of `lights` (fills the vec3's tail
+    // padding slot).
+    light_count: u32,
     // inverse of the camera's view-projection matrix, for reconstructing a
     // world-space ray origin per pixel in the raymarcher
     camera_inv_proj: mat4x4<f32>,
     // Screen dimensions
-    screen_dim: vec2<f32>
+    screen_dim: vec2<f32>,
+    // Complex binomial coefficients C(complex_power, k) for k = 1..16, two per
+    // vec4 (k odd in .xy, k even in .zw), for the Complex Multibrot delta
+    // series. Precomputed on the CPU since they only depend on the power.
+    cm_coef: array<vec4<f32>, 8>,
 };
 
 // Smooth cyclic palettes (Inigo Quilez cosine palettes), selected by id.
@@ -74,20 +81,21 @@ fn classic_color(ci: f32, de: f32) -> vec3<f32> {
     return palette(u.palette_id, t) * sqrt(de);
 }
 
-// A single directional/point light, set by the UI's light list. `color`'s
-// alpha channel doubles as intensity (see `shadow_color`'s use of
-// `light_color.a`). Each shader that binds a `lights: array<Light, 16>`
-// uniform (colorize.wgsl, mandelbrot.wgsl's export shadow path) uses this
-// same layout.
+// A single directional light, built on the CPU from the UI's light list
+// (`GpuLight` in lights.rs): `dir` is the unit direction toward the light
+// (precomputed from azimuth/altitude so the shader does no trig), `color` a
+// packed RGBA8 whose alpha doubles as intensity. Only the first
+// `u.light_count` entries are live, all with a non-zero colour. Each shader
+// that binds a `lights: array<Light, 16>` uniform (colorize.wgsl,
+// mandelbrot.wgsl's export shadow path) uses this same layout.
 struct Light {
-    azimuth: f32,
-    altitude: f32,
+    dir: vec3<f32>,
     color: u32,
-    _pad: u32,
 };
 
+// Lambertian term for a unit `light` direction.
 fn compute_light(normal: vec3<f32>, light: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(max(0., dot(normal, normalize(light))));
+    return vec3<f32>(max(0., dot(normal, light)));
 }
 
 fn uncharted2tonemap(x: vec3<f32>) -> vec3<f32> {
@@ -139,27 +147,20 @@ fn normal_from_heights(h0: f32, h1: f32, h2: f32) -> vec3<f32> {
 fn shadow_color(normal: vec3<f32>) -> vec3<f32> {
     var color: vec3<f32>;
     if u.shadow_palette_id == 0u {
-        color = compute_light(normal, vec3<f32>(.5, .5, .5)) + vec3<f32>(0.58, 0.85, 1.) * 0.2;
+        color = compute_light(normal, vec3<f32>(0.57735027, 0.57735027, 0.57735027)) + vec3<f32>(0.58, 0.85, 1.) * 0.2;
 
         color = filmic(color, 2.5);
         color = contrast(color, 4., 0.67);
     } else if u.shadow_palette_id == 1u {
-        color = compute_light(normal, vec3<f32>(0., .5, .5)) * vec3<f32>(1., 0.5, 0.5) + compute_light(normal, vec3<f32>(0.5, 0., .5)) * vec3<f32>(0.5, 1., 1.);
+        color = compute_light(normal, vec3<f32>(0., 0.70710678, 0.70710678)) * vec3<f32>(1., 0.5, 0.5) + compute_light(normal, vec3<f32>(0.70710678, 0., 0.70710678)) * vec3<f32>(0.5, 1., 1.);
 
         color = filmic(color, 4.2);
     } else {
         color = vec3<f32>(0);
-        var light_count = 0;
-        for (var i = 0u; i < 16; i++) {
+        let light_count = min(u.light_count, 16u);
+        for (var i = 0u; i < light_count; i++) {
             let light_color = unpack4x8unorm(lights[i].color);
-            if any(light_color != vec4<f32>(0)) {
-                light_count   += 1;
-            }
-
-            color   += compute_light(normal, vec3<f32>(
-                cos(lights[i].azimuth) * cos(lights[i].altitude),
-                sin(lights[i].azimuth) * cos(lights[i].altitude),
-                sin(lights[i].altitude))) * light_color.xyz * light_color.a;
+            color += compute_light(normal, lights[i].dir) * light_color.xyz * light_color.a;
         }
 
         color = filmic(color, 1. + f32(light_count));
