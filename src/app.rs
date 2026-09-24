@@ -366,9 +366,13 @@ pub struct FractalApp {
     ref_center_re: Big,
     ref_center_im: Big,
     ref_half_height: f64,
-    /// Kind-switch morph the current `reference` was computed with. The shader
-    /// blends with this (not the live morph) so its delta formula always
-    /// matches the orbit, even while the worker lags a frame behind.
+    /// Kind and kind-switch morph the current `reference` was computed with.
+    /// The shader iterates with these (not the live kind/morph) so its delta
+    /// formula always matches the orbit, even while the worker lags a frame
+    /// behind — otherwise a kind switch flashes the new kind, unblended, for
+    /// the frame(s) before the morphed reference arrives. `None` until the
+    /// first reference lands.
+    ref_kind: Option<FractalKind>,
     ref_morph: Option<(FractalKind, f32)>,
     /// Parameters of the most recent reference request (drift baseline / dedupe).
     last_request: Option<RequestKey>,
@@ -518,6 +522,7 @@ impl FractalApp {
             ref_center_re,
             ref_center_im,
             ref_half_height,
+            ref_kind: None,
             ref_morph: None,
             last_request: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -893,9 +898,11 @@ impl FractalApp {
         cre: Big,
         cim: Big,
         hh: f64,
+        kind: FractalKind,
         morph: Option<(FractalKind, f32)>,
     ) {
         self.reference = Arc::new(points);
+        self.ref_kind = Some(kind);
         self.ref_morph = morph;
         self.ref_center_re = cre;
         self.ref_center_im = cim;
@@ -989,6 +996,7 @@ impl FractalApp {
                     key.center_re.clone(),
                     key.center_im.clone(),
                     key.half_height,
+                    key.kind,
                     key.morph,
                 );
             }
@@ -1003,6 +1011,7 @@ impl FractalApp {
                 res.center_re,
                 res.center_im,
                 res.half_height,
+                res.kind,
                 res.morph,
             );
             self.pending = false;
@@ -1067,6 +1076,7 @@ impl FractalApp {
             key.center_re.clone(),
             key.center_im.clone(),
             key.half_height,
+            key.kind,
             key.morph,
         );
         self.last_request = Some(key);
@@ -1125,7 +1135,7 @@ impl FractalApp {
             palette_id: self.palette,
             shadow_palette_id: self.shadow_palette,
             aa_level: if self.antialias { 2 } else { 1 },
-            kind: self.kind as u32,
+            kind: self.ref_kind.unwrap_or(self.kind) as u32,
             power: self.power,
             morph_from: self.ref_morph.map_or(0, |(k, _)| k as u32),
             dc_offset: self.dc_offset(),
@@ -2534,8 +2544,12 @@ impl FractalApp {
         self.screen_dim = [rect.width(), rect.height()];
         self.camera.set_aspect_ratio(aspect as f32);
         let mut uniforms = self.make_uniforms(aspect);
-        if interacting {
-            uniforms.aa_level = 1; // supersampling is wasted on the low-res pass
+        // Supersampling is wasted on the low-res pass, and on a kind-switch
+        // morph (every frame re-iterates, and the blend moves on next frame).
+        // `ref_morph` too: the last morphed reference outlives `morph` by a
+        // frame or so, until the worker delivers the plain one.
+        if interacting || self.morph.is_some() || self.ref_morph.is_some() {
+            uniforms.aa_level = 1;
         }
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,

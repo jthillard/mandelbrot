@@ -37,7 +37,9 @@ pub struct RefResult {
     pub center_im: Big,
     pub half_height: f64,
     pub points: Vec<[f32; 2]>,
-    /// The morph `points` was computed with (echoed from the request).
+    /// The kind and morph `points` was computed with (echoed from the
+    /// request).
+    pub kind: FractalKind,
     pub morph: Option<(FractalKind, f32)>,
 }
 
@@ -72,6 +74,7 @@ impl RefWorker {
                             center_im: req.center_im,
                             half_height: req.half_height,
                             points,
+                            kind: req.kind,
                             morph: req.morph,
                         })
                         .is_err()
