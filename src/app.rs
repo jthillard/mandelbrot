@@ -992,8 +992,41 @@ impl FractalApp {
         self.last_request = Some(key);
     }
 
+    /// The rendering mode the shaders should use this frame: 3D for as long
+    /// as the 2D <-> 3D camera transition is in flight (the raymarcher, and
+    /// the DE heights it reads, stay on until the camera is back top-down),
+    /// otherwise the selected mode.
+    fn effective_rendering_mode(&self) -> u32 {
+        if self.anim.camera_state > 0.0 {
+            2
+        } else {
+            self.rendering_mode
+        }
+    }
+
+    /// 3D-mode zoom toward the screen point `off` (points from the widget
+    /// center): unproject it through the camera onto the z = 0 fractal plane,
+    /// then zoom the 2D view about the matching fractal-texture pixel.
+    fn zoom_3d_at(&mut self, off: egui::Vec2, rect: egui::Rect, height_px: f64, factor: f64) {
+        let ndc = (off / rect.size()) * 2.;
+        let camera_ndc_pos = self.camera.orthographic(self.anim.camera_state).inverse()
+            * Vec4::new(ndc.x, ndc.y, 0., 1.);
+        let view_direction = self.camera.direction(self.anim.camera_state);
+
+        let z_move = camera_ndc_pos.z / view_direction.z;
+
+        let ndc_pos = camera_ndc_pos.xyz() + view_direction * -z_move;
+
+        let pos = egui::Vec2::new(ndc_pos.x / self.camera.aspect_ratio, ndc_pos.y) * rect.size()
+            - rect.center().to_vec2();
+
+        self.view
+            .zoom_at_pixel(pos.x as f64, pos.y as f64, height_px, factor);
+    }
+
     pub(crate) fn make_uniforms(&self, aspect: f64) -> Uniforms {
         let (span_x, span_y) = self.view.span(aspect);
+        let mode = self.effective_rendering_mode();
         Uniforms {
             span: [span_x as f32, span_y as f32],
             max_iter: self.max_iterations.min(MAX_REF_POINTS as u32 - 1),
@@ -1011,12 +1044,8 @@ impl FractalApp {
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
             complex_power: [self.complex_power.0 as f32, self.complex_power.1 as f32],
-            de_coloring: (self.de_coloring | (self.rendering_mode > 0)) as u32,
-            rendering_mode: if self.anim.camera_state > 0.0 {
-                2
-            } else {
-                self.rendering_mode
-            },
+            de_coloring: (self.de_coloring || mode > 0) as u32,
+            rendering_mode: mode,
             camera_direction: self.camera.direction(self.anim.camera_state).to_array(),
             camera_inv_proj: self
                 .camera
@@ -2099,36 +2128,19 @@ impl FractalApp {
             if let Some(mt) = multi_touch {
                 let t = mt.translation_delta;
                 if t.x != 0.0 || t.y != 0.0 {
-                    self.camera.rotate(t.x * ROT_SENS, -t.y * ROT_SENS);
+                    self.camera.rotate(-t.x * ROT_SENS, -t.y * ROT_SENS);
                     interacted = true;
                 }
                 if mt.zoom_delta != 1.0 {
-                    let ndc = (mt.center_pos.to_vec2() / rect.size()) * 2.;
-                    let camera_ndc_pos = self.camera.orthographic(self.anim.camera_state).inverse()
-                        * Vec4::new(ndc.x, ndc.y, 0., 1.);
-                    let view_direction = self.camera.direction(self.anim.camera_state);
-
-                    let z_move = camera_ndc_pos.z / view_direction.z;
-
-                    let ndc_pos = camera_ndc_pos.xyz() + view_direction * -z_move;
-
-                    let pos = egui::Vec2::new(ndc_pos.x / self.camera.aspect_ratio, ndc_pos.y)
-                        * rect.size()
-                        - rect.center().to_vec2();
-
-                    self.view.zoom_at_pixel(
-                        pos.x as f64,
-                        pos.y as f64,
-                        height_px,
-                        1. / (mt.zoom_delta as f64),
-                    );
+                    let off = mt.center_pos - rect.center();
+                    self.zoom_3d_at(off, rect, height_px, 1. / (mt.zoom_delta as f64));
                     interacted = true;
                 }
                 ui.ctx().request_repaint();
             } else if response.dragged() {
                 let d = response.drag_delta();
                 if d.x != 0.0 || d.y != 0.0 {
-                    self.camera.rotate(d.x * ROT_SENS, -d.y * ROT_SENS);
+                    self.camera.rotate(-d.x * ROT_SENS, -d.y * ROT_SENS);
                 }
             }
         } else if let Some(mt) = multi_touch {
@@ -2165,21 +2177,7 @@ impl FractalApp {
             let factor = (-scroll_y as f64 * 0.0015).exp();
             let off = pos - rect.center();
             if self.rendering_mode == 2 {
-                let ndc = (off / rect.size()) * 2.;
-                let camera_ndc_pos = self.camera.orthographic(self.anim.camera_state).inverse()
-                    * Vec4::new(ndc.x, ndc.y, 0., 1.);
-                let view_direction = self.camera.direction(self.anim.camera_state);
-
-                let z_move = camera_ndc_pos.z / view_direction.z;
-
-                let ndc_pos = camera_ndc_pos.xyz() + view_direction * -z_move;
-
-                let pos = egui::Vec2::new(ndc_pos.x / self.camera.aspect_ratio, ndc_pos.y)
-                    * rect.size()
-                    - rect.center().to_vec2();
-
-                self.view
-                    .zoom_at_pixel(pos.x as f64, pos.y as f64, height_px, factor);
+                self.zoom_3d_at(off, rect, height_px, factor);
             } else {
                 self.view
                     .zoom_at_pixel(off.x as f64, off.y as f64, height_px, factor);
@@ -2384,7 +2382,7 @@ impl FractalApp {
             (((rect.height() * ppp).round() as u32) / downscale).max(1),
         ];
 
-        if self.rendering_mode == 2 {
+        if self.effective_rendering_mode() == 2 {
             size_px = [size_px[0] * 2, size_px[1] * 2];
         }
 

@@ -1,4 +1,4 @@
-use std::f32::consts::PI;
+use std::f32::consts::{PI, TAU};
 
 use glam::Vec3;
 
@@ -32,9 +32,11 @@ impl Camera {
 
     /// Adjust yaw/pitch by the given deltas (radians). Pitch is clamped just
     /// short of straight up/down to avoid the view flipping past the pole.
+    /// Yaw is wrapped to [-π, π) so the 2D <-> 3D transition (which scales
+    /// yaw by `t`) always unwinds the short way instead of every past turn.
     pub fn rotate(&mut self, dyaw: f32, dpitch: f32) {
         const PITCH_LIMIT: f32 = PI / 2.0 - 0.01;
-        self.yaw += dyaw;
+        self.yaw = (self.yaw + dyaw + PI).rem_euclid(TAU) - PI;
         self.pitch = (self.pitch + dpitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
@@ -64,9 +66,8 @@ impl Camera {
         let yaw = self.yaw * t;
         let pitch = self.pitch * t;
 
-        let forward = glam::Mat3::from_rotation_z(-yaw)
-            * glam::Mat3::from_rotation_x(-pitch)
-            * glam::Vec3::Z;
+        let forward =
+            glam::Mat3::from_rotation_z(-yaw) * glam::Mat3::from_rotation_x(-pitch) * glam::Vec3::Z;
 
         forward.normalize()
     }

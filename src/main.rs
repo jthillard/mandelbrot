@@ -123,9 +123,7 @@ fn main() {
             match result {
                 Ok(_) => loading.remove(),
                 Err(e) => {
-                    loading.set_inner_html(
-                        &format!("<p>The app has crashed.</br>{e:?}</p>"),
-                    );
+                    loading.set_inner_html(&format!("<p>The app has crashed.</br>{e:?}</p>"));
                     log::error!("failed to start eframe: {e:?}");
                 }
             }
