@@ -27,6 +27,16 @@ pub const MAX_REF_POINTS: usize = 1 << 17;
 /// no `float32-filterable` feature is needed.
 const DATA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
+/// Cap on the interactive cache's pixel count (the texture is scaled down,
+/// aspect kept, above it). Each pixel costs 36 bytes across the data, AA and
+/// colour textures, and the 3D view renders at 2× per axis, so a HiDPI screen
+/// in 3D would otherwise want 0.5 GB+. Browsers cap WebGPU memory well below
+/// what native gets, so the web budget is ~4K (≈300 MB); native, ~8K.
+#[cfg(target_arch = "wasm32")]
+const MAX_CACHE_PIXELS: u32 = 3840 * 2160;
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_CACHE_PIXELS: u32 = 7680 * 4320;
+
 /// True when the two uniforms differ in any field the iteration pass depends on
 /// (i.e. anything except the palette / colour scale / offset / camera).
 fn geom_differs(a: &Uniforms, b: &Uniforms) -> bool {
@@ -216,21 +226,21 @@ pub struct Uniforms {
 /// Offscreen textures for the two-pass render, recreated whenever the widget's
 /// pixel size changes:
 /// * `data_view` — the 1-spp iteration pass's output (see [`DATA_FORMAT`]).
-/// * `data_aa_view` — the adaptive-AA refine pass's output (only when AA is on).
+/// * `aa` — the adaptive-AA refine pass's output (only when AA is on).
 /// * `color_view` — the colourise pass's output; the blit source.
 ///   plus the bind groups that read them.
 struct CacheTarget {
     /// Kept so they can be `destroy()`ed on resize (see `ensure_cache`).
-    textures: [wgpu::Texture; 3],
+    textures: Vec<wgpu::Texture>,
     data_view: wgpu::TextureView,
-    data_aa_view: wgpu::TextureView,
     color_view: wgpu::TextureView,
     /// Refine pass input (group 1): the 1-spp data texture.
     refine_bind_group: wgpu::BindGroup,
     /// Colourise pass input: uniforms + the 1-spp data texture.
     colorize_bind_group: wgpu::BindGroup,
-    /// Colourise pass input when AA is on: uniforms + the refined texture.
-    colorize_aa_bind_group: wgpu::BindGroup,
+    /// Refine pass output + the colourise bind group reading it. Only
+    /// allocated while AA is on: it's a second full-size `Rgba32Float`.
+    aa: Option<(wgpu::TextureView, wgpu::BindGroup)>,
     /// Blit pass input: the colour texture + sampler.
     blit_bind_group: wgpu::BindGroup,
     width: u32,
@@ -595,12 +605,14 @@ impl FractalRenderer {
         }
     }
 
-    /// Ensure the cache texture exists at `width`×`height`. Recreates it (and its
-    /// blit bind group) on a size change, invalidating any previous render.
-    fn ensure_cache(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+    /// Ensure the cache textures exist at `width`×`height` (plus the AA refine
+    /// target iff `aa`). Recreates them (and their bind groups) on a change,
+    /// invalidating any previous render.
+    fn ensure_cache(&mut self, device: &wgpu::Device, width: u32, height: u32, aa: bool) {
         if let Some(c) = &self.cache
             && c.width == width
             && c.height == height
+            && c.aa.is_some() == aa
         {
             return;
         }
@@ -638,17 +650,19 @@ impl FractalRenderer {
         let data_view = data_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Adaptive-AA output: same format, written by the refine pass.
-        let data_aa_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("fractal data (AA)"),
-            size: extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DATA_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+        let data_aa_texture = aa.then(|| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("fractal data (AA)"),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DATA_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
         });
-        let data_aa_view = data_aa_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Colour texture (colourise output; blit source).
         let color_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -684,7 +698,11 @@ impl FractalRenderer {
             })
         };
         let colorize_bind_group = colorize_bind_group_for(&data_view);
-        let colorize_aa_bind_group = colorize_bind_group_for(&data_aa_view);
+        let aa_target = data_aa_texture.as_ref().map(|t| {
+            let view = t.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = colorize_bind_group_for(&view);
+            (view, bind_group)
+        });
 
         let refine_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("refine bind group"),
@@ -711,13 +729,15 @@ impl FractalRenderer {
         });
 
         self.cache = Some(CacheTarget {
-            textures: [data_texture, data_aa_texture, color_texture],
+            textures: [Some(data_texture), data_aa_texture, Some(color_texture)]
+                .into_iter()
+                .flatten()
+                .collect(),
             data_view,
-            data_aa_view,
             color_view,
             refine_bind_group,
             colorize_bind_group,
-            colorize_aa_bind_group,
+            aa: aa_target,
             blit_bind_group,
             width,
             height,
@@ -1315,12 +1335,16 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
         // (the iterate pass maps pixels through NDC, so the view is unchanged;
         // the blit just upsamples). The 2× 3D supersample on a large/HiDPI
         // screen can otherwise exceed it.
+        // Also cap the total pixel count (`MAX_CACHE_PIXELS`), same way.
         let max_dim = device.limits().max_texture_dimension_2d;
         let [w, h] = self.size_px.map(|v| v.max(1));
-        let scale = (max_dim as f64 / w.max(h) as f64).min(1.0);
+        let scale = (max_dim as f64 / w.max(h) as f64)
+            .min((MAX_CACHE_PIXELS as f64 / (w as f64 * h as f64)).sqrt())
+            .min(1.0);
         let width = ((w as f64 * scale) as u32).clamp(1, max_dim);
         let height = ((h as f64 * scale) as u32).clamp(1, max_dim);
-        renderer.ensure_cache(device, width, height);
+        let aa = self.uniforms.aa_level > 1;
+        renderer.ensure_cache(device, width, height, aa);
 
         // Iteration (expensive) re-runs only when the geometry inputs change;
         // colourise (cheap) re-runs when it did, or when only a colour/camera/
@@ -1372,7 +1396,6 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
             renderer.uploaded_lights = Some(self.lights);
         }
 
-        let aa = self.uniforms.aa_level > 1;
         if iter_dirty {
             renderer.ensure_pipelines(device, PipelineKey::from_uniforms(&self.uniforms));
         }
@@ -1387,12 +1410,12 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
                     &pipelines.iterate,
                     &[&renderer.bind_group],
                 );
-                if aa {
+                if let Some((data_aa_view, _)) = &cache.aa {
                     // Adaptive AA: supersample only the non-smooth pixels.
                     data_pass(
                         egui_encoder,
                         "fractal AA refine pass",
-                        &cache.data_aa_view,
+                        data_aa_view,
                         &pipelines.refine,
                         &[&renderer.bind_group, &cache.refine_bind_group],
                     );
@@ -1400,11 +1423,10 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
             }
 
             // Colourise pass: data texture → colour texture.
-            let colorize_bind_group = if aa {
-                &cache.colorize_aa_bind_group
-            } else {
-                &cache.colorize_bind_group
-            };
+            let colorize_bind_group = cache
+                .aa
+                .as_ref()
+                .map_or(&cache.colorize_bind_group, |(_, bg)| bg);
             data_pass(
                 egui_encoder,
                 "fractal colorize pass",
