@@ -292,18 +292,22 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     // seeds the delta and nothing is added per step.
     var step_add = offset;
     var e = vec2<f32>(0.0, 0.0);
-    // Orbit derivative for distance estimation. For the set plane it is d/dc
-    // (starts at 0, gains +1 each step); for Julia it is d/dz0 (starts at 1).
-    var dz = vec2<f32>(0.0, 0.0);
+    // Orbit derivative for distance estimation, pre-multiplied by the pixel
+    // size `px`. For the set plane it is px·d/dc (starts at 0, gains +px each
+    // step); for Julia it is px·d/dz0 (starts at px). The raw derivative grows
+    // like 1/px, so unscaled its square overflows f32 at deep zoom (~1e-12),
+    // which zeroed DE along iteration bands; scaled, it stays ~|z|ln|z| / DE
+    // in pixels at any depth.
+    var dzs = vec2<f32>(0.0, 0.0);
     if IS_JULIA {
         step_add = vec2<f32>(0.0, 0.0);
         e = offset;
-        dz = vec2<f32>(1.0, 0.0);
+        dzs = vec2<f32>(px, 0.0);
     }
     // Previous-iterate state for the Phoenix two-term recurrence (delta of
-    // y_{n-1}, and its derivative for DE). Both start at 0 (y_{-1} = 0).
+    // y_{n-1}, and its scaled derivative for DE). Both start at 0 (y_{-1} = 0).
     var e_prev = vec2<f32>(0.0, 0.0);
-    var dz_prev = vec2<f32>(0.0, 0.0);
+    var dzs_prev = vec2<f32>(0.0, 0.0);
 
     var m: u32 = 0u;              // reference index; invariant: y_n = xm + e, xm = X[m]
     var n: u32 = 0u;              // total iteration count
@@ -344,15 +348,15 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
             mult2 = mult2 * dot(fp, fp);
         }
         if DE {
-            var dz_new = cmul(fp, dz);
+            var dzs_new = cmul(fp, dzs);
             if !IS_JULIA {
-                dz_new.x = dz_new.x + 1.0;
+                dzs_new.x = dzs_new.x + px;
             }
             if KIND == KIND_PHOENIX {
-                dz_new = dz_new + cmul(u.phoenix_p, dz_prev);
-                dz_prev = dz;
+                dzs_new = dzs_new + cmul(u.phoenix_p, dzs_prev);
+                dzs_prev = dzs;
             }
-            dz = dz_new;
+            dzs = dzs_new;
         }
 
         // Advance the delta by this fractal's formula (+ dc for the set plane).
@@ -419,6 +423,15 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         return Sample(0.0, 1.0, false); // interior of the set
     }
 
+    // Both escape formulas below (smooth count, DE) assume |f(z)| ~ |z|^2 near
+    // escape. Lambda's λz(1-z) + c ~ -λz^2 adds a factor |λ| per step, which
+    // made both jump at every band boundary (contour lines in shadow/3D).
+    // w = -λz conjugates it to an exact w^2 + C, so measure |w| and |dw|.
+    var dzs_esc = dzs;
+    if KIND == KIND_LAMBDA {
+        z = cmul(u.lambda_l, z);
+        dzs_esc = cmul(u.lambda_l, dzs);
+    }
     z2 = dot(z, z);
 
     // Continuous (smooth) iteration count.
@@ -432,16 +445,15 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
 
     var de = 1.0;
     if DE {
-        // Exterior distance estimate (complex-plane units): |z|·ln|z| / |dz|.
-        // Divided by the pixel footprint it becomes a distance in pixels; we
-        // darken toward the boundary (< ~1 px away) so filaments stay crisp
-        // instead of aliasing into speckle. If |dz| overflowed, de -> 0 and the
-        // boundary simply reads as dark, which is the correct limit.
+        // Exterior distance estimate |z|·ln|z| / |dz|, already in pixels since
+        // `dzs` = px·dz. We darken toward the boundary (< ~1 px away) so
+        // filaments stay crisp instead of aliasing into speckle. If |dzs|
+        // overflowed (far sub-pixel from the set), de -> 0 and the boundary
+        // simply reads as dark, which is the correct limit.
         let zmag = sqrt(max(z2, 1.0));
-        let dzmag = sqrt(max(dot(dz, dz), 1e-20));
-        let d = zmag * log(zmag) / dzmag;
+        let dzmag = sqrt(max(dot(dzs_esc, dzs_esc), 1e-30));
         let max_de = select(1.0, 1000.0, u.shadow != 0u);
-        de = clamp(d / max(px, 1e-30), 0.0, max_de);
+        de = clamp(zmag * log(zmag) / dzmag, 0.0, max_de);
     }
     return Sample(ci, de, true);
 }
@@ -489,6 +501,20 @@ fn aggregate_sample(base: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, px: f32, aa: 
     return vec3<f32>(ci_avg, de_avg, interior_frac);
 }
 
+// Pixel footprint in complex units, |(|dx| + |dy|)|. Not `length()` directly:
+// that squares its argument, and below ~1e-19 per pixel (half-height ~1e-16,
+// sooner for the 2x-resolution 3D texture) the square drops under f32's
+// smallest normal and flushes to 0, making px = 0 and DE meaningless.
+// Normalizing by the largest component first keeps the square near 1.
+fn pixel_size(dx: vec2<f32>, dy: vec2<f32>) -> f32 {
+    let a = abs(dx) + abs(dy);
+    let m = max(a.x, a.y);
+    if m == 0.0 {
+        return 0.0;
+    }
+    return m * length(a / m);
+}
+
 // Iteration pass: write per-pixel escape data (color-independent) so a colour
 // change is remapped by the cheap colourise pass without re-iterating.
 //   R = ci (palette parameter), G = DE factor, B = interior fraction (for AA).
@@ -499,7 +525,7 @@ fn fs_data(in: VsOut) -> @location(0) vec4<f32> {
     let base = in.centered * u.span + u.dc_offset;
     let dx = dpdx(base);
     let dy = dpdy(base);
-    let px = length(abs(dx) + abs(dy));
+    let px = pixel_size(dx, dy);
 
     return vec4<f32>(aggregate_sample(base, dx, dy, px, 1u), 1.0);
 }
@@ -535,7 +561,7 @@ fn fs_refine(in: VsOut) -> @location(0) vec4<f32> {
     let base = in.centered * u.span + u.dc_offset;
     let dx = dpdx(base);
     let dy = dpdy(base);
-    let px = length(abs(dx) + abs(dy));
+    let px = pixel_size(dx, dy);
 
     let p = vec2<i32>(in.pos.xy);
     let hi = vec2<i32>(textureDimensions(coarse_tex)) - vec2<i32>(1, 1);
@@ -559,7 +585,7 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
     let base = in.centered * u.span + u.dc_offset;
     let dx = dpdx(base);
     let dy = dpdy(base);
-    let px = length(abs(dx) + abs(dy));
+    let px = pixel_size(dx, dy);
     let aa = max(u.aa_level, 1u);
 
     if u.shadow != 0u {
