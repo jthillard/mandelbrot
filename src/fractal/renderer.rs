@@ -208,6 +208,8 @@ pub struct Uniforms {
 /// * `color_view` — the colourise pass's output; the blit source.
 ///   plus the bind groups that read them.
 struct CacheTarget {
+    /// Kept so they can be `destroy()`ed on resize (see `ensure_cache`).
+    textures: [wgpu::Texture; 3],
     data_view: wgpu::TextureView,
     data_aa_view: wgpu::TextureView,
     color_view: wgpu::TextureView,
@@ -591,6 +593,19 @@ impl FractalRenderer {
             return;
         }
 
+        // Free the old textures explicitly. On the web backend dropping a
+        // `wgpu::Texture` does not release its GPU memory — that waits for the
+        // JS garbage collector — and this runs on every size change (including
+        // each switch in/out of the downscaled interactive resolution), so the
+        // stale Rgba32Float textures piled up until WebGPU ran out of memory.
+        // Any commands using them were submitted on earlier frames, and
+        // `destroy()` defers the actual free until those finish.
+        if let Some(old) = self.cache.take() {
+            for t in &old.textures {
+                t.destroy();
+            }
+        }
+
         let extent = wgpu::Extent3d {
             width,
             height,
@@ -684,6 +699,7 @@ impl FractalRenderer {
         });
 
         self.cache = Some(CacheTarget {
+            textures: [data_texture, data_aa_texture, color_texture],
             data_view,
             data_aa_view,
             color_view,
@@ -1132,8 +1148,15 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
             return Vec::new();
         };
 
-        let width = self.size_px[0].max(1);
-        let height = self.size_px[1].max(1);
+        // Clamp to the device's texture-size limit, keeping the aspect ratio
+        // (the iterate pass maps pixels through NDC, so the view is unchanged;
+        // the blit just upsamples). The 2× 3D supersample on a large/HiDPI
+        // screen can otherwise exceed it.
+        let max_dim = device.limits().max_texture_dimension_2d;
+        let [w, h] = self.size_px.map(|v| v.max(1));
+        let scale = (max_dim as f64 / w.max(h) as f64).min(1.0);
+        let width = ((w as f64 * scale) as u32).clamp(1, max_dim);
+        let height = ((h as f64 * scale) as u32).clamp(1, max_dim);
         renderer.ensure_cache(device, width, height);
 
         // Iteration (expensive) re-runs only when the geometry inputs change;
