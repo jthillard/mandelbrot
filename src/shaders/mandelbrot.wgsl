@@ -595,12 +595,12 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
         // neighbours a `dx`/`dy` step away.
         let here = aggregate_sample(base, dx, dy, px, aa);
         if here.z != 0.0 {
-            return vec4<f32>(0.1, 0.1, 0.1, 1.0);
+            return vec4<f32>(shadow_interior_color(), 1.0);
         }
         let right = aggregate_sample(base + dx, dx, dy, px, aa);
         let down = aggregate_sample(base + dy, dx, dy, px, aa);
         let normal = normal_from_heights(here.y, right.y, down.y);
-        return vec4<f32>(shadow_color(normal), 1.0);
+        return vec4<f32>(shadow_color(normal, here.x), 1.0);
     }
 
     let inv = 1.0 / f32(aa);

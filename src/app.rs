@@ -39,8 +39,13 @@ const INTERACT_DOWNSCALE: u32 = 2;
 const INTERACT_SETTLE: f64 = 0.12;
 /// Palette names; index maps to `palette_id` in the shader.
 const PALETTE_NAMES: &[&str] = &["Amber", "Rainbow", "Ember", "Lime", "Grayscale"];
-/// Shadow palette names; index maps to `palette_id` in the shader.
-const SHADOW_PALETTE_NAMES: &[&str] = &["Grayscale", "Red & Blue", "Custom lights"];
+/// Shadow palette names; index maps to `shadow_palette_id` in the shader.
+/// Append new entries: share links store the index.
+const SHADOW_PALETTE_NAMES: &[&str] = &["Grayscale", "Red & Blue", "Custom lights", "Classic"];
+/// Shadow palette lit by the user's `lights` list.
+const SHADOW_PALETTE_CUSTOM_LIGHTS: u32 = 2;
+/// Shadow palette that paints the classic escape-time palette, lit.
+const SHADOW_PALETTE_CLASSIC: u32 = 3;
 /// Buddhabrot tonemap style names; index maps to `BuddhabrotUniforms::palette`.
 const BUDDHA_PALETTE_NAMES: &[&str] = &["Nebula", "Yellow", "Grayscale"];
 
@@ -992,6 +997,13 @@ impl FractalApp {
         self.last_request = Some(key);
     }
 
+    /// Whether the classic escape-time palette (and its scale / offset /
+    /// palette controls) is in use: always in classic mode, and in shadow/3D
+    /// modes under the "Classic" shading palette.
+    fn uses_classic_palette(&self) -> bool {
+        self.rendering_mode == 0 || self.shadow_palette == SHADOW_PALETTE_CLASSIC
+    }
+
     /// The rendering mode the shaders should use this frame: 3D for as long
     /// as the 2D <-> 3D camera transition is in flight (the raymarcher, and
     /// the DE heights it reads, stay on until the camera is back top-down),
@@ -1801,7 +1813,16 @@ impl FractalApp {
         ui.separator();
         ui.add_space(4.);
 
-        if self.rendering_mode == 0 {
+        if self.rendering_mode != 0 {
+            egui::ComboBox::from_label("shading")
+                .selected_text(SHADOW_PALETTE_NAMES[self.shadow_palette as usize])
+                .show_ui(ui, |ui| {
+                    for (i, name) in SHADOW_PALETTE_NAMES.iter().enumerate() {
+                        ui.selectable_value(&mut self.shadow_palette, i as u32, *name);
+                    }
+                });
+        }
+        if self.uses_classic_palette() {
             ui.add(
                 egui::Slider::new(&mut self.color_scale, 0.01..=1.0)
                     .text("color scale")
@@ -1815,17 +1836,8 @@ impl FractalApp {
                         ui.selectable_value(&mut self.palette, i as u32, *name);
                     }
                 });
-        } else {
-            egui::ComboBox::from_label("palette")
-                .selected_text(SHADOW_PALETTE_NAMES[self.shadow_palette as usize])
-                .show_ui(ui, |ui| {
-                    for (i, name) in SHADOW_PALETTE_NAMES.iter().enumerate() {
-                        ui.selectable_value(&mut self.shadow_palette, i as u32, *name);
-                    }
-                });
         }
-        if self.rendering_mode > 0 && self.shadow_palette as usize == SHADOW_PALETTE_NAMES.len() - 1
-        {
+        if self.rendering_mode != 0 && self.shadow_palette == SHADOW_PALETTE_CUSTOM_LIGHTS {
             ui.horizontal(|ui| {
                 ui.label("lights:");
                 if ui.button("+").clicked() {
@@ -1848,7 +1860,7 @@ impl FractalApp {
         ui.add_space(4.);
 
         ui.collapsing("Animation", |ui| {
-            if self.rendering_mode == 0 {
+            if self.uses_classic_palette() {
                 ui.checkbox(&mut self.anim.color, "Cycle colours")
                     .on_hover_text("Scroll the palette offset over time.");
                 if self.anim.color {

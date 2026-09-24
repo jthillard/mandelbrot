@@ -25,7 +25,7 @@ fn shadow_fragment(pos: vec2<f32>) -> vec4<f32> {
     let size = textureDimensions(data_tex);
     let here = textureLoad(data_tex, vec2<i32>(x, y), 0);
     if here.b != 0. {
-        return vec4<f32>(0.1, 0.1, 0.1, 1.0);
+        return vec4<f32>(shadow_interior_color(), 1.0);
     }
     // Forward differences, except on the last column/row where x+1 / y+1
     // is off the texture: fall back to a backward difference, mirrored
@@ -45,7 +45,7 @@ fn shadow_fragment(pos: vec2<f32>) -> vec4<f32> {
         h2 = 2.0 * h0 - textureLoad(data_tex, vec2<i32>(x, y - 1), 0).g;
     }
     let normal = normal_from_heights(h0, h1, h2);
-    return vec4<f32>(shadow_color(normal), 1.0);
+    return vec4<f32>(shadow_color(normal, here.r), 1.0);
 }
 
 @fragment

@@ -141,10 +141,12 @@ fn normal_from_heights(h0: f32, h1: f32, h2: f32) -> vec3<f32> {
 }
 
 // Shade a DE-derived surface normal per `u.shadow_palette_id`: 0 = grayscale
-// key light, 1 = red/blue two-tone, 2 = the user's custom `lights` list.
+// key light, 1 = red/blue two-tone, 2 = the user's custom `lights` list,
+// 3 = the classic escape-time palette at `ci` (the smoothed iteration count),
+// lit by the grayscale key light.
 // Shared by the interactive shadow pass (colorize.wgsl) and the PNG-export
 // shadow path (mandelbrot.wgsl's `fs_color`), which must render identically.
-fn shadow_color(normal: vec3<f32>) -> vec3<f32> {
+fn shadow_color(normal: vec3<f32>, ci: f32) -> vec3<f32> {
     var color: vec3<f32>;
     if u.shadow_palette_id == 0u {
         color = compute_light(normal, vec3<f32>(0.57735027, 0.57735027, 0.57735027)) + vec3<f32>(0.58, 0.85, 1.) * 0.2;
@@ -155,6 +157,14 @@ fn shadow_color(normal: vec3<f32>) -> vec3<f32> {
         color = compute_light(normal, vec3<f32>(0., 0.70710678, 0.70710678)) * vec3<f32>(1., 0.5, 0.5) + compute_light(normal, vec3<f32>(0.70710678, 0., 0.70710678)) * vec3<f32>(0.5, 1., 1.);
 
         color = filmic(color, 4.2);
+    } else if u.shadow_palette_id == 3u {
+        // No DE darkening as in `classic_color`: in shadow/3D modes the DE
+        // is a height (clamped to 1000, not 1), and the lighting already
+        // shows the relief.
+        let t = fract(ci * u.color_scale + u.color_offset);
+        let ambient = 0.25;
+        let light = compute_light(normal, vec3<f32>(0.57735027, 0.57735027, 0.57735027));
+        color = palette(u.palette_id, t) * (ambient + (1.0 - ambient) * light);
     } else {
         color = vec3<f32>(0);
         let light_count = min(u.light_count, 16u);
@@ -166,4 +176,13 @@ fn shadow_color(normal: vec3<f32>) -> vec3<f32> {
         color = filmic(color, 1. + f32(light_count));
     }
     return color;
+}
+
+// Colour of an interior (non-escaped) pixel in shadow/3D modes: black under
+// the classic palette, like classic 2D mode, otherwise a dark gray plateau.
+fn shadow_interior_color() -> vec3<f32> {
+    if u.shadow_palette_id == 3u {
+        return vec3<f32>(0.0);
+    }
+    return vec3<f32>(0.1);
 }
