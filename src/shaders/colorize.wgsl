@@ -68,6 +68,9 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 }
 
+// Colour of rays that miss the fractal's footprint.
+const RAY_MISS: vec4<f32> = vec4<f32>(1.0, 0.0, 0.0, 1.0);
+
 // Per-frame constants of the raymarch, computed once per pixel in
 // `ray_marching` rather than on each of the up-to-100 `sdf` steps.
 struct MarchConsts {
@@ -126,27 +129,43 @@ fn ray_marching(pos: vec4<f32>) -> vec4<f32> {
     let ray_origin = world_pos.xyz;
     let ray_dir = u.camera_direction;
 
-    let z_intersect = ray_origin.z / ray_dir.z;
-    var p = ray_origin - ray_dir * z_intersect;
-    var i = 0u;
-    var dist = 0.0;
+    // Start where the ray crosses z = 0, the topmost possible surface (the
+    // camera pitch is clamped short of ±90°, so ray_dir.z > 0).
+    let start = ray_origin - ray_dir * (ray_origin.z / ray_dir.z);
 
-    let dist_threshold = 0.000001;
-    while i < 100u {
-        let from_origin = p - ray_origin;
-        if dot(from_origin, from_origin) > 9. {
-            break;
-        }
-        dist = sdf(p, k);
+    // The terrain only exists over the footprint x in [0, aspect],
+    // y in [0, 1]: clip the ray's xy to it up front, so rays that miss it cost
+    // nothing and the rest start marching at its edge. A huge finite 1/d on
+    // an axis the ray doesn't move along (top-down, during the 2D <-> 3D
+    // transition) keeps the slab maths finite.
+    let inv = select(1.0 / ray_dir.xy, vec2<f32>(1e30), abs(ray_dir.xy) < vec2<f32>(1e-20));
+    let ta = -start.xy * inv;
+    let tb = (vec2<f32>(aspect_ratio, 1.0) - start.xy) * inv;
+    let t_leave = min(max(ta.x, tb.x), max(ta.y, tb.y));
+    var t = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), 0.0);
+    if t >= t_leave {
+        return RAY_MISS;
+    }
+
+    // About 1/50 of a texel at typical sizes: tighter only adds steps
+    // without visibly moving the hit.
+    let dist_threshold = 0.00001;
+    var hit = false;
+    for (var i = 0u; i < 100u; i++) {
+        let dist = sdf(start + t * ray_dir, k);
         if dist < dist_threshold {
+            hit = true;
             break;
         }
-        p += dist * ray_dir;
-        i += 1u;
+        t += dist;
+        // Past the footprint's far edge: nothing left to hit.
+        if t >= t_leave {
+            break;
+        }
     }
-
-    if dist < dist_threshold {
-        return shadow_fragment(p.xy * k.to_texel);
+    // Shade outside the loop, so its registers don't weigh on the march.
+    if !hit {
+        return RAY_MISS;
     }
-    return vec4<f32>(1., 0., 0., 1.);
+    return shadow_fragment((start.xy + t * ray_dir.xy) * k.to_texel);
 }

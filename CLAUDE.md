@@ -204,6 +204,13 @@ sample per pixel. When AA is on, `fs_refine` reads that texture and runs the
 reads the refined texture. PNG export (`fs_color`) still supersamples every
 pixel.
 
+The 3D view (`colorize.wgsl::ray_marching`) sphere-traces the DE height
+field straight from the data texture. It's cheap: rays start on the z = 0
+plane, and most hit within a few steps (about 4 on average). A min-height
+mip pyramid (quadtree height-field tracing) was tried and measured about 3×
+slower, because it needs about 12 costlier steps per ray. Don't reintroduce it.
+Orbiting the camera only re-runs the colourise pass, never iteration.
+
 While the user is actively panning/zooming, the app renders downscaled with
 AA off (`INTERACT_DOWNSCALE`) and snaps back to full resolution once input
 settles (`INTERACT_SETTLE`).

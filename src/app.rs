@@ -2127,9 +2127,12 @@ impl FractalApp {
         if self.rendering_mode == 2 {
             if let Some(mt) = multi_touch {
                 let t = mt.translation_delta;
+                // Orbiting only moves the camera, which the colourise pass
+                // handles alone, so (like mouse-drag orbiting) it doesn't count
+                // as interaction: that would drop to the low-res pass and
+                // re-iterate the fractal twice.
                 if t.x != 0.0 || t.y != 0.0 {
                     self.camera.rotate(-t.x * ROT_SENS, -t.y * ROT_SENS);
-                    interacted = true;
                 }
                 if mt.zoom_delta != 1.0 {
                     let off = mt.center_pos - rect.center();
