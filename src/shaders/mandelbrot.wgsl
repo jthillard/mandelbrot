@@ -206,6 +206,49 @@ fn fprime(z: vec2<f32>) -> vec2<f32> {
     return 2.0 * z;
 }
 
+// Periodicity (interior) detection, Brent-style: the full orbit value is
+// saved at iterations PERIOD_FIRST_CHECK, 2x that, 4x ..., and every later
+// iterate is compared against the last saved one. Returning within
+// PERIOD_EPS2 (relative, squared) means the orbit has closed a cycle.
+//
+// A close return alone isn't trusted. A pixel just *outside* the set (at a
+// minibrot's edge, or a cusp) can shadow a cycle for thousands of iterations
+// before escaping. So three safeguards apply, tuned against an f64 simulation
+// of this exact algorithm and f64 ground truth on cusp, bulb-contact,
+// minibrot-edge and deep seahorse views:
+// * Multiplier: |product of f'(z)|^2 over the steps since the save must be
+//   < PERIOD_MAX_MULT2, so the cycle it closed is clearly attracting. Plain
+//   "< 1" let near-parabolic exterior points (|multiplier| ~ 1) through at
+//   cusps; the margin fixes that.
+// * Confirmation: the contracting return must happen in
+//   PERIOD_CONFIRMATIONS consecutive windows, each twice as long as the
+//   last. Exterior orbits passing near the critical point can look strongly
+//   contracting for one window (seen: flagged at iteration 245, escaped at
+//   2275). A second, longer window rules that out.
+// * Tolerance: PERIOD_EPS2 is relative and near f32 precision.
+// Every kind here except Phoenix is
+// (piecewise) conformal, so |f'| from `fprime` is the exact local scale
+// factor, including the abs-folding kinds, whose folds are isometries.
+// Phoenix's two-term map would need a 2x2 Jacobian, so it's excluded. So is
+// Complex Multibrot without DE, where `fprime` would add a second `cpow`
+// (log/atan2/exp) per step for a check that rarely fires on its views.
+const PERIOD_FIRST_CHECK: u32 = 16u;
+const PERIOD_EPS2: f32 = 1e-12;
+const PERIOD_MAX_MULT2: f32 = 0.25;
+const PERIOD_CONFIRMATIONS: u32 = 2u;
+
+// Whether `iterate_sample` runs periodicity detection for this kind (folds to
+// a constant per pipeline).
+fn periodic_enabled() -> bool {
+    if KIND == KIND_PHOENIX {
+        return false;
+    }
+    if KIND == KIND_COMPLEX_MULTIBROT && !DE {
+        return false;
+    }
+    return true;
+}
+
 // Escape data for one sample: `ci` is the (color-independent) palette parameter,
 // `de` the distance-estimate darkening factor in [0,1], `escaped` false for the
 // interior of the set. Splitting iteration from coloring lets a colour change be
@@ -269,6 +312,17 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     var z2 = dot(z, z);
     var escaped = false;
 
+    // Periodicity detection (see PERIOD_FIRST_CHECK): last saved orbit value,
+    // |f'|^2 product of the steps since it was saved, next save iteration.
+    let periodic = periodic_enabled();
+    // Plus whether this window already had a contracting return, and how many
+    // consecutive windows have.
+    var z_saved = z;
+    var mult2 = 1.0;
+    var check_at = PERIOD_FIRST_CHECK;
+    var period_hit = false;
+    var period_streak = 0u;
+
     loop {
         if z2 > bailout_sq {
             escaped = true;
@@ -281,8 +335,16 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         // Propagate the derivative of the full orbit (unaffected by rebasing,
         // which only re-expresses the same value). Only when DE is enabled.
         // Phoenix's two-term map adds p·dz_{n-1} and carries the previous dz.
+        // f'(z) of this step, shared by DE and the periodicity multiplier.
+        var fp = vec2<f32>(0.0, 0.0);
+        if DE || periodic {
+            fp = fprime(z);
+        }
+        if periodic {
+            mult2 = mult2 * dot(fp, fp);
+        }
         if DE {
-            var dz_new = cmul(fprime(z), dz);
+            var dz_new = cmul(fp, dz);
             if !IS_JULIA {
                 dz_new.x = dz_new.x + 1.0;
             }
@@ -328,6 +390,28 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
             e = z - z0;
             xm = z0;
             m = 0u;
+        }
+
+        if periodic {
+            // Closed an attracting cycle in enough consecutive windows:
+            // interior (see PERIOD_FIRST_CHECK).
+            let d = z - z_saved;
+            if !period_hit && mult2 < PERIOD_MAX_MULT2 && dot(d, d) <= PERIOD_EPS2 * z2 {
+                period_hit = true;
+                period_streak = period_streak + 1u;
+                if period_streak >= PERIOD_CONFIRMATIONS {
+                    break;
+                }
+            }
+            if n == check_at {
+                if !period_hit {
+                    period_streak = 0u;
+                }
+                period_hit = false;
+                z_saved = z;
+                mult2 = 1.0;
+                check_at = check_at * 2u;
+            }
         }
     }
 
