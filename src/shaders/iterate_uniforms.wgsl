@@ -19,6 +19,8 @@ struct Uniforms {
     kind: u32,
     // Exponent for the Multibrot kind.
     power: u32,
+    // Kind-switch morph: the kind blended *from* (see morph_w).
+    morph_from: u32,
     dc_offset: vec2<f32>,
     // Distortion constant p for the Phoenix map (z^2 + c + p*z_{n-1}); unused
     // by other kinds. Placed by dc_offset so both vec2s stay 8-byte aligned.
@@ -43,6 +45,9 @@ struct Uniforms {
     camera_inv_proj: mat4x4<f32>,
     // Screen dimensions
     screen_dim: vec2<f32>,
+    // Kind-switch morph weight: each step is (1 - w)*f_kind + w*f_morph_from;
+    // 0 = no morph. Only read by MORPH pipelines (see mandelbrot.wgsl).
+    morph_w: f32,
     // Complex binomial coefficients C(complex_power, k) for k = 1..16, two per
     // vec4 (k odd in .xy, k even in .zw), for the Complex Multibrot delta
     // series. Precomputed on the CPU since they only depend on the power.

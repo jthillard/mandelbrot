@@ -42,6 +42,8 @@ fn geom_differs(a: &Uniforms, b: &Uniforms) -> bool {
         || a.dc_offset != b.dc_offset
         || a.phoenix_p != b.phoenix_p
         || a.lambda_l != b.lambda_l
+        || a.morph_from != b.morph_from
+        || a.morph_w != b.morph_w
         || a.de_coloring != b.de_coloring
         // The iterate pass's DE clamp (`max_de`) depends on whether any
         // shadow-style mode is on.
@@ -72,6 +74,8 @@ pub struct PipelineKey {
     kind: u32,
     julia: bool,
     de: bool,
+    /// A kind-switch morph is in progress (`morph_w > 0`).
+    morph: bool,
 }
 
 impl PipelineKey {
@@ -80,14 +84,16 @@ impl PipelineKey {
             kind: u.kind,
             julia: u.is_julia != 0,
             de: u.de_coloring != 0,
+            morph: u.morph_w > 0.0,
         }
     }
 
-    fn constants(&self) -> [(&'static str, f64); 3] {
+    fn constants(&self) -> [(&'static str, f64); 4] {
         [
             ("KIND", self.kind as f64),
             ("IS_JULIA", self.julia as u32 as f64),
             ("DE", self.de as u32 as f64),
+            ("MORPH", self.morph as u32 as f64),
         ]
     }
 }
@@ -166,7 +172,9 @@ pub struct Uniforms {
     pub kind: u32,
     /// Exponent for the Multibrot kind.
     pub power: u32,
-    pub _pad: [u32; 1],
+    /// Kind-switch morph: the kind being blended *from* (a `FractalKind`
+    /// discriminant); only read when `morph_w > 0`.
+    pub morph_from: u32,
     /// Complex offset of the view center from the reference center, so a stale
     /// or reused reference (computed at a slightly different center) still maps
     /// correctly. Added to every pixel's per-pixel offset.
@@ -194,7 +202,11 @@ pub struct Uniforms {
     pub camera_inv_proj: [f32; 16],
     /// Screen dimension
     pub screen_dim: [f32; 2],
-    pub _pad3: [u32; 2],
+    /// Kind-switch morph weight: each step is `(1 - w)·f_kind + w·f_from`.
+    /// 0 = no morph (and the iteration pipeline is then specialized without
+    /// the morph path, see [`PipelineKey`]).
+    pub morph_w: f32,
+    pub _pad3: [u32; 1],
     /// Complex binomial coefficients `C(complex_power, k)`, k = 1..16, two per
     /// row (odd k in `[0..2]`, even k in `[2..4]`), for the Complex Multibrot
     /// delta series. Derived from `complex_power` alone.

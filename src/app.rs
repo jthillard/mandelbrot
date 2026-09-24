@@ -20,7 +20,7 @@ use crate::view::parse_half_height_spec;
 use crate::view::parse_re_im_spec;
 use crate::view::{
     Big, DEFAULT_HALF_HEIGHT, ViewState, big_from_decimal_str, big_from_f64, big_to_decimal_str,
-    parse_view_spec, precision_for,
+    interpolate_view, parse_view_spec, precision_for,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use clap::Parser;
@@ -161,6 +161,35 @@ struct RequestKey {
     kind: FractalKind,
     power: u32,
     complex_power: (f64, f64),
+    /// Kind-switch morph `(from_kind, weight)`, if one is running.
+    morph: Option<(FractalKind, f32)>,
+}
+
+/// An in-progress kind-switch animation: the iteration formula is blended per
+/// step from `from` to the current kind, `(1 - w)·f_kind + w·f_from`, while the
+/// camera glides from `from_view` to the new kind's default view.
+struct KindMorph {
+    from: FractalKind,
+    /// Linear progress in [0, 1]; eased with smoothstep.
+    progress: f32,
+    from_view: ViewState,
+    to_view: ViewState,
+    /// Whether the morph still drives the camera. Cleared as soon as the user
+    /// pans/zooms, so they can take over mid-morph.
+    camera: bool,
+}
+
+impl KindMorph {
+    /// Smoothstep-eased progress.
+    fn eased(&self) -> f32 {
+        let p = self.progress.clamp(0.0, 1.0);
+        p * p * (3.0 - 2.0 * p)
+    }
+
+    /// Weight of the old kind's formula: 1 at the start, 0 at the end.
+    fn weight(&self) -> f32 {
+        1.0 - self.eased()
+    }
 }
 
 /// Shared state for an in-progress PNG export. The worker (a background thread
@@ -213,6 +242,12 @@ struct AnimState {
     /// e-folds per second; positive zooms in, negative zooms out.
     zoom_speed: f32,
 
+    /// Morph the iteration formula (and camera) when switching fractal kinds,
+    /// instead of cutting straight to the new kind.
+    kind_morph: bool,
+    /// Kind-switch morph duration, in seconds.
+    kind_morph_duration: f32,
+
     /// Linear 2D <-> 3D transition progress in [0, 1], advanced at a constant
     /// rate; `camera_state` is its smoothstep-eased value.
     camera_progress: f32,
@@ -242,6 +277,8 @@ impl Default for AnimState {
             lambda_angle: 0.0,
             zoom: false,
             zoom_speed: 0.5,
+            kind_morph: true,
+            kind_morph_duration: 1.5,
             camera_progress: 0.,
             camera_state: 0.,
         }
@@ -309,6 +346,8 @@ pub struct FractalApp {
     help_open: bool,
     /// Time-based animation of colours / Julia c / Phoenix p / zoom.
     anim: AnimState,
+    /// Kind-switch morph in progress, if any.
+    morph: Option<KindMorph>,
 
     /// Smoothed frames-per-second, recomputed each ~0.5 s window. Only advances
     /// while the app is actually repainting (interaction / animation / export);
@@ -327,6 +366,10 @@ pub struct FractalApp {
     ref_center_re: Big,
     ref_center_im: Big,
     ref_half_height: f64,
+    /// Kind-switch morph the current `reference` was computed with. The shader
+    /// blends with this (not the live morph) so its delta formula always
+    /// matches the orbit, even while the worker lags a frame behind.
+    ref_morph: Option<(FractalKind, f32)>,
     /// Parameters of the most recent reference request (drift baseline / dedupe).
     last_request: Option<RequestKey>,
 
@@ -466,6 +509,7 @@ impl FractalApp {
             info_open: false,
             help_open: false,
             anim: AnimState::default(),
+            morph: None,
             fps: 0.0,
             fps_frames: 0,
             fps_window_start: 0.0,
@@ -474,6 +518,7 @@ impl FractalApp {
             ref_center_re,
             ref_center_im,
             ref_half_height,
+            ref_morph: None,
             last_request: None,
             #[cfg(not(target_arch = "wasm32"))]
             worker: crate::worker::RefWorker::spawn(),
@@ -667,6 +712,7 @@ impl FractalApp {
         ) {
             self.mode = FractalMode::Mandelbrot;
             self.view = ViewState::with_center(cre, cim, half_height);
+            self.morph = None;
             // Presets carry a hand-tuned count; don't let the auto-scaler clobber it.
             self.auto_iterations = false;
             self.max_iterations = iterations.clamp(32, MAX_REF_POINTS as u32 - 1);
@@ -706,6 +752,7 @@ impl FractalApp {
 
     /// Restore a shared state into this app.
     fn apply_share(&mut self, s: &ShareState) {
+        self.morph = None;
         self.mode = if s.julia {
             FractalMode::Julia
         } else {
@@ -778,6 +825,7 @@ impl FractalApp {
             kind: self.kind,
             power: self.power,
             complex_power: self.complex_power,
+            morph: self.morph.as_ref().map(|m| (m.from, m.weight())),
         }
     }
 
@@ -809,11 +857,17 @@ impl FractalApp {
             || key.kind != self.kind
             || key.power != self.power
             || key.complex_power != self.complex_power
+            || key.morph != self.morph.as_ref().map(|m| (m.from, m.weight()))
         {
             return true;
         }
-        // Lambda in Set mode is a static fractal; don't trigger recompute on center drift.
-        if self.kind == FractalKind::Lambda && matches!(self.mode, FractalMode::Mandelbrot) {
+        // Lambda in Set mode is a static fractal; don't trigger recompute on
+        // center drift. (Not while morphing: the other kind's formula does
+        // depend on the center.)
+        if self.kind == FractalKind::Lambda
+            && matches!(self.mode, FractalMode::Mandelbrot)
+            && self.morph.is_none()
+        {
             // But still recompute on significant zoom changes for precision
             let ratio = self.view.half_height / key.half_height;
             return !(0.5..=2.0).contains(&ratio);
@@ -833,8 +887,16 @@ impl FractalApp {
         [dre, dim]
     }
 
-    fn apply_reference(&mut self, points: Vec<[f32; 2]>, cre: Big, cim: Big, hh: f64) {
+    fn apply_reference(
+        &mut self,
+        points: Vec<[f32; 2]>,
+        cre: Big,
+        cim: Big,
+        hh: f64,
+        morph: Option<(FractalKind, f32)>,
+    ) {
         self.reference = Arc::new(points);
+        self.ref_morph = morph;
         self.ref_center_re = cre;
         self.ref_center_im = cim;
         self.ref_half_height = hh;
@@ -865,7 +927,7 @@ impl FractalApp {
             let max_iter = key.iter.min(MAX_REF_POINTS as u32 - 1);
 
             // Lambda in Set mode has a static fractal centered at origin.
-            if key.kind == FractalKind::Lambda && !key.julia {
+            if key.kind == FractalKind::Lambda && !key.julia && key.morph.is_none() {
                 key.center_re = big_from_f64(0.0, precision);
                 key.center_im = big_from_f64(0.0, precision);
             }
@@ -885,6 +947,7 @@ impl FractalApp {
                     phoenix_p: key.phoenix_p,
                     lambda_l: key.lambda_l,
                     complex_power: key.complex_power,
+                    morph: key.morph,
                 });
                 self.pending = true;
             }
@@ -905,6 +968,7 @@ impl FractalApp {
                         key.phoenix_p,
                         key.lambda_l,
                         key.complex_power,
+                        key.morph.map(|(k, w)| (k, w as f64)),
                     )
                 } else {
                     compute_set_reference(
@@ -917,6 +981,7 @@ impl FractalApp {
                         key.phoenix_p,
                         key.lambda_l,
                         key.complex_power,
+                        key.morph.map(|(k, w)| (k, w as f64)),
                     )
                 };
                 self.apply_reference(
@@ -924,6 +989,7 @@ impl FractalApp {
                     key.center_re.clone(),
                     key.center_im.clone(),
                     key.half_height,
+                    key.morph,
                 );
             }
 
@@ -932,7 +998,13 @@ impl FractalApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(res) = self.worker.try_take_latest() {
-            self.apply_reference(res.points, res.center_re, res.center_im, res.half_height);
+            self.apply_reference(
+                res.points,
+                res.center_re,
+                res.center_im,
+                res.half_height,
+                res.morph,
+            );
             self.pending = false;
         }
     }
@@ -954,7 +1026,7 @@ impl FractalApp {
         let max_iter = key.iter;
 
         // Lambda in Set mode has a static fractal centered at origin.
-        if key.kind == FractalKind::Lambda && !key.julia {
+        if key.kind == FractalKind::Lambda && !key.julia && key.morph.is_none() {
             key.center_re = big_from_f64(0.0, precision);
             key.center_im = big_from_f64(0.0, precision);
         }
@@ -974,6 +1046,7 @@ impl FractalApp {
                 key.phoenix_p,
                 key.lambda_l,
                 key.complex_power,
+                key.morph.map(|(k, w)| (k, w as f64)),
             )
         } else {
             compute_set_reference(
@@ -986,6 +1059,7 @@ impl FractalApp {
                 key.phoenix_p,
                 key.lambda_l,
                 key.complex_power,
+                key.morph.map(|(k, w)| (k, w as f64)),
             )
         };
         self.apply_reference(
@@ -993,6 +1067,7 @@ impl FractalApp {
             key.center_re.clone(),
             key.center_im.clone(),
             key.half_height,
+            key.morph,
         );
         self.last_request = Some(key);
     }
@@ -1052,6 +1127,7 @@ impl FractalApp {
             aa_level: if self.antialias { 2 } else { 1 },
             kind: self.kind as u32,
             power: self.power,
+            morph_from: self.ref_morph.map_or(0, |(k, _)| k as u32),
             dc_offset: self.dc_offset(),
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
@@ -1059,6 +1135,7 @@ impl FractalApp {
             de_coloring: (self.de_coloring || mode > 0) as u32,
             rendering_mode: mode,
             camera_direction: self.camera.direction(self.anim.camera_state).to_array(),
+            morph_w: self.ref_morph.map_or(0.0, |(_, w)| w),
             camera_inv_proj: self
                 .camera
                 .orthographic(self.anim.camera_state)
@@ -1067,7 +1144,6 @@ impl FractalApp {
             screen_dim: self.screen_dim,
             light_count: gpu_lights(&self.lights).1,
             cm_coef: complex_binomials(self.complex_power),
-            _pad: [0; _],
             _pad3: [0; _],
         }
     }
@@ -1586,6 +1662,22 @@ impl FractalApp {
         let p = self.anim.camera_progress;
         self.anim.camera_state = p * p * (3.0 - 2.0 * p);
 
+        // Kind-switch morph: advance the per-iteration formula blend, and glide
+        // the camera to the new kind's default view unless the user took over.
+        if let Some(m) = &mut self.morph {
+            m.progress += dt as f32 / self.anim.kind_morph_duration.max(0.05);
+            if m.camera {
+                self.view = interpolate_view(&m.from_view, &m.to_view, m.eased() as f64);
+            }
+            if m.progress >= 1.0 {
+                if m.camera {
+                    self.view = m.to_view.clone();
+                }
+                self.morph = None;
+            }
+            ui.ctx().request_repaint();
+        }
+
         if !(self.anim.color || self.anim.zoom || julia_on || phoenix_on || lambda_on) {
             return;
         }
@@ -1701,9 +1793,23 @@ impl FractalApp {
             });
         }
         if self.kind != prev_kind {
-            self.view = Self::default_view_for(self.mode, self.kind);
+            let to_view = Self::default_view_for(self.mode, self.kind);
+            // Buddhabrot has its own pipeline without the blended formula, so
+            // it keeps the instant switch.
+            self.morph =
+                (self.anim.kind_morph && self.mode != FractalMode::Buddhabrot).then(|| KindMorph {
+                    from: prev_kind,
+                    progress: 0.0,
+                    from_view: self.view.clone(),
+                    to_view: to_view.clone(),
+                    camera: true,
+                });
+            if self.morph.is_none() {
+                self.view = to_view;
+            }
         }
 
+        let prev_mode = self.mode;
         ui.horizontal(|ui| {
             ui.radio_value(&mut self.mode, FractalMode::Mandelbrot, "Set");
             ui.radio_value(&mut self.mode, FractalMode::Julia, "Julia");
@@ -1714,6 +1820,9 @@ impl FractalApp {
                  progressively sharpens while the view stays still.",
                 );
         });
+        if self.mode != prev_mode {
+            self.morph = None;
+        }
 
         if self.mode == FractalMode::Buddhabrot {
             self.buddhabrot_ui(ui);
@@ -1722,6 +1831,7 @@ impl FractalApp {
             ui.add_space(4.);
             if ui.button("Reset view").clicked() {
                 self.view = Self::default_view_for(self.mode, self.kind);
+                self.morph = None;
             }
             ui.add_space(8.0);
             ui.small("Drag to pan · scroll to zoom toward the cursor");
@@ -1877,6 +1987,19 @@ impl FractalApp {
             if self.anim.zoom {
                 ui.add(
                     egui::Slider::new(&mut self.anim.zoom_speed, -2.0..=2.0).text("rate (+ = in)"),
+                );
+            }
+
+            ui.checkbox(&mut self.anim.kind_morph, "Morph kind switch")
+                .on_hover_text(
+                    "When picking another fractal, blend the old and new formulas \
+                     at every iteration step and glide to the new default view.",
+                );
+            if self.anim.kind_morph {
+                ui.add(
+                    egui::Slider::new(&mut self.anim.kind_morph_duration, 0.2..=10.0)
+                        .text("morph s")
+                        .logarithmic(true),
                 );
             }
 
@@ -2064,6 +2187,7 @@ impl FractalApp {
         ui.add_space(4.);
         if ui.button("Reset view").clicked() {
             self.view = Self::default_view_for(self.mode, self.kind);
+            self.morph = None;
         }
         ui.add_space(8.0);
         ui.small("Drag to pan · scroll to zoom toward the cursor");
@@ -2302,6 +2426,7 @@ impl FractalApp {
 
             if ui.input(|i| i.key_pressed(egui::Key::R)) {
                 self.view = Self::default_view_for(self.mode, self.kind);
+                self.morph = None;
                 self.camera = Camera::new();
                 interacted = true;
             }
@@ -2379,6 +2504,11 @@ impl FractalApp {
         let now = ui.input(|i| i.time);
         if interacted {
             self.last_interact_time = now;
+            // The user is steering the camera: stop the kind-switch morph from
+            // overriding it (the formula blend itself carries on).
+            if let Some(m) = &mut self.morph {
+                m.camera = false;
+            }
         }
         let interacting = now - self.last_interact_time < INTERACT_SETTLE;
         if interacting {

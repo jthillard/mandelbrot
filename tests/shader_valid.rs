@@ -77,23 +77,30 @@ fn mandelbrot_shader_is_valid() {
 }
 
 /// Every specialization renderer.rs can build (`PipelineKey`: kind × Julia ×
-/// DE), for every fragment entry point.
+/// DE × morph), for every fragment entry point.
 #[test]
 fn mandelbrot_shader_specializations_compile() {
     let (module, info) = validate("mandelbrot.wgsl", MANDELBROT_SRC);
     for kind in 0..kind_count() {
         for julia in [0.0, 1.0] {
             for de in [0.0, 1.0] {
-                let constants = [("KIND", kind as f64), ("IS_JULIA", julia), ("DE", de)];
-                for entry in ["fs_data", "fs_refine", "fs_color"] {
-                    specialize(
-                        "mandelbrot.wgsl",
-                        &module,
-                        &info,
-                        naga::ShaderStage::Fragment,
-                        entry,
-                        &constants,
-                    );
+                for morph in [0.0, 1.0] {
+                    let constants = [
+                        ("KIND", kind as f64),
+                        ("IS_JULIA", julia),
+                        ("DE", de),
+                        ("MORPH", morph),
+                    ];
+                    for entry in ["fs_data", "fs_refine", "fs_color"] {
+                        specialize(
+                            "mandelbrot.wgsl",
+                            &module,
+                            &info,
+                            naga::ShaderStage::Fragment,
+                            entry,
+                            &constants,
+                        );
+                    }
                 }
             }
         }

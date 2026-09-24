@@ -129,7 +129,16 @@ pixel is a handful of `f32` complex multiplies.
   exact delta). `fprime(z)` is the derivative used for distance-estimation
   (DE) shading; exact for holomorphic kinds, an approximation (`~2Z`) for the
   abs-based ones. A `KIND_*` constant (from `common.wgsl`) must match the
-  matching `FractalKind` variant's discriminant exactly.
+  matching `FractalKind` variant's discriminant exactly. The per-kind bodies
+  are `advance_delta_kind`/`fprime_kind`; `advance_delta`/`fprime` wrap them
+  to blend two kinds during the kind-switch morph (`u.morph_from`,
+  `u.morph_w`: each step is `(1-w)·f_kind + w·f_from`, mirrored on the CPU by
+  the `morph` argument of `compute_reference`, in both its f64 and `FBig`
+  paths). The blend only exists in pipelines built with the `MORPH` override
+  (part of `PipelineKey`, on while `morph_w > 0`); those also skip periodicity
+  detection and the cardioid bypass. App side: `KindMorph` in
+  `app.rs`; the uniforms use the morph the *current reference* was built with
+  (`ref_morph`), not the live one, so orbit and delta formula never disagree.
 - `src/fractal/renderer.rs` — `FractalRenderer` (wgpu pipelines, uniform +
   storage buffers, bind groups), `Uniforms` (repr(C) layout that must match
   the WGSL `Uniforms` struct field-for-field, including padding; it includes

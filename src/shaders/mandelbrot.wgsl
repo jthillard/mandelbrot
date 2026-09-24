@@ -31,6 +31,10 @@
 override KIND: u32 = 0u;
 override IS_JULIA: bool = false;
 override DE: bool = false;
+// A kind-switch morph is in progress (`u.morph_w > 0`): each step blends in a
+// second kind, `u.morph_from`. That one is a runtime value (it only lives for
+// the length of the animation), so only MORPH pipelines pay for its branches.
+override MORPH: bool = false;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -137,11 +141,11 @@ fn complex_multibrot_delta(z: vec2<f32>, e: vec2<f32>, p: vec2<f32>) -> vec2<f32
     return cpow(z + e, p) - cpow(z, p);
 }
 
-// One perturbation step of the current fractal's delta: e -> f(Z+e) - f(Z),
-// where `z` is the reference orbit value X_m. `step_add` (dc) is added by the
-// caller. Must match `FractalKind` on the CPU side.
-fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
-    if KIND == KIND_BURNING_SHIP {
+// One perturbation step of `kind`'s delta: e -> f(Z+e) - f(Z), where `z` is
+// the reference orbit value X_m. `step_add` (dc) is added by the caller. Must
+// match `FractalKind` on the CPU side.
+fn advance_delta_kind(kind: u32, z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
+    if kind == KIND_BURNING_SHIP {
         // (|x| + i|y|)^2 has real part x^2 - y^2 (an ordinary square delta) and
         // imaginary part 2|x y|. The imaginary delta is 2(|x y| - |X Y|); diffabs
         // computes it exactly, even where the product x y changes sign — which the
@@ -150,34 +154,34 @@ fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
         let base = 2.0 * cmul(z, e) + cmul(e, e);
         let dp = z.x * e.y + z.y * e.x + e.x * e.y;
         return vec2<f32>(base.x, 2.0 * diffabs(z.x * z.y, dp));
-    } else if KIND == KIND_TRICORN {
+    } else if kind == KIND_TRICORN {
         let cz = conj(z);
         let ce = conj(e);
         return 2.0 * cmul(cz, ce) + cmul(ce, ce);
-    } else if KIND == KIND_MULTIBROT {
+    } else if kind == KIND_MULTIBROT {
         return multibrot_delta(z, e, clamp(u.power, 2u, 8u));
-    } else if KIND == KIND_CELTIC {
+    } else if kind == KIND_CELTIC {
         // z^2 delta split: sq.x = delta of Re(z^2), sq.y = delta of Im(z^2).
         // Celtic abs the real output, so |Re(z^2)| delta = diffabs(Re(Z^2), sq.x).
         let sq = 2.0 * cmul(z, e) + cmul(e, e);
         return vec2<f32>(diffabs(z.x * z.x - z.y * z.y, sq.x), sq.y);
-    } else if KIND == KIND_BUFFALO {
+    } else if kind == KIND_BUFFALO {
         // Abs both outputs: real |Re(z^2)|, imag -|Im(z^2)| (Im(Z^2) = 2 X Y).
         let sq = 2.0 * cmul(z, e) + cmul(e, e);
         return vec2<f32>(diffabs(z.x * z.x - z.y * z.y, sq.x),
                          -diffabs(2.0 * z.x * z.y, sq.y));
-    } else if KIND == KIND_PERPENDICULAR {
+    } else if kind == KIND_PERPENDICULAR {
         // real x^2 - y^2 (ordinary square delta), imag -2 x |y|.
         // d(-2 x |y|) = -2[ X·(|Y+ey|-|Y|) + ex·|Y+ey| ]; diffabs gives |Y+ey|-|Y|.
         let sq = 2.0 * cmul(z, e) + cmul(e, e);
         let da = diffabs(z.y, e.y);        // |Y + ey| - |Y|
         let abs_yf = abs(z.y) + da;        // |Y + ey|
         return vec2<f32>(sq.x, -2.0 * (z.x * da + e.x * abs_yf));
-    } else if KIND == KIND_LAMBDA {
+    } else if kind == KIND_LAMBDA {
         // Lambda map: z^{n+1} = λ·z·(1-z). Delta: e = λ·e·(1-2z-e).
         let one_minus_2z_minus_e = vec2<f32>(1.0 - 2.0 * z.x - e.x, -2.0 * z.y - e.y);
         return cmul(u.lambda_l, cmul(e, one_minus_2z_minus_e));
-    } else if KIND == KIND_COMPLEX_MULTIBROT {
+    } else if kind == KIND_COMPLEX_MULTIBROT {
         return complex_multibrot_delta(z, e, u.complex_power);
     }
     return 2.0 * cmul(z, e) + cmul(e, e); // Mandelbrot (and Phoenix square part)
@@ -188,22 +192,57 @@ fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
 // holomorphic kinds (z^2 -> 2Z, z^p -> p Z^{p-1}); for the non-holomorphic
 // Burning Ship / Tricorn we use |f'| ~ |2Z|, which keeps the DE magnitude close
 // enough to de-speckle filaments.
-fn fprime(z: vec2<f32>) -> vec2<f32> {
-    if KIND == KIND_MULTIBROT {
+fn fprime_kind(kind: u32, z: vec2<f32>) -> vec2<f32> {
+    if kind == KIND_MULTIBROT {
         let p = clamp(u.power, 2u, 8u);
         var zk = z; // Z^1
         for (var k: u32 = 2u; k < p; k = k + 1u) {
             zk = cmul(zk, z); // -> Z^{p-1}
         }
         return f32(p) * zk;
-    } else if KIND == KIND_LAMBDA {
+    } else if kind == KIND_LAMBDA {
         // Lambda: f'(z) = λ·(1-2z).
         return cmul(u.lambda_l, vec2<f32>(1.0 - 2.0 * z.x, -2.0 * z.y));
-    } else if KIND == KIND_COMPLEX_MULTIBROT {
+    } else if kind == KIND_COMPLEX_MULTIBROT {
         // f'(z) = p * z^(p-1).
         return cmul(u.complex_power, cpow(z, u.complex_power - vec2<f32>(1.0, 0.0)));
     }
     return 2.0 * z;
+}
+
+// Delta step of the current map. While switching kinds (MORPH), the map is
+// blended per iteration, (1 - w)*f_kind + w*f_from; that's linear in the two
+// outputs, so its delta is the same blend of both kinds' deltas (the CPU
+// reference in reference.rs uses the same blend, so rebasing stays exact).
+fn advance_delta(z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
+    let d = advance_delta_kind(KIND, z, e);
+    if MORPH {
+        return mix(d, advance_delta_kind(u.morph_from, z, e), u.morph_w);
+    }
+    return d;
+}
+
+// Derivative of the current (possibly morphing) map; blended like
+// `advance_delta`.
+fn fprime(z: vec2<f32>) -> vec2<f32> {
+    let d = fprime_kind(KIND, z);
+    if MORPH {
+        return mix(d, fprime_kind(u.morph_from, z), u.morph_w);
+    }
+    return d;
+}
+
+// Weight of the Phoenix kind's p*z_{n-1} term in the current map: 1 for plain
+// Phoenix, its morph share while switching to/from Phoenix, else 0.
+fn phoenix_weight() -> f32 {
+    var w = 0.0;
+    if KIND == KIND_PHOENIX {
+        w = select(1.0, 1.0 - u.morph_w, MORPH);
+    }
+    if MORPH && u.morph_from == KIND_PHOENIX {
+        w = w + u.morph_w;
+    }
+    return w;
 }
 
 // Periodicity (interior) detection, Brent-style: the full orbit value is
@@ -229,7 +268,8 @@ fn fprime(z: vec2<f32>) -> vec2<f32> {
 // Every kind here except Phoenix is
 // (piecewise) conformal, so |f'| from `fprime` is the exact local scale
 // factor, including the abs-folding kinds, whose folds are isometries.
-// Phoenix's two-term map would need a 2x2 Jacobian, so it's excluded. So is
+// Phoenix's two-term map would need a 2x2 Jacobian, so it's excluded (as
+// is a kind-switch morph, for the same reason). So is
 // Complex Multibrot without DE, where `fprime` would add a second `cpow`
 // (log/atan2/exp) per step for a check that rarely fires on its views.
 const PERIOD_FIRST_CHECK: u32 = 16u;
@@ -240,7 +280,8 @@ const PERIOD_CONFIRMATIONS: u32 = 2u;
 // Whether `iterate_sample` runs periodicity detection for this kind (folds to
 // a constant per pipeline).
 fn periodic_enabled() -> bool {
-    if KIND == KIND_PHOENIX {
+    // A blend of two maps isn't conformal, so |f'| isn't its scale factor.
+    if MORPH || KIND == KIND_PHOENIX {
         return false;
     }
     if KIND == KIND_COMPLEX_MULTIBROT && !DE {
@@ -276,7 +317,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     // orbit itself, since X_1 = X_0^2 + C_ref = C_ref. That's only f32-accurate,
     // so skip the test once a pixel is smaller than that error (deep zoom),
     // where it could misclassify pixels right at the boundary.
-    if KIND == KIND_MANDELBROT && !IS_JULIA && ref_len > 1u && px > 1e-6 {
+    if KIND == KIND_MANDELBROT && !MORPH && !IS_JULIA && ref_len > 1u && px > 1e-6 {
         let c = ref_orbit[1] + offset;
         let xq = c.x - 0.25;
         let q = xq * xq + c.y * c.y;
@@ -308,6 +349,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     // y_{n-1}, and its scaled derivative for DE). Both start at 0 (y_{-1} = 0).
     var e_prev = vec2<f32>(0.0, 0.0);
     var dzs_prev = vec2<f32>(0.0, 0.0);
+    let phoenix_w = phoenix_weight();
 
     var m: u32 = 0u;              // reference index; invariant: y_n = xm + e, xm = X[m]
     var n: u32 = 0u;              // total iteration count
@@ -352,8 +394,8 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
             if !IS_JULIA {
                 dzs_new.x = dzs_new.x + px;
             }
-            if KIND == KIND_PHOENIX {
-                dzs_new = dzs_new + cmul(u.phoenix_p, dzs_prev);
+            if phoenix_w > 0.0 {
+                dzs_new = dzs_new + phoenix_w * cmul(u.phoenix_p, dzs_prev);
                 dzs_prev = dzs;
             }
             dzs = dzs_new;
@@ -364,8 +406,8 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         let e_old = e;
         let z_old = z;
         e = advance_delta(xm, e) + step_add;
-        if KIND == KIND_PHOENIX {
-            e = e + cmul(u.phoenix_p, e_prev);
+        if phoenix_w > 0.0 {
+            e = e + phoenix_w * cmul(u.phoenix_p, e_prev);
             e_prev = e_old;
         }
         m = m + 1u;
@@ -388,7 +430,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
             // full value `z` (and `z2`) is unchanged by the re-expression.
             // Phoenix: after rebasing the implied previous reference is Y[-1]=0,
             // so the previous delta becomes the full previous value y_{n-1}.
-            if KIND == KIND_PHOENIX {
+            if phoenix_w > 0.0 {
                 e_prev = z_old;
             }
             e = z - z0;

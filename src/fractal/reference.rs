@@ -9,6 +9,11 @@
 //! The `(z0, c)` form serves both set types:
 //! * Mandelbrot-set: `z0 = 0`, `c = view center` (the c-plane point per pixel).
 //! * Julia-set:      `z0 = view center`, `c = fractal constant` (fixed per view).
+//!
+//! While switching fractal kinds, the formula is morphed *per iteration*:
+//! `Z_{n+1} = (1 - w)·f_kind(Z_n) + w·f_from(Z_n)` (see `morph` below). The
+//! map is linear in the two outputs, so the GPU delta is the same blend of
+//! the two kinds' deltas and perturbation/rebasing keep working unchanged.
 
 use super::kind::FractalKind;
 use crate::view::{Big, big_from_f64};
@@ -37,6 +42,9 @@ const F64_MAX_PRECISION: usize = 80;
 /// Compute the reference orbit `Z_0..Z_{len-1}` where `Z_0 = z0` and
 /// `Z_{n+1} = f(Z_n, c)` for the given `kind` (and `power`, for Multibrot), up
 /// to `max_iter` steps at `precision` bits. Each entry is `[re, im]` in f32.
+///
+/// `morph = Some((from, w))` blends in a second kind's formula at every step:
+/// `(1 - w)·f_kind + w·f_from` (used by the kind-switch animation).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_reference(
     z0_re: &Big,
@@ -50,20 +58,9 @@ pub fn compute_reference(
     phoenix_p: (f64, f64),
     lambda_l: (f64, f64),
     complex_power: (f64, f64),
+    morph: Option<(FractalKind, f64)>,
 ) -> Vec<[f32; 2]> {
-    if precision <= F64_MAX_PRECISION {
-        return compute_reference_f64(
-            (z0_re.to_f64().value(), z0_im.to_f64().value()),
-            (c_re.to_f64().value(), c_im.to_f64().value()),
-            max_iter,
-            kind,
-            power,
-            phoenix_p,
-            lambda_l,
-            complex_power,
-        );
-    }
-    compute_reference_big(
+    compute_reference_inner(
         z0_re,
         z0_im,
         c_re,
@@ -75,28 +72,86 @@ pub fn compute_reference(
         phoenix_p,
         lambda_l,
         complex_power,
+        morph,
+        false,
     )
 }
 
-/// [`compute_reference`]'s fast path for shallow views (see
-/// [`F64_MAX_PRECISION`]): the same per-kind formulas in plain `f64`.
+/// [`compute_reference`] plus `set_plane` (see [`StepConsts::set_plane`]):
+/// picks the `f64` fast path or the `FBig` path by precision.
 #[allow(clippy::too_many_arguments)]
-fn compute_reference_f64(
-    z0: (f64, f64),
-    c: (f64, f64),
+fn compute_reference_inner(
+    z0_re: &Big,
+    z0_im: &Big,
+    c_re: &Big,
+    c_im: &Big,
     max_iter: u32,
+    precision: usize,
     kind: FractalKind,
     power: u32,
     phoenix_p: (f64, f64),
     lambda_l: (f64, f64),
     complex_power: (f64, f64),
+    morph: Option<(FractalKind, f64)>,
+    set_plane: bool,
 ) -> Vec<[f32; 2]> {
-    let (cr, ci) = c;
+    // A zero-weight morph is just the plain kind; skip the second formula.
+    let morph = morph.filter(|&(_, w)| w != 0.0);
+    if precision <= F64_MAX_PRECISION {
+        let k = StepConstsF64 {
+            c: (c_re.to_f64().value(), c_im.to_f64().value()),
+            p: phoenix_p,
+            l: lambda_l,
+            cpow: complex_power,
+            power,
+            set_plane,
+        };
+        return compute_reference_f64(
+            (z0_re.to_f64().value(), z0_im.to_f64().value()),
+            max_iter,
+            kind,
+            &k,
+            morph,
+        );
+    }
+    let k = StepConsts {
+        cr: c_re.clone().with_precision(precision).value(),
+        ci: c_im.clone().with_precision(precision).value(),
+        pr: big_from_f64(phoenix_p.0, precision),
+        pi: big_from_f64(phoenix_p.1, precision),
+        lr: big_from_f64(lambda_l.0, precision),
+        li: big_from_f64(lambda_l.1, precision),
+        cpow_re: big_from_f64(complex_power.0, precision),
+        cpow_im: big_from_f64(complex_power.1, precision),
+        power,
+        precision,
+        set_plane,
+    };
+    compute_reference_big(z0_re, z0_im, max_iter, kind, &k, morph)
+}
+
+/// `f64` twin of [`StepConsts`].
+struct StepConstsF64 {
+    c: (f64, f64),
+    p: (f64, f64),
+    l: (f64, f64),
+    cpow: (f64, f64),
+    power: u32,
+    set_plane: bool,
+}
+
+/// [`compute_reference`]'s fast path for shallow views (see
+/// [`F64_MAX_PRECISION`]): the same per-kind formulas in plain `f64`.
+fn compute_reference_f64(
+    z0: (f64, f64),
+    max_iter: u32,
+    kind: FractalKind,
+    k: &StepConstsF64,
+    morph: Option<(FractalKind, f64)>,
+) -> Vec<[f32; 2]> {
     let (mut zr, mut zi) = z0;
     // Previous iterate, for the Phoenix two-term recurrence (Y_{-1} = 0).
-    let (mut zr_prev, mut zi_prev) = (0.0f64, 0.0f64);
-    let (pr, pi) = phoenix_p;
-    let (lr, li) = lambda_l;
+    let mut prev = (0.0f64, 0.0f64);
 
     let mut points: Vec<[f32; 2]> = Vec::with_capacity(max_iter as usize + 1);
     for _ in 0..=max_iter {
@@ -105,39 +160,66 @@ fn compute_reference_f64(
             break;
         }
 
-        let (new_zr, new_zi) = match kind {
-            FractalKind::Mandelbrot => ((zr + zi) * (zr - zi) + cr, 2.0 * zr * zi + ci),
-            FractalKind::BurningShip => (zr * zr - zi * zi + cr, (2.0 * zr * zi).abs() + ci),
-            FractalKind::Tricorn => (zr * zr - zi * zi + cr, ci - 2.0 * zr * zi),
-            FractalKind::Multibrot => {
-                let (mut rr, mut ri) = (1.0f64, 0.0f64);
-                for _ in 0..power.max(2) {
-                    (rr, ri) = (rr * zr - ri * zi, rr * zi + ri * zr);
-                }
-                (rr + cr, ri + ci)
-            }
-            FractalKind::Celtic => ((zr * zr - zi * zi).abs() + cr, 2.0 * zr * zi + ci),
-            FractalKind::Perpendicular => (zr * zr - zi * zi + cr, ci - 2.0 * zr * zi.abs()),
-            FractalKind::Buffalo => ((zr * zr - zi * zi).abs() + cr, ci - (2.0 * zr * zi).abs()),
-            FractalKind::Phoenix => (
-                zr * zr - zi * zi + cr + (pr * zr_prev - pi * zi_prev),
-                2.0 * zr * zi + ci + (pr * zi_prev + pi * zr_prev),
-            ),
-            FractalKind::Lambda => {
-                // λ·z(1 - z).
-                let (re2, im2) = (1.0 - zr, -zi);
-                let (lzr, lzi) = (lr * zr - li * zi, lr * zi + li * zr);
-                (lzr * re2 - lzi * im2, re2 * lzi + lzr * im2)
-            }
-            FractalKind::ComplexMultibrot => {
-                let (pr, pi) = complex_pow_complex_f64(zr, zi, complex_power.0, complex_power.1);
-                (pr + cr, pi + ci)
-            }
-        };
-        (zr_prev, zi_prev) = (zr, zi);
+        let (mut new_zr, mut new_zi) = step_f64(kind, k, zr, zi, prev);
+        if let Some((from, w)) = morph {
+            let (br, bi) = step_f64(from, k, zr, zi, prev);
+            new_zr += w * (br - new_zr);
+            new_zi += w * (bi - new_zi);
+        }
+        prev = (zr, zi);
         (zr, zi) = (new_zr, new_zi);
     }
     points
+}
+
+/// `f64` twin of [`step`]: one step `f(Z_n)` of `kind`'s formula.
+fn step_f64(
+    kind: FractalKind,
+    k: &StepConstsF64,
+    zr: f64,
+    zi: f64,
+    prev: (f64, f64),
+) -> (f64, f64) {
+    let (cr, ci) = k.c;
+    match kind {
+        FractalKind::Mandelbrot => ((zr + zi) * (zr - zi) + cr, 2.0 * zr * zi + ci),
+        FractalKind::BurningShip => (zr * zr - zi * zi + cr, (2.0 * zr * zi).abs() + ci),
+        FractalKind::Tricorn => (zr * zr - zi * zi + cr, ci - 2.0 * zr * zi),
+        FractalKind::Multibrot => {
+            let (mut rr, mut ri) = (1.0f64, 0.0f64);
+            for _ in 0..k.power.max(2) {
+                (rr, ri) = (rr * zr - ri * zi, rr * zi + ri * zr);
+            }
+            (rr + cr, ri + ci)
+        }
+        FractalKind::Celtic => ((zr * zr - zi * zi).abs() + cr, 2.0 * zr * zi + ci),
+        FractalKind::Perpendicular => (zr * zr - zi * zi + cr, ci - 2.0 * zr * zi.abs()),
+        FractalKind::Buffalo => ((zr * zr - zi * zi).abs() + cr, ci - (2.0 * zr * zi).abs()),
+        FractalKind::Phoenix => {
+            let (pr, pi) = k.p;
+            let (zr_prev, zi_prev) = prev;
+            (
+                zr * zr - zi * zi + cr + (pr * zr_prev - pi * zi_prev),
+                2.0 * zr * zi + ci + (pr * zi_prev + pi * zr_prev),
+            )
+        }
+        FractalKind::Lambda => {
+            // λ·z(1 - z) (+ c on the parameter plane).
+            let (lr, li) = k.l;
+            let (re2, im2) = (1.0 - zr, -zi);
+            let (lzr, lzi) = (lr * zr - li * zi, lr * zi + li * zr);
+            let (re, im) = (lzr * re2 - lzi * im2, re2 * lzi + lzr * im2);
+            if k.set_plane {
+                (re + cr, im + ci)
+            } else {
+                (re, im)
+            }
+        }
+        FractalKind::ComplexMultibrot => {
+            let (pr, pi) = complex_pow_complex_f64(zr, zi, k.cpow.0, k.cpow.1);
+            (pr + cr, pi + ci)
+        }
+    }
 }
 
 /// `f64` twin of [`complex_pow_complex`] (principal branch, `0^p = 0`).
@@ -152,38 +234,44 @@ fn complex_pow_complex_f64(zr: f64, zi: f64, pr: f64, pi: f64) -> (f64, f64) {
     (mag * cos_a, mag * sin_a)
 }
 
+/// Everything a single formula step needs besides the orbit state, converted
+/// to `Big` once up front.
+struct StepConsts {
+    cr: Big,
+    ci: Big,
+    /// Phoenix distortion constant `p`.
+    pr: Big,
+    pi: Big,
+    /// Lambda distortion constant `l`.
+    lr: Big,
+    li: Big,
+    /// Complex Multibrot exponent.
+    cpow_re: Big,
+    cpow_im: Big,
+    power: u32,
+    precision: usize,
+    /// Parameter plane: the GPU adds `dc` every step for every kind, so the
+    /// Lambda map (which has no `c` of its own) is `λ·z(1 - z) + c` there.
+    set_plane: bool,
+}
+
 /// [`compute_reference`] at arbitrary precision (`FBig`), for deep views.
-#[allow(clippy::too_many_arguments)]
 fn compute_reference_big(
     z0_re: &Big,
     z0_im: &Big,
-    c_re: &Big,
-    c_im: &Big,
     max_iter: u32,
-    precision: usize,
     kind: FractalKind,
-    power: u32,
-    phoenix_p: (f64, f64),
-    lambda_l: (f64, f64),
-    complex_power: (f64, f64),
+    k: &StepConsts,
+    morph: Option<(FractalKind, f64)>,
 ) -> Vec<[f32; 2]> {
-    let cr = c_re.clone().with_precision(precision).value();
-    let ci = c_im.clone().with_precision(precision).value();
+    let precision = k.precision;
+    let morph = morph.map(|(from, w)| (from, big_from_f64(w, precision)));
 
     let mut zr = z0_re.clone().with_precision(precision).value();
     let mut zi = z0_im.clone().with_precision(precision).value();
     // Previous iterate, for the Phoenix two-term recurrence (Y_{-1} = 0).
     let mut zr_prev = big_zero(precision);
     let mut zi_prev = big_zero(precision);
-    // Phoenix distortion constant `p` (a small fixed complex number).
-    let pr = big_from_f64(phoenix_p.0, precision);
-    let pi = big_from_f64(phoenix_p.1, precision);
-    // Lambda distortion constant `l` (a small fixed complex number).
-    let lr = big_from_f64(lambda_l.0, precision);
-    let li = big_from_f64(lambda_l.1, precision);
-    // Complex Multibrot exponent (a fixed complex number).
-    let cpow_re = big_from_f64(complex_power.0, precision);
-    let cpow_im = big_from_f64(complex_power.1, precision);
 
     let mut points: Vec<[f32; 2]> = Vec::with_capacity(max_iter as usize + 1);
 
@@ -197,73 +285,13 @@ fn compute_reference_big(
             break;
         }
 
-        let (new_zr, new_zi) = match kind {
-            FractalKind::Mandelbrot => {
-                // Z^2 = (zr^2 - zi^2) + (2 zr zi) i, with zr^2 - zi^2 as
-                // (zr + zi)(zr - zi): one multiply instead of two squares.
-                let re = (&zr + &zi) * (&zr - &zi) + &cr;
-                let im = ((&zr * &zi) << 1) + &ci; // << 1 is exact ×2 in base 2
-                (re, im)
-            }
-            FractalKind::BurningShip => {
-                // (|zr| + i|zi|)^2 = (zr^2 - zi^2) + 2|zr zi| i.
-                let re = &zr.sqr() - &zi.sqr() + &cr;
-                let im = big_abs((&zr * &zi) << 1) + &ci;
-                (re, im)
-            }
-            FractalKind::Tricorn => {
-                // conj(z)^2 = (zr^2 - zi^2) - 2 zr zi i.
-                let re = &zr.sqr() - &zi.sqr() + &cr;
-                let im = &ci - ((&zr * &zi) << 1);
-                (re, im)
-            }
-            FractalKind::Multibrot => {
-                let (pr, pi) = complex_pow(&zr, &zi, power.max(2), precision);
-                (pr + &cr, pi + &ci)
-            }
-            FractalKind::Celtic => {
-                // |Re(z^2)| + i·Im(z^2): abs the real output of the square.
-                let re = big_abs(&zr.sqr() - &zi.sqr()) + &cr;
-                let im = ((&zr * &zi) << 1) + &ci;
-                (re, im)
-            }
-            FractalKind::Perpendicular => {
-                // (x^2 - y^2) - 2·x·|y| i: abs the imaginary input.
-                let re = &zr.sqr() - &zi.sqr() + &cr;
-                let im = if zi.to_f64().value() < 0.0 {
-                    &ci + ((&zr * &zi) << 1)
-                } else {
-                    &ci - ((&zr * &zi) << 1)
-                };
-                (re, im)
-            }
-            FractalKind::Buffalo => {
-                // |Re(z^2)| - |Im(z^2)| i: abs both outputs.
-                let re = big_abs(&zr.sqr() - &zi.sqr()) + &cr;
-                let im = &ci - big_abs((&zr * &zi) << 1);
-                (re, im)
-            }
-            FractalKind::Phoenix => {
-                // z^2 + c + p·z_{n-1}.
-                let re2 = &zr.sqr() - &zi.sqr();
-                let im2 = (&zr * &zi) << 1;
-                let pzr = &pr * &zr_prev - &pi * &zi_prev;
-                let pzi = &pr * &zi_prev + &pi * &zr_prev;
-                (re2 + &cr + pzr, im2 + &ci + pzi)
-            }
-            FractalKind::Lambda => {
-                // λ·z(1 - z): logistic map.
-                let re2 = 1 - &zr;
-                let im2 = -&zi;
-                let lzr = &lr * &zr - &li * &zi;
-                let lzi = &lr * &zi + &li * &zr;
-                (&lzr * &re2 - &lzi * &im2, re2 * lzi + lzr * im2)
-            }
-            FractalKind::ComplexMultibrot => {
-                let (pr, pi) = complex_pow_complex(&zr, &zi, &cpow_re, &cpow_im, precision);
-                (pr + &cr, pi + &ci)
-            }
-        };
+        let (mut new_zr, mut new_zi) = step(kind, k, &zr, &zi, &zr_prev, &zi_prev);
+        if let Some((from, w)) = &morph {
+            // (1 - w)·a + w·b = a + w·(b - a).
+            let (br, bi) = step(*from, k, &zr, &zi, &zr_prev, &zi_prev);
+            new_zr = &new_zr + &(w * &(br - &new_zr));
+            new_zi = &new_zi + &(w * &(bi - &new_zi));
+        }
 
         // Shift the previous iterate (only the Phoenix arm reads it).
         zr_prev = zr;
@@ -273,6 +301,92 @@ fn compute_reference_big(
     }
 
     points
+}
+
+/// One step `f(Z_n)` of `kind`'s formula (including its `+ c`), given the
+/// current and previous iterate.
+fn step(
+    kind: FractalKind,
+    k: &StepConsts,
+    zr: &Big,
+    zi: &Big,
+    zr_prev: &Big,
+    zi_prev: &Big,
+) -> (Big, Big) {
+    let (cr, ci) = (&k.cr, &k.ci);
+    match kind {
+        FractalKind::Mandelbrot => {
+            // Z^2 = (zr^2 - zi^2) + (2 zr zi) i, with zr^2 - zi^2 as
+            // (zr + zi)(zr - zi): one multiply instead of two squares.
+            let re = (zr + zi) * (zr - zi) + cr;
+            let im = ((zr * zi) << 1) + ci; // << 1 is exact ×2 in base 2
+            (re, im)
+        }
+        FractalKind::BurningShip => {
+            // (|zr| + i|zi|)^2 = (zr^2 - zi^2) + 2|zr zi| i.
+            let re = &zr.sqr() - &zi.sqr() + cr;
+            let im = big_abs((zr * zi) << 1) + ci;
+            (re, im)
+        }
+        FractalKind::Tricorn => {
+            // conj(z)^2 = (zr^2 - zi^2) - 2 zr zi i.
+            let re = &zr.sqr() - &zi.sqr() + cr;
+            let im = ci - ((zr * zi) << 1);
+            (re, im)
+        }
+        FractalKind::Multibrot => {
+            let (pr, pi) = complex_pow(zr, zi, k.power.max(2), k.precision);
+            (pr + cr, pi + ci)
+        }
+        FractalKind::Celtic => {
+            // |Re(z^2)| + i·Im(z^2): abs the real output of the square.
+            let re = big_abs(&zr.sqr() - &zi.sqr()) + cr;
+            let im = ((zr * zi) << 1) + ci;
+            (re, im)
+        }
+        FractalKind::Perpendicular => {
+            // (x^2 - y^2) - 2·x·|y| i: abs the imaginary input.
+            let re = &zr.sqr() - &zi.sqr() + cr;
+            let im = if zi.to_f64().value() < 0.0 {
+                ci + ((zr * zi) << 1)
+            } else {
+                ci - ((zr * zi) << 1)
+            };
+            (re, im)
+        }
+        FractalKind::Buffalo => {
+            // |Re(z^2)| - |Im(z^2)| i: abs both outputs.
+            let re = big_abs(&zr.sqr() - &zi.sqr()) + cr;
+            let im = ci - big_abs((zr * zi) << 1);
+            (re, im)
+        }
+        FractalKind::Phoenix => {
+            // z^2 + c + p·z_{n-1}.
+            let re2 = &zr.sqr() - &zi.sqr();
+            let im2 = (zr * zi) << 1;
+            let pzr = &k.pr * zr_prev - &k.pi * zi_prev;
+            let pzi = &k.pr * zi_prev + &k.pi * zr_prev;
+            (re2 + cr + pzr, im2 + ci + pzi)
+        }
+        FractalKind::Lambda => {
+            // λ·z(1 - z): logistic map (+ c on the parameter plane).
+            let re2 = 1 - zr;
+            let im2 = -zi;
+            let lzr = &k.lr * zr - &k.li * zi;
+            let lzi = &k.lr * zi + &k.li * zr;
+            let re = &lzr * &re2 - &lzi * &im2;
+            let im = re2 * lzi + lzr * im2;
+            if k.set_plane {
+                (re + cr, im + ci)
+            } else {
+                (re, im)
+            }
+        }
+        FractalKind::ComplexMultibrot => {
+            let (pr, pi) = complex_pow_complex(zr, zi, &k.cpow_re, &k.cpow_im, k.precision);
+            (pr + cr, pi + ci)
+        }
+    }
 }
 
 fn big_zero(precision: usize) -> Big {
@@ -338,9 +452,10 @@ pub fn compute_set_reference(
     phoenix_p: (f64, f64),
     lambda_l: (f64, f64),
     complex_power: (f64, f64),
+    morph: Option<(FractalKind, f64)>,
 ) -> Vec<[f32; 2]> {
     let zero = big_zero(precision);
-    compute_reference(
+    compute_reference_inner(
         &zero,
         &zero,
         center_re,
@@ -352,6 +467,8 @@ pub fn compute_set_reference(
         phoenix_p,
         lambda_l,
         complex_power,
+        morph,
+        true,
     )
 }
 
@@ -375,6 +492,7 @@ mod tests {
             (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
+            None,
         );
 
         // Independent naive f64 orbit.
@@ -401,37 +519,42 @@ mod tests {
     }
 
     /// The f64 fast path (shallow views) must produce the same orbit as the
-    /// arbitrary-precision path, for every kind, in both planes.
+    /// arbitrary-precision path, for every kind, in both planes, with and
+    /// without a kind-switch morph.
     #[test]
     fn f64_fast_path_matches_big() {
         let bits_fast = F64_MAX_PRECISION;
         let bits_big = F64_MAX_PRECISION + 64;
         for kind in FractalKind::ALL {
             for julia in [false, true] {
-                let run = |bits: usize| {
-                    let (a, b) = (big_from_f64(-0.3, bits), big_from_f64(0.2, bits));
-                    let (jr, ji) = (big_from_f64(-0.4, bits), big_from_f64(0.55, bits));
-                    let args = (60, bits, kind, 3, (0.1, -0.2), (0.9, 0.3), (2.3, 0.4));
-                    if julia {
-                        compute_reference(
-                            &a, &b, &jr, &ji, args.0, args.1, args.2, args.3, args.4, args.5,
-                            args.6,
-                        )
-                    } else {
-                        compute_set_reference(
-                            &a, &b, args.0, args.1, args.2, args.3, args.4, args.5, args.6,
-                        )
-                    }
-                };
-                let (fast, big) = (run(bits_fast), run(bits_big));
-                assert_eq!(fast.len(), big.len(), "{kind:?} julia={julia}: length");
-                for (i, (f, b)) in fast.iter().zip(&big).enumerate() {
-                    for k in 0..2 {
-                        let tol = 1e-5 * (1.0 + b[k].abs());
-                        assert!(
-                            (f[k] - b[k]).abs() <= tol,
-                            "{kind:?} julia={julia}: point {i} {f:?} vs {b:?}"
-                        );
+                for morph in [None, Some((FractalKind::Phoenix, 0.3))] {
+                    let run = |bits: usize| {
+                        let (a, b) = (big_from_f64(-0.3, bits), big_from_f64(0.2, bits));
+                        let (jr, ji) = (big_from_f64(-0.4, bits), big_from_f64(0.55, bits));
+                        let args = (60, bits, kind, 3, (0.1, -0.2), (0.9, 0.3), (2.3, 0.4));
+                        if julia {
+                            compute_reference(
+                                &a, &b, &jr, &ji, args.0, args.1, args.2, args.3, args.4, args.5,
+                                args.6, morph,
+                            )
+                        } else {
+                            compute_set_reference(
+                                &a, &b, args.0, args.1, args.2, args.3, args.4, args.5, args.6,
+                                morph,
+                            )
+                        }
+                    };
+                    let ctx = format!("{kind:?} julia={julia} morph={morph:?}");
+                    let (fast, big) = (run(bits_fast), run(bits_big));
+                    assert_eq!(fast.len(), big.len(), "{ctx}: length");
+                    for (i, (f, b)) in fast.iter().zip(&big).enumerate() {
+                        for k in 0..2 {
+                            let tol = 1e-5 * (1.0 + b[k].abs());
+                            assert!(
+                                (f[k] - b[k]).abs() <= tol,
+                                "{ctx}: point {i} {f:?} vs {b:?}"
+                            );
+                        }
                     }
                 }
             }
@@ -453,6 +576,7 @@ mod tests {
             (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
+            None,
         );
         assert_eq!(points.len(), 501, "interior orbit should not escape");
     }
@@ -472,6 +596,7 @@ mod tests {
             (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
+            None,
         );
 
         let (c_re, c_im) = (-1.75_f64, -0.03_f64);
@@ -502,6 +627,7 @@ mod tests {
             (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
+            None,
         );
 
         let (c_re, c_im) = (0.3_f64, 0.2_f64);
@@ -538,6 +664,7 @@ mod tests {
             (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
+            None,
         );
 
         let (mut zr, mut zi) = (0.15_f64, -0.1_f64);
@@ -568,6 +695,7 @@ mod tests {
             (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
+            None,
         );
 
         let (c_re, c_im) = (-0.6_f64, 0.4_f64);
@@ -599,6 +727,7 @@ mod tests {
             (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
+            None,
         );
 
         let (c_re, c_im) = (-0.7_f64, -0.2_f64);
@@ -630,6 +759,7 @@ mod tests {
             (0.0, 0.0),
             (0.0, 0.0),
             (0.0, 0.0),
+            None,
         );
 
         let (c_re, c_im) = (-1.2_f64, -0.35_f64);
@@ -662,6 +792,7 @@ mod tests {
             p,
             (0.0, 0.0),
             (0.0, 0.0),
+            None,
         );
 
         let (c_re, c_im) = (0.5667_f64, 0.0_f64);
@@ -700,6 +831,7 @@ mod tests {
             (0.0, 0.0),
             (0.0, 0.0),
             power,
+            None,
         );
 
         // Naive f64 complex power via z^p = exp(p * ln z), ln z = ln|z| + i*arg(z).
@@ -726,6 +858,74 @@ mod tests {
             let nzi = pi + c_im;
             zr = nzr;
             zi = nzi;
+        }
+    }
+
+    fn set_ref(
+        cr: f64,
+        ci: f64,
+        kind: FractalKind,
+        morph: Option<(FractalKind, f64)>,
+    ) -> Vec<[f32; 2]> {
+        compute_set_reference(
+            &Big::try_from(cr).unwrap(),
+            &Big::try_from(ci).unwrap(),
+            60,
+            200,
+            kind,
+            2,
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+            morph,
+        )
+    }
+
+    /// Morph weight 0 is the plain kind; weight 1 is entirely the from-kind.
+    #[test]
+    fn morph_endpoints_match_plain_kinds() {
+        let (cr, ci) = (-1.75, -0.03);
+        let ship = set_ref(cr, ci, FractalKind::BurningShip, None);
+        let mandel = set_ref(cr, ci, FractalKind::Mandelbrot, None);
+        let w0 = set_ref(
+            cr,
+            ci,
+            FractalKind::BurningShip,
+            Some((FractalKind::Mandelbrot, 0.0)),
+        );
+        let w1 = set_ref(
+            cr,
+            ci,
+            FractalKind::BurningShip,
+            Some((FractalKind::Mandelbrot, 1.0)),
+        );
+        assert_eq!(w0, ship);
+        assert_eq!(w1, mandel);
+    }
+
+    /// A half-way Mandelbrot / Burning Ship morph matches a naive f64
+    /// iteration of the per-step blend.
+    #[test]
+    fn morph_blend_matches_naive_f64() {
+        let (c_re, c_im) = (-0.6_f64, 0.3_f64);
+        let w = 0.5_f64;
+        let points = set_ref(
+            c_re,
+            c_im,
+            FractalKind::Mandelbrot,
+            Some((FractalKind::BurningShip, w)),
+        );
+
+        let (mut zr, mut zi) = (0.0_f64, 0.0_f64);
+        for point in &points {
+            let tol = 1e-4 * (1.0 + zr.abs().max(zi.abs()));
+            assert!((point[0] as f64 - zr).abs() < tol, "re: {point:?} vs {zr}");
+            assert!((point[1] as f64 - zi).abs() < tol, "im: {point:?} vs {zi}");
+            let re = zr * zr - zi * zi + c_re; // identical for both kinds
+            let im_m = 2.0 * zr * zi + c_im;
+            let im_b = 2.0 * (zr * zi).abs() + c_im;
+            zr = re;
+            zi = (1.0 - w) * im_m + w * im_b;
         }
     }
 }

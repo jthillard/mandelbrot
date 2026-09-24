@@ -28,6 +28,8 @@ pub struct RefRequest {
     pub lambda_l: (f64, f64),
     /// Complex exponent for the Complex Multibrot kind (ignored by other kinds).
     pub complex_power: (f64, f64),
+    /// Kind-switch morph: `(from_kind, weight)` blended into every step.
+    pub morph: Option<(FractalKind, f32)>,
 }
 
 pub struct RefResult {
@@ -35,6 +37,8 @@ pub struct RefResult {
     pub center_im: Big,
     pub half_height: f64,
     pub points: Vec<[f32; 2]>,
+    /// The morph `points` was computed with (echoed from the request).
+    pub morph: Option<(FractalKind, f32)>,
 }
 
 pub struct RefWorker {
@@ -68,6 +72,7 @@ impl RefWorker {
                             center_im: req.center_im,
                             half_height: req.half_height,
                             points,
+                            morph: req.morph,
                         })
                         .is_err()
                     {
@@ -110,6 +115,7 @@ fn compute(req: &RefRequest) -> Vec<[f32; 2]> {
             req.phoenix_p,
             req.lambda_l,
             req.complex_power,
+            req.morph.map(|(k, w)| (k, w as f64)),
         )
     } else {
         compute_set_reference(
@@ -122,6 +128,7 @@ fn compute(req: &RefRequest) -> Vec<[f32; 2]> {
             req.phoenix_p,
             req.lambda_l,
             req.complex_power,
+            req.morph.map(|(k, w)| (k, w as f64)),
         )
     }
 }
