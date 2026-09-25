@@ -121,11 +121,21 @@ fn cm_coef(k: u32) -> vec2<f32> {
 // dynamics, not a deep-zoom edge case — and the series above would diverge.
 // But forming Z+e directly is numerically safe exactly there (e isn't many
 // orders of magnitude smaller than Z), so fall back to a plain subtraction.
+//
+// The series is also wrong when Z -> Z+e crosses the principal branch cut
+// (negative real axis) that `cpow` and the CPU reference use. There it
+// continues Z's branch, but the true map jumps by a factor e^{2πip}. Which
+// pixels crossed then depended on the reference's position, so whole disks
+// flipped branch while panning. With |w| < 0.5, arg(1+w) is within ±30°, so an
+// Im sign flip with Re(Z) < 0 is exactly a cut crossing. The direct form is
+// fine there: the true delta across the cut is large, not tiny.
 fn complex_multibrot_delta(z: vec2<f32>, e: vec2<f32>, p: vec2<f32>) -> vec2<f32> {
+    let y = z + e;
+    let crosses_cut = z.x < 0.0 && ((z.y < 0.0) != (y.y < 0.0));
     // |w|^2 = |e|^2 / |Z|^2; inf or nan (Z ~ 0, or both ~ 0) correctly fails
     // the `< 0.25` test below and falls through to the direct branch.
     let w2 = dot(e, e) / dot(z, z);
-    if w2 < 0.25 {
+    if w2 < 0.25 && !crosses_cut {
         let w = cdiv(e, z);
         var wk = w; // w^1
         var acc = vec2<f32>(0.0, 0.0);
@@ -138,7 +148,7 @@ fn complex_multibrot_delta(z: vec2<f32>, e: vec2<f32>, p: vec2<f32>) -> vec2<f32
         }
         return cmul(cpow(z, p), acc);
     }
-    return cpow(z + e, p) - cpow(z, p);
+    return cpow(y, p) - cpow(z, p);
 }
 
 // One perturbation step of `kind`'s delta: e -> f(Z+e) - f(Z), where `z` is
