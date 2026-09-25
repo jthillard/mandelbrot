@@ -503,6 +503,10 @@ pub struct FractalApp {
     // Use shadow coloring
     // Use 3D raymarching rendering
     rendering_mode: u32,
+    /// Per-axis scale of the 3D view's height-field texture relative to the
+    /// widget: higher shows sharper, more distant terrain but costs GPU time
+    /// and memory.
+    render_scale_3d: f32,
 
     /// List of enabled lights in the world
     lights: Vec<Light>,
@@ -716,6 +720,7 @@ impl FractalApp {
             worker: crate::worker::RefWorker::spawn(),
             pending: false,
             export_scale: 2.0,
+            render_scale_3d: 2.0,
             last_size_px: egui::vec2(1280.0, 720.0),
             last_interact_time: -1.0e9,
             export_requested: false,
@@ -1360,7 +1365,10 @@ impl FractalApp {
     /// then zoom the 2D view about the matching fractal-texture pixel.
     fn zoom_3d_at(&mut self, off: egui::Vec2, rect: egui::Rect, height_px: f64, factor: f64) {
         let ndc = (off / rect.size()) * 2.;
-        let camera_ndc_pos = self.camera.orthographic(self.anim.camera_state).inverse()
+        let camera_ndc_pos = self
+            .camera
+            .orthographic(self.anim.camera_state, self.render_scale_3d)
+            .inverse()
             * Vec4::new(ndc.x, ndc.y, 0., 1.);
         let view_direction = self.camera.direction(self.anim.camera_state);
 
@@ -1402,7 +1410,7 @@ impl FractalApp {
             morph_w: self.ref_morph.map_or(0.0, |(_, w)| w),
             camera_inv_proj: self
                 .camera
-                .orthographic(self.anim.camera_state)
+                .orthographic(self.anim.camera_state, self.render_scale_3d)
                 .inverse()
                 .to_cols_array(),
             screen_dim: self.screen_dim,
@@ -2188,6 +2196,22 @@ impl FractalApp {
             ui.radio_value(&mut self.rendering_mode, 1, "Shadow");
             ui.radio_value(&mut self.rendering_mode, 2, "3D");
         });
+        if self.rendering_mode == 2 {
+            let old_scale = self.render_scale_3d;
+            ui.add(egui::Slider::new(&mut self.render_scale_3d, 1.0..=4.0).text("3D render scale"))
+                .on_hover_text(
+                    "Resolution multiplier of the 3D height field. Higher shows more \
+                 distant detail but costs GPU time and memory.",
+                );
+            // The 3D camera zooms in by the render scale (`Camera::orthographic`):
+            // zoom the view out by the same ratio so the fractal keeps its
+            // on-screen size and the extra texels become surrounding terrain.
+            if self.render_scale_3d != old_scale {
+                let factor = (self.render_scale_3d / old_scale) as f64;
+                self.view
+                    .zoom_at_pixel(0.0, 0.0, self.last_size_px.y.max(1.0) as f64, factor);
+            }
+        }
 
         ui.add_space(4.);
         ui.separator();
@@ -2832,7 +2856,8 @@ impl FractalApp {
         ];
 
         if self.effective_rendering_mode() == 2 {
-            size_px = [size_px[0] * 2, size_px[1] * 2];
+            let s = self.render_scale_3d;
+            size_px = size_px.map(|v| ((v as f32 * s).round() as u32).max(1));
         }
 
         self.screen_dim = [rect.width(), rect.height()];

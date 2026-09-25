@@ -53,11 +53,15 @@ impl Camera {
         self.pitch = pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
-    pub fn orthographic(&self, t: f32) -> glam::Mat4 {
+    /// `render_scale` is the 3D texture's per-axis scale (see
+    /// `FractalApp::render_scale_3d`): the full 3D camera (`t = 1`) zooms in
+    /// by the same factor, so one texel still covers one screen pixel and the
+    /// extra texels become terrain beyond the screen edges.
+    pub fn orthographic(&self, t: f32, render_scale: f32) -> glam::Mat4 {
         let yaw = self.yaw * t;
         let pitch = self.pitch * t;
 
-        let zoom = 0.5 * (1. + t);
+        let zoom = 0.5 * (1. + t * (render_scale - 1.));
         // Orbit pivot: the center of the fractal texture, which the raymarcher's
         // `sdf` lays out over world x ∈ [0, aspect], y ∈ [0, 1] on the z = 0 plane.
         let view = glam::Mat4::from_translation(Vec3::new(0.5 * self.aspect_ratio, 0.5, 0.))

@@ -29,7 +29,8 @@ const DATA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 /// Cap on the interactive cache's pixel count (the texture is scaled down,
 /// aspect kept, above it). Each pixel costs 36 bytes across the data, AA and
-/// colour textures, and the 3D view renders at 2× per axis, so a HiDPI screen
+/// colour textures, and the 3D view renders at a configurable multiple per axis
+/// (default 2×), so a HiDPI screen
 /// in 3D would otherwise want 0.5 GB+. Browsers cap WebGPU memory well below
 /// what native gets, so the web budget is ~4K (≈300 MB); native, ~8K.
 #[cfg(target_arch = "wasm32")]
@@ -1411,7 +1412,7 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
 
         // Clamp to the device's texture-size limit, keeping the aspect ratio
         // (the iterate pass maps pixels through NDC, so the view is unchanged;
-        // the blit just upsamples). The 2× 3D supersample on a large/HiDPI
+        // the blit just upsamples). The 3D supersample (default 2×) on a large/HiDPI
         // screen can otherwise exceed it.
         // Also cap the total pixel count (`MAX_CACHE_PIXELS`), same way.
         let max_dim = device.limits().max_texture_dimension_2d;
