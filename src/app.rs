@@ -2142,7 +2142,7 @@ impl FractalApp {
             return;
         }
 
-        if self.mode == FractalMode::Julia && self.kind != FractalKind::Lambda {
+        if self.mode == FractalMode::Julia {
             ui.horizontal(|ui| {
                 ui.label("c =");
                 ui.add(

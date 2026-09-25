@@ -26,7 +26,7 @@ pub enum FractalKind {
     Buffalo = 6,
     /// `z -> z^2 + c + p·z_{n-1}` (two-term recurrence; `p` is `phoenix_p`).
     Phoenix = 7,
-    /// `z -> lambda·z(1 - z)` (logistic map).
+    /// `z -> lambda·z(1 - z) + c` (logistic map).
     Lambda = 8,
     /// `z -> z^power + c`, where `power` is a complex constant (the
     /// `complex_power` argument), via the principal branch `z^p = exp(p·ln z)`.
@@ -104,7 +104,7 @@ impl FractalKind {
             FractalKind::Perpendicular => "z = (x² − y²) − 2x|y|i + c".to_string(),
             FractalKind::Buffalo => "z = |Re(z²)| − i|Im(z²)| + c".to_string(),
             FractalKind::Phoenix => "z = z² + c + p·z_prev".to_string(),
-            FractalKind::Lambda => "z = λ·z(1 − z)".to_string(),
+            FractalKind::Lambda => "z = λ·z(1 − z) + c".to_string(),
             FractalKind::ComplexMultibrot => {
                 format!("z = z^({:.3}{:+.3}i) + c", complex_power.0, complex_power.1)
             }
