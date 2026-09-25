@@ -255,10 +255,19 @@ fn phoenix_weight() -> f32 {
     return w;
 }
 
-// Periodicity (interior) detection, Brent-style: the full orbit value is
-// saved at iterations PERIOD_FIRST_CHECK, 2x that, 4x ..., and every later
-// iterate is compared against the last saved one. Returning within
-// PERIOD_EPS2 (relative, squared) means the orbit has closed a cycle.
+// Periodicity (interior) detection, Brent-style: windows end at iterations
+// PERIOD_FIRST_CHECK, 2x that, 4x ..., and at each window end the window's
+// iterate closest to the critical point is saved. Every later iterate is
+// compared against the last saved one. Returning within PERIOD_EPS2
+// (relative, squared) means the orbit has closed a cycle.
+//
+// Why the closest-to-critical iterate rather than the one at the window end:
+// near a deep minibrot, an orbit follows the minibrot's cycle with a
+// deviation at the minibrot's own scale. At an arbitrary phase |z| ~ 1, so
+// that deviation is far below the relative tolerance and *any* nearby
+// exterior orbit "returned" (a large black disk around a minibrot at
+// ~1e-13 zoom). At the phase nearest the critical point, z itself is at the
+// minibrot's scale, so the relative tolerance measures the actual return.
 //
 // A close return alone isn't trusted. A pixel just *outside* the set (at a
 // minibrot's edge, or a cusp) can shadow a cycle for thousands of iterations
@@ -298,6 +307,15 @@ fn periodic_enabled() -> bool {
         return false;
     }
     return true;
+}
+
+// Critical point of the current map (where f' = 0), the periodicity save
+// point's reference: 0 for every z^p-like kind, 1/2 for Lambda's λz(1-z).
+fn critical_point() -> vec2<f32> {
+    if KIND == KIND_LAMBDA {
+        return vec2<f32>(0.5, 0.0);
+    }
+    return vec2<f32>(0.0, 0.0);
 }
 
 // Escape data for one sample: `ci` is the (color-independent) palette parameter,
@@ -378,6 +396,12 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     var check_at = PERIOD_FIRST_CHECK;
     var period_hit = false;
     var period_streak = 0u;
+    // This window's save candidate: its iterate closest to the critical
+    // point, that distance squared, and the |f'|^2 product since it.
+    let crit = critical_point();
+    var z_cand = z;
+    var cand_d2 = 3.0e38;
+    var mult2_cand = 1.0;
 
     loop {
         if z2 > bailout_sq {
@@ -397,7 +421,9 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
             fp = fprime(z);
         }
         if periodic {
-            mult2 = mult2 * dot(fp, fp);
+            let fp2 = dot(fp, fp);
+            mult2 = mult2 * fp2;
+            mult2_cand = mult2_cand * fp2;
         }
         if DE {
             var dzs_new = cmul(fp, dzs);
@@ -459,13 +485,20 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
                     break;
                 }
             }
+            let dc2 = dot(z - crit, z - crit);
+            if dc2 < cand_d2 {
+                cand_d2 = dc2;
+                z_cand = z;
+                mult2_cand = 1.0;
+            }
             if n == check_at {
                 if !period_hit {
                     period_streak = 0u;
                 }
                 period_hit = false;
-                z_saved = z;
-                mult2 = 1.0;
+                z_saved = z_cand;
+                mult2 = mult2_cand;
+                cand_d2 = 3.0e38;
                 check_at = check_at * 2u;
             }
         }

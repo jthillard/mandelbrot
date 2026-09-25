@@ -133,8 +133,11 @@ pixel is a handful of `f32` complex multiplies.
   clearly attracting (`PERIOD_MAX_MULT2`), and the contracting return must
   repeat in `PERIOD_CONFIRMATIONS` consecutive windows. Both guards are
   needed: without them, exterior pixels at cusps and minibrot edges turned
-  black. Retune them only against f64 ground truth on such views. Phoenix is
-  excluded (two-term map).
+  black. Retune them only against f64 ground truth on such views. Each
+  window saves its iterate closest to the critical point, not the one at the
+  checkpoint. At an arbitrary phase the relative tolerance is far coarser
+  than a deep minibrot's scale, and a black disk surrounded the minibrot
+  (seen at ~1e-13 zoom). Phoenix is excluded (two-term map).
   `advance_delta(z, e)` is the per-kind delta step (`z` = reference point,
   `e` = current delta); the caller adds `step_add` (= `dc`) afterward — this
   relies on `c` being additive in every current kind's formula (a kind where
