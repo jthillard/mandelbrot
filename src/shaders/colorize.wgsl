@@ -150,18 +150,44 @@ fn ray_marching(pos: vec4<f32>) -> vec4<f32> {
     // About 1/50 of a texel at typical sizes: tighter only adds steps
     // without visibly moving the hit.
     let dist_threshold = 0.00001;
+    // Rays grazing the exponential slope see a tiny `dist` for many steps in
+    // a row and would crawl along it until the step budget runs out. Force a
+    // step of at least half a texel (the height field is nearest-sampled, so
+    // nothing finer exists), and bisect back if that lands inside the solid.
+    let min_step = 0.5 * k.inv_size_y;
     var hit = false;
+    var t_prev = t;
     for (var i = 0u; i < 100u; i++) {
         let dist = sdf(start + t * ray_dir, k);
         if dist < dist_threshold {
             hit = true;
+            if dist < 0. {
+                // Overshot: t_prev is outside, t inside. Refine the crossing.
+                var lo = t_prev;
+                var hi = t;
+                for (var j = 0u; j < 8u; j++) {
+                    let mid = 0.5 * (lo + hi);
+                    if sdf(start + mid * ray_dir, k) < dist_threshold {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                t = hi;
+            }
             break;
         }
-        t += dist;
+        t_prev = t;
+        t += max(dist, min_step);
         // Past the footprint's far edge: nothing left to hit.
         if t >= t_leave {
             break;
         }
+    }
+    // Out of steps while still over the footprint: the ray is skimming the
+    // surface, so shade where it got to rather than reporting a miss.
+    if !hit && t < t_leave {
+        hit = true;
     }
     // Shade outside the loop, so its registers don't weigh on the march.
     if !hit {
