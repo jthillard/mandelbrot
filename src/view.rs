@@ -201,6 +201,7 @@ pub fn interpolate_view(from: &ViewState, to: &ViewState, t: f64) -> ViewState {
     ViewState::with_center(center_re, center_im, half_height)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn interpolate_f64(from: f64, to: f64, t: f64) -> f64 {
     from + (to - from) * t
 }

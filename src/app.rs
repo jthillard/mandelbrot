@@ -581,6 +581,7 @@ pub struct FractalApp {
     export: Option<Arc<Mutex<ExportShared>>>,
     /// Output path for `--export-path` (native CLI only); falls back to a
     /// timestamped name when unset.
+    #[cfg(not(target_arch = "wasm32"))]
     export_path: Option<String>,
     /// Short status line (saved path, "link copied", errors).
     status: Option<String>,
@@ -719,6 +720,7 @@ impl FractalApp {
             last_interact_time: -1.0e9,
             export_requested: false,
             export: None,
+            #[cfg(not(target_arch = "wasm32"))]
             export_path: None,
             status: None,
             center_re_edit,
