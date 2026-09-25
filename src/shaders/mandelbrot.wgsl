@@ -508,8 +508,18 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         // 3D saturates heights smoothly itself (`sdf` in colorize.wgsl).
         let zmag = sqrt(max(z2, 1.0));
         let dzmag = sqrt(max(dot(dzs_esc, dzs_esc), 1e-30));
+        // |z|·ln|z|/|dz| is G/|G'| (G the potential, ln|z|/2^n). Far from the
+        // set G ~ ln r, so it grows like r·ln r rather than r: zoomed far out,
+        // the 3D cone got steeper with every zoom step, down to a texel-wide
+        // needle cut off above the plateau. Replacing G by 2(1 - e^(-G/2))
+        // leaves it unchanged near the set (G -> 0, and ~0.8x at the edge of
+        // the default view) but caps it at 2, so far away DE grows like 2r
+        // and the cone stops narrowing. G underflows to 0 past ~150
+        // iterations, where the factor is 1 anyway.
+        let g = log(zmag) * exp2(-f32(n));
+        let far = select(1.0, 2.0 * (1.0 - exp(-g / 2.0)) / g, g > 1e-4);
         let max_de = select(1.0, 1e30, u.shadow != 0u);
-        de = clamp(zmag * log(zmag) / dzmag, 0.0, max_de);
+        de = clamp(zmag * log(zmag) / dzmag * far, 0.0, max_de);
     }
     return Sample(ci, de, true);
 }
