@@ -502,9 +502,13 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         // filaments stay crisp instead of aliasing into speckle. If |dzs|
         // overflowed (far sub-pixel from the set), de -> 0 and the boundary
         // simply reads as dark, which is the correct limit.
+        // Shadow/3D use DE as a height field, so it must stay unclamped: any
+        // cap flattens everything farther than that from the set into a
+        // uniform plateau (a visible circle around the set when zoomed out).
+        // 3D saturates heights smoothly itself (`sdf` in colorize.wgsl).
         let zmag = sqrt(max(z2, 1.0));
         let dzmag = sqrt(max(dot(dzs_esc, dzs_esc), 1e-30));
-        let max_de = select(1.0, 1000.0, u.shadow != 0u);
+        let max_de = select(1.0, 1e30, u.shadow != 0u);
         de = clamp(zmag * log(zmag) / dzmag, 0.0, max_de);
     }
     return Sample(ci, de, true);
@@ -586,7 +590,7 @@ fn fs_data(in: VsOut) -> @location(0) vec4<f32> {
 // 4-neighbour's 1-spp sample differs from its own by more than this. `ci`
 // steps are palette-phase steps of `ci * color_scale` (color_scale <= 1 in the
 // UI), so 0.02 keeps anything visibly banded; DE is compared relative to its
-// own magnitude (it's in pixels, up to 1000 for shadow/3D height fields).
+// own magnitude (it's in pixels, unbounded for shadow/3D height fields).
 const AA_CI_EPS: f32 = 0.02;
 const AA_DE_EPS: f32 = 0.1;
 

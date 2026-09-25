@@ -164,7 +164,7 @@ fn shadow_color(normal: vec3<f32>, ci: f32) -> vec3<f32> {
         color = filmic(color, 4.2);
     } else if u.shadow_palette_id == 3u {
         // No DE darkening as in `classic_color`: in shadow/3D modes the DE
-        // is a height (clamped to 1000, not 1), and the lighting already
+        // is a height (unclamped, not capped at 1), and the lighting already
         // shows the relief.
         let t = fract(ci * u.color_scale + u.color_offset);
         let ambient = 0.25;
