@@ -1,9 +1,11 @@
 //! Camera / view state over the complex plane.
 //!
 //! The center is stored in arbitrary precision (`FBig`) — this is what lets us
-//! zoom far past f64's ~1e13x limit. The pixel *scale* stays `f64`: even at
-//! 10^30x zoom the scale is ~1e-33, comfortably inside f64's range. Only the
-//! center needs the extra digits.
+//! zoom far past f64's ~1e13x limit. The pixel *scale* stays `f64`, which
+//! bounds zoom at ~10^300x (`MIN_HALF_HEIGHT`). Only the center needs the
+//! extra digits. Once a pixel is smaller than `DEEP_PIXEL_SIZE` the GPU
+//! switches to rescaled deltas (see `needs_deep`), since f32 alone bottoms
+//! out near 1e-38.
 
 use core::str::FromStr;
 
@@ -15,6 +17,34 @@ pub type Big = FBig<HalfAway, 2>;
 
 /// Half-height (complex units) of the default view; also the zoom-1 reference.
 pub const DEFAULT_HALF_HEIGHT: f64 = 1.25;
+
+/// Smallest half-height the view can zoom to: f64's range (the pixel scale,
+/// and the rescaled GPU uniforms, are computed in f64).
+pub const MIN_HALF_HEIGHT: f64 = 1e-300;
+
+/// Below this pixel size (complex units per pixel) the GPU renders with the
+/// deep pipeline, whose per-pixel deltas start out as an f32 mantissa times
+/// `2^scale_exp`. Plain f32 stays exact as long as the smallest per-pixel
+/// offsets (a quarter pixel, for the AA grid) are normal floats (>= 2^-126),
+/// i.e. down to 2^-124 per pixel. Measured: pixel-identical to the deep path
+/// down to 2^-124 (no AA), first errors at 2^-126, all black by 2^-136. The
+/// deep path is slower, so the switch is as late as that allows, with two
+/// binades of margin.
+pub const DEEP_PIXEL_SIZE: f64 = 1.0 / (1u128 << 122) as f64; // 2^-122
+
+/// Whether a view rendered `height_px` pixels tall needs the deep pipeline
+/// (see `DEEP_PIXEL_SIZE`).
+pub fn needs_deep(half_height: f64, height_px: f64) -> bool {
+    2.0 * half_height / height_px.max(1.0) < DEEP_PIXEL_SIZE
+}
+
+/// Binary exponent `E` of the deep view scale: `floor(log2(half_height))`,
+/// so the rescaled span is in `[2, 4)`. Never 0, which means "not deep"
+/// (see `Uniforms::scale_exp`).
+pub fn deep_scale_exp(half_height: f64) -> i32 {
+    let e = half_height.max(MIN_HALF_HEIGHT).log2().floor() as i32;
+    if e == 0 { -1 } else { e }
+}
 
 /// Guard bits added on top of the zoom-dictated precision.
 const GUARD_BITS: usize = 48;
@@ -103,7 +133,7 @@ impl ViewState {
         let k = cpp * (1.0 - factor);
         self.center_re = &self.center_re + &big_from_f64(off_x * k, bits);
         self.center_im = &self.center_im + &big_from_f64(off_y * k, bits);
-        self.half_height *= factor;
+        self.half_height = (self.half_height * factor).max(MIN_HALF_HEIGHT);
     }
 
     /// Build a view from full-precision center coordinates and a half-height.
@@ -111,7 +141,7 @@ impl ViewState {
         let mut v = Self {
             center_re,
             center_im,
-            half_height,
+            half_height: half_height.max(MIN_HALF_HEIGHT),
         };
         v.sync_precision();
         v
@@ -138,6 +168,7 @@ pub fn parse_view_spec(spec: &str) -> Option<(ViewState, Option<u32>)> {
     if !(half_height > 0.0 && half_height.is_finite()) {
         return None;
     }
+    let half_height = half_height.max(MIN_HALF_HEIGHT);
     let bits = precision_for(half_height);
     let re = big_from_decimal_str(parts[0], bits)?;
     let im = big_from_decimal_str(parts[1], bits)?;
@@ -153,7 +184,7 @@ pub fn parse_half_height_spec(spec: &str) -> Option<f64> {
     if !(half_height > 0.0 && half_height.is_finite()) {
         return None;
     }
-    Some(half_height)
+    Some(half_height.max(MIN_HALF_HEIGHT))
 }
 /// Parse a "re,im" spec (re/im decimal, parsed at
 /// full precision) into a view. Shared by

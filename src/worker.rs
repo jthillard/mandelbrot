@@ -9,7 +9,7 @@
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 
-use crate::fractal::{FractalKind, compute_reference, compute_set_reference};
+use crate::fractal::{FractalKind, RefOrbit, compute_reference, compute_set_reference};
 use crate::view::{Big, big_from_f64};
 
 pub struct RefRequest {
@@ -36,7 +36,7 @@ pub struct RefResult {
     pub center_re: Big,
     pub center_im: Big,
     pub half_height: f64,
-    pub points: Vec<[f32; 2]>,
+    pub points: RefOrbit,
     /// The kind and morph `points` was computed with (echoed from the
     /// request).
     pub kind: FractalKind,
@@ -102,7 +102,7 @@ impl RefWorker {
     }
 }
 
-fn compute(req: &RefRequest) -> Vec<[f32; 2]> {
+fn compute(req: &RefRequest) -> RefOrbit {
     if req.julia {
         let jr = big_from_f64(req.julia_c.0, req.precision);
         let ji = big_from_f64(req.julia_c.1, req.precision);

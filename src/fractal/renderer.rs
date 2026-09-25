@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use eframe::egui_wgpu::{self, wgpu};
 
+use super::reference::RefOrbit;
 use crate::lights::{GpuLight, Light, MAX_LIGHT_COUNT, gpu_lights};
 
 /// Maximum reference-orbit length (points) the storage buffer can hold. Also
@@ -51,6 +52,7 @@ fn geom_differs(a: &Uniforms, b: &Uniforms) -> bool {
         || a.power != b.power
         || a.complex_power != b.complex_power
         || a.dc_offset != b.dc_offset
+        || a.scale_exp != b.scale_exp
         || a.phoenix_p != b.phoenix_p
         || a.lambda_l != b.lambda_l
         || a.morph_from != b.morph_from
@@ -87,6 +89,9 @@ pub struct PipelineKey {
     de: bool,
     /// A kind-switch morph is in progress (`morph_w > 0`).
     morph: bool,
+    /// Deep view: the delta starts out in rescaled (mantissa + exponent)
+    /// form (`scale_exp != 0`).
+    deep: bool,
 }
 
 impl PipelineKey {
@@ -96,15 +101,17 @@ impl PipelineKey {
             julia: u.is_julia != 0,
             de: u.de_coloring != 0,
             morph: u.morph_w > 0.0,
+            deep: u.scale_exp != 0,
         }
     }
 
-    fn constants(&self) -> [(&'static str, f64); 4] {
+    fn constants(&self) -> [(&'static str, f64); 5] {
         [
             ("KIND", self.kind as f64),
             ("IS_JULIA", self.julia as u32 as f64),
             ("DE", self.de as u32 as f64),
             ("MORPH", self.morph as u32 as f64),
+            ("DEEP", self.deep as u32 as f64),
         ]
     }
 }
@@ -217,7 +224,11 @@ pub struct Uniforms {
     /// 0 = no morph (and the iteration pipeline is then specialized without
     /// the morph path, see [`PipelineKey`]).
     pub morph_w: f32,
-    pub _pad3: [u32; 1],
+    /// Binary exponent `E` of the deep (rescaled) view scale: `span` and
+    /// `dc_offset` are uploaded multiplied by `2^-E`, so they stay inside
+    /// f32's exponent range at any depth. Non-zero exactly when the deep
+    /// pipeline is used (see [`PipelineKey`] and `mandelbrot.wgsl`'s `DEEP`).
+    pub scale_exp: i32,
     /// Complex binomial coefficients `C(complex_power, k)`, k = 1..16, two per
     /// row (odd k in `[0..2]`, even k in `[2..4]`), for the Complex Multibrot
     /// delta series. Derived from `complex_power` alone.
@@ -279,6 +290,7 @@ pub struct FractalRenderer {
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
     ref_buffer: wgpu::Buffer,
+    ref_exp_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     target_format: wgpu::TextureFormat,
@@ -331,6 +343,15 @@ impl FractalRenderer {
             mapped_at_creation: false,
         });
 
+        // Per-point exponents of the reference orbit (`RefOrbit::exps`), only
+        // read by deep pipelines.
+        let ref_exp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reference orbit exponents"),
+            size: (MAX_REF_POINTS * std::mem::size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lights parameters"),
             size: std::mem::size_of::<[GpuLight; MAX_LIGHT_COUNT]>() as u64,
@@ -374,6 +395,16 @@ impl FractalRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -392,6 +423,10 @@ impl FractalRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: lights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ref_exp_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -590,6 +625,7 @@ impl FractalRenderer {
             bind_group_layout,
             uniform_buffer,
             ref_buffer,
+            ref_exp_buffer,
             lights_buffer,
             bind_group,
             target_format,
@@ -892,7 +928,7 @@ impl ExportRender {
         width: u32,
         height: u32,
         uniforms: Uniforms,
-        reference: &[[f32; 2]],
+        reference: &RefOrbit,
         lights: &[Light],
     ) -> Self {
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -910,8 +946,19 @@ impl ExportRender {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let ref_exp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("export reference orbit exponents"),
+            size: (count.max(1) * std::mem::size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         if count > 0 {
             queue.write_buffer(&ref_buffer, 0, bytemuck::cast_slice(&reference[..count]));
+            queue.write_buffer(
+                &ref_exp_buffer,
+                0,
+                bytemuck::cast_slice(&reference.exps[..count]),
+            );
         }
 
         // Only read by the shadow branch's custom-lights palette; harmless
@@ -941,6 +988,10 @@ impl ExportRender {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: lights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ref_exp_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1391,7 +1442,7 @@ pub struct FractalCallback {
     /// Lights buffer contents, from [`gpu_lights`] (its count is in
     /// `uniforms.light_count`).
     pub lights: [GpuLight; MAX_LIGHT_COUNT],
-    pub reference: Arc<Vec<[f32; 2]>>,
+    pub reference: Arc<RefOrbit>,
     pub generation: u64,
     /// Widget size in physical pixels — the cache texture resolution.
     pub size_px: [u32; 2],
@@ -1456,6 +1507,11 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
                 &renderer.ref_buffer,
                 0,
                 bytemuck::cast_slice(&self.reference[..count]),
+            );
+            queue.write_buffer(
+                &renderer.ref_exp_buffer,
+                0,
+                bytemuck::cast_slice(&self.reference.exps[..count]),
             );
             renderer.uploaded_generation = self.generation;
         }

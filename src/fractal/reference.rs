@@ -39,6 +39,86 @@ const REFERENCE_ESCAPE_SQ: f64 = 1.0e10;
 ///   below 0.1% of a pixel.
 const F64_MAX_PRECISION: usize = 80;
 
+/// Orbit points with a magnitude below `2^TINY_LOG2` are stored normalized
+/// (mantissa + exponent, see [`RefOrbit::exps`]): f32's smallest normal is
+/// ~2^-126, and the GPU's deep (rescaled) phase needs these points' exact
+/// value to decide rebasing. The margin keeps a few mantissa bits clear of
+/// the subnormal range for the smaller component.
+const TINY_LOG2: i32 = -100;
+
+/// A reference orbit as uploaded to the GPU.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RefOrbit {
+    /// `Z_n` as f32 pairs. For points with a non-zero `exps[n]`, a mantissa
+    /// instead: the true value is `points[n] * 2^exps[n]`.
+    pub points: Vec<[f32; 2]>,
+    /// Per-point binary exponent (same length as `points`). Non-zero only for
+    /// points too small for f32's exponent range (see [`TINY_LOG2`]); only
+    /// the deep shader pipeline reads it, so [`Self::has_scaled`] forces it.
+    pub exps: Vec<i32>,
+}
+
+impl RefOrbit {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            points: Vec::with_capacity(n),
+            exps: Vec::with_capacity(n),
+        }
+    }
+
+    fn push(&mut self, point: [f32; 2]) {
+        self.points.push(point);
+        self.exps.push(0);
+    }
+
+    /// Whether any point is stored as mantissa + exponent, i.e. the orbit
+    /// can only be read by the deep pipeline.
+    pub fn has_scaled(&self) -> bool {
+        self.exps.iter().any(|&e| e != 0)
+    }
+}
+
+impl core::ops::Deref for RefOrbit {
+    type Target = [[f32; 2]];
+    fn deref(&self) -> &Self::Target {
+        &self.points
+    }
+}
+
+impl<'a> IntoIterator for &'a RefOrbit {
+    type Item = &'a [f32; 2];
+    type IntoIter = core::slice::Iter<'a, [f32; 2]>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.points.iter()
+    }
+}
+
+/// `floor(log2|x|)`, or `None` for zero. Exact (from the binary
+/// representation), and works far below f64's range.
+fn big_log2_floor(x: &Big) -> Option<isize> {
+    let repr = x.repr();
+    let digits = repr.digits();
+    (digits > 0).then(|| repr.exponent() + digits as isize - 1)
+}
+
+/// Store `(zr, zi)` into `orbit`, as plain f32 unless its magnitude is below
+/// `2^TINY_LOG2`, in which case both components share an exponent `k` and
+/// the stored mantissa `Z * 2^-k` has its larger component in `[0.5, 1)`.
+fn push_big_point(orbit: &mut RefOrbit, zr: &Big, zi: &Big) {
+    let (lr, li) = (big_log2_floor(zr), big_log2_floor(zi));
+    let top = lr.max(li);
+    match top {
+        Some(top) if top < TINY_LOG2 as isize => {
+            let k = top + 1;
+            let mr = (zr.clone() << -k).to_f64().value() as f32;
+            let mi = (zi.clone() << -k).to_f64().value() as f32;
+            orbit.points.push([mr, mi]);
+            orbit.exps.push(k as i32);
+        }
+        _ => orbit.push([zr.to_f64().value() as f32, zi.to_f64().value() as f32]),
+    }
+}
+
 /// Compute the reference orbit `Z_0..Z_{len-1}` where `Z_0 = z0` and
 /// `Z_{n+1} = f(Z_n, c)` for the given `kind` (and `power`, for Multibrot), up
 /// to `max_iter` steps at `precision` bits. Each entry is `[re, im]` in f32.
@@ -59,7 +139,7 @@ pub fn compute_reference(
     lambda_l: (f64, f64),
     complex_power: (f64, f64),
     morph: Option<(FractalKind, f64)>,
-) -> Vec<[f32; 2]> {
+) -> RefOrbit {
     // A zero-weight morph is just the plain kind; skip the second formula.
     let morph = morph.filter(|&(_, w)| w != 0.0);
     if precision <= F64_MAX_PRECISION {
@@ -110,12 +190,12 @@ fn compute_reference_f64(
     kind: FractalKind,
     k: &StepConstsF64,
     morph: Option<(FractalKind, f64)>,
-) -> Vec<[f32; 2]> {
+) -> RefOrbit {
     let (mut zr, mut zi) = z0;
     // Previous iterate, for the Phoenix two-term recurrence (Y_{-1} = 0).
     let mut prev = (0.0f64, 0.0f64);
 
-    let mut points: Vec<[f32; 2]> = Vec::with_capacity(max_iter as usize + 1);
+    let mut points = RefOrbit::with_capacity(max_iter as usize + 1);
     for _ in 0..=max_iter {
         points.push([zr as f32, zi as f32]);
         if zr * zr + zi * zi > REFERENCE_ESCAPE_SQ {
@@ -217,7 +297,7 @@ fn compute_reference_big(
     kind: FractalKind,
     k: &StepConsts,
     morph: Option<(FractalKind, f64)>,
-) -> Vec<[f32; 2]> {
+) -> RefOrbit {
     let precision = k.precision;
     let morph = morph.map(|(from, w)| (from, big_from_f64(w, precision)));
 
@@ -227,13 +307,12 @@ fn compute_reference_big(
     let mut zr_prev = big_zero(precision);
     let mut zi_prev = big_zero(precision);
 
-    let mut points: Vec<[f32; 2]> = Vec::with_capacity(max_iter as usize + 1);
+    let mut points = RefOrbit::with_capacity(max_iter as usize + 1);
 
     for _ in 0..=max_iter {
-        let fr = zr.to_f64().value() as f32;
-        let fi = zi.to_f64().value() as f32;
-        points.push([fr, fi]);
+        push_big_point(&mut points, &zr, &zi);
 
+        let [fr, fi] = *points.points.last().unwrap();
         let mag = (fr as f64) * (fr as f64) + (fi as f64) * (fi as f64);
         if mag > REFERENCE_ESCAPE_SQ {
             break;
@@ -403,7 +482,7 @@ pub fn compute_set_reference(
     lambda_l: (f64, f64),
     complex_power: (f64, f64),
     morph: Option<(FractalKind, f64)>,
-) -> Vec<[f32; 2]> {
+) -> RefOrbit {
     let zero = big_zero(precision);
     compute_reference(
         &zero,
@@ -508,6 +587,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Orbit points below f32's range are stored as a normalized mantissa
+    /// plus exponent (for the deep GPU phase); every other point stays a
+    /// plain f32 with exponent 0.
+    #[test]
+    fn tiny_points_are_stored_normalized() {
+        let bits = 400;
+        // c = -1 + δ: X_2 = c(c + 1) = -δ + δ², far below f32's range.
+        let delta = 1e-45_f64;
+        let cr = big_from_f64(-1.0, bits) + big_from_f64(delta, bits);
+        let ci = big_from_f64(0.0, bits);
+        let orbit = compute_set_reference(
+            &cr,
+            &ci,
+            3,
+            bits,
+            FractalKind::Mandelbrot,
+            2,
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+            None,
+        );
+        assert_eq!(orbit.exps.len(), orbit.points.len());
+        assert!(orbit.has_scaled());
+        assert_eq!(&orbit.exps[..2], &[0, 0], "X_0 = 0 and X_1 = c are plain");
+        let [mr, mi] = orbit.points[2];
+        let k = orbit.exps[2];
+        assert!(k < TINY_LOG2, "exponent {k}");
+        assert!(
+            (0.5..1.0).contains(&mr.abs()),
+            "mantissa {mr} not normalized"
+        );
+        assert_eq!(mi, 0.0);
+        let x2 = mr as f64 * 2f64.powi(k);
+        assert!(
+            (x2 + delta).abs() < 1e-6 * delta,
+            "X_2 = {x2}, expected {}",
+            -delta
+        );
+
+        // A shallow orbit stays entirely plain.
+        let plain = set_ref(-0.75, 0.1, FractalKind::Mandelbrot, None);
+        assert!(!plain.has_scaled());
+        assert!(plain.exps.iter().all(|&e| e == 0));
     }
 
     /// A point inside the main cardioid never escapes: full-length orbit.
@@ -842,12 +967,7 @@ mod tests {
         }
     }
 
-    fn set_ref(
-        cr: f64,
-        ci: f64,
-        kind: FractalKind,
-        morph: Option<(FractalKind, f64)>,
-    ) -> Vec<[f32; 2]> {
+    fn set_ref(cr: f64, ci: f64, kind: FractalKind, morph: Option<(FractalKind, f64)>) -> RefOrbit {
         compute_set_reference(
             &Big::try_from(cr).unwrap(),
             &Big::try_from(ci).unwrap(),

@@ -12,15 +12,16 @@ use crate::camera::Camera;
 use crate::cli::Cli;
 use crate::fractal::{
     BuddhabrotCallback, BuddhabrotRenderer, BuddhabrotUniforms, ExportRender, FractalCallback,
-    FractalKind, FractalRenderer, MAX_REF_POINTS, ShareState, Uniforms, compute_reference,
-    compute_set_reference,
+    FractalKind, FractalRenderer, MAX_REF_POINTS, RefOrbit, ShareState, Uniforms,
+    compute_reference, compute_set_reference,
 };
 use crate::lights::{Light, gpu_lights};
 use crate::view::parse_half_height_spec;
 use crate::view::parse_re_im_spec;
 use crate::view::{
-    Big, DEFAULT_HALF_HEIGHT, ViewState, big_from_decimal_str, big_from_f64, big_to_decimal_str,
-    interpolate_view, parse_view_spec, precision_for,
+    Big, DEFAULT_HALF_HEIGHT, MIN_HALF_HEIGHT, ViewState, big_from_decimal_str, big_from_f64,
+    big_to_decimal_str, deep_scale_exp, interpolate_view, needs_deep, parse_view_spec,
+    precision_for,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use clap::Parser;
@@ -161,7 +162,7 @@ pub(crate) struct RefJob {
 #[cfg(not(target_arch = "wasm32"))]
 impl RefJob {
     /// Iterate the reference orbit at full precision (the expensive part).
-    pub(crate) fn compute(&self) -> Vec<[f32; 2]> {
+    pub(crate) fn compute(&self) -> RefOrbit {
         let key = &self.key;
         let precision = self.precision;
         let morph = key.morph.map(|(k, w)| (k, w as f64));
@@ -548,7 +549,7 @@ pub struct FractalApp {
     fps_window_start: f64,
 
     /// Reference orbit (`Z_n` as f32 pairs) for the current view.
-    reference: Arc<Vec<[f32; 2]>>,
+    reference: Arc<RefOrbit>,
     /// Bumped whenever `reference` is replaced, so the GPU re-uploads it.
     generation: u64,
     /// Center + zoom the current `reference` was computed at (may differ
@@ -708,7 +709,7 @@ impl FractalApp {
             fps: 0.0,
             fps_frames: 0,
             fps_window_start: 0.0,
-            reference: Arc::new(Vec::new()),
+            reference: Arc::new(RefOrbit::default()),
             generation: 0,
             ref_center_re,
             ref_center_im,
@@ -1149,20 +1150,32 @@ impl FractalApp {
         self.drift_from(key) > 0.5 * self.view.half_height || !(0.5..=2.0).contains(&ratio)
     }
 
-    /// Complex offset of the live view center from the reference center, in f32.
-    fn dc_offset(&self) -> [f32; 2] {
+    /// Complex offset of the live view center from the reference center.
+    fn dc_offset(&self) -> (f64, f64) {
         let dre = (&self.view.center_re - &self.ref_center_re)
             .to_f64()
-            .value() as f32;
+            .value();
         let dim = (&self.view.center_im - &self.ref_center_im)
             .to_f64()
-            .value() as f32;
-        [dre, dim]
+            .value();
+        (dre, dim)
+    }
+
+    /// Binary exponent of the deep (rescaled) view scale, or 0 for the plain
+    /// f32 path (see `Uniforms::scale_exp`). Deep when a pixel of a render
+    /// `height_px` tall is too small for f32 (`needs_deep`), or when the
+    /// reference orbit holds points only the deep pipeline can read.
+    fn scale_exp(&self, height_px: f64) -> i32 {
+        if needs_deep(self.view.half_height, height_px) || self.reference.has_scaled() {
+            deep_scale_exp(self.view.half_height)
+        } else {
+            0
+        }
     }
 
     fn apply_reference(
         &mut self,
-        points: Vec<[f32; 2]>,
+        points: RefOrbit,
         cre: Big,
         cim: Big,
         hh: f64,
@@ -1182,7 +1195,7 @@ impl FractalApp {
     /// rendering to build its own `ExportRender` without going through
     /// `egui_wgpu`'s callback machinery.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn reference_points(&self) -> &[[f32; 2]] {
+    pub(crate) fn reference_points(&self) -> &RefOrbit {
         &self.reference
     }
 
@@ -1327,7 +1340,7 @@ impl FractalApp {
     /// Install the orbit computed for `job` (from `reference_job`) as the
     /// current reference, along with the iteration count it was made for.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn finish_reference(&mut self, job: RefJob, points: Vec<[f32; 2]>) {
+    pub(crate) fn finish_reference(&mut self, job: RefJob, points: RefOrbit) {
         self.max_iterations = job.max_iterations;
         let key = job.key;
         self.apply_reference(
@@ -1383,11 +1396,18 @@ impl FractalApp {
             .zoom_at_pixel(pos.x as f64, pos.y as f64, height_px, factor);
     }
 
-    pub(crate) fn make_uniforms(&self, aspect: f64) -> Uniforms {
+    /// `height_px` is the full-resolution render height (it decides whether
+    /// the view needs the deep pipeline); pass the same value during
+    /// interaction's downscaled pass, so the pipeline doesn't flip.
+    pub(crate) fn make_uniforms(&self, aspect: f64, height_px: f64) -> Uniforms {
         let (span_x, span_y) = self.view.span(aspect);
         let mode = self.effective_rendering_mode();
+        // Deep views upload the geometry pre-multiplied by 2^-E (exact).
+        let scale_exp = self.scale_exp(height_px);
+        let inv_scale = 2f64.powi(-scale_exp);
+        let (dc_re, dc_im) = self.dc_offset();
         Uniforms {
-            span: [span_x as f32, span_y as f32],
+            span: [(span_x * inv_scale) as f32, (span_y * inv_scale) as f32],
             max_iter: self.max_iterations.min(MAX_REF_POINTS as u32 - 1),
             ref_len: self.reference.len() as u32,
             color_offset: self.color_offset,
@@ -1400,7 +1420,7 @@ impl FractalApp {
             kind: self.ref_kind.unwrap_or(self.kind) as u32,
             power: self.power,
             morph_from: self.ref_morph.map_or(0, |(k, _)| k as u32),
-            dc_offset: self.dc_offset(),
+            dc_offset: [(dc_re * inv_scale) as f32, (dc_im * inv_scale) as f32],
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
             complex_power: [self.complex_power.0 as f32, self.complex_power.1 as f32],
@@ -1416,7 +1436,7 @@ impl FractalApp {
             screen_dim: self.screen_dim,
             light_count: gpu_lights(&self.lights).1,
             cm_coef: complex_binomials(self.complex_power),
-            _pad3: [0; _],
+            scale_exp,
         }
     }
 
@@ -1476,7 +1496,7 @@ impl FractalApp {
         let scale = self.export_scale.max(1.0);
         let w = ((self.last_size_px.x * scale).round() as u32).clamp(16, MAX_EXPORT_DIM);
         let h = ((self.last_size_px.y * scale).round() as u32).clamp(16, MAX_EXPORT_DIM);
-        let uniforms = self.make_uniforms(w as f64 / h as f64);
+        let uniforms = self.make_uniforms(w as f64 / h as f64, h as f64);
 
         let device = rs.device.clone();
         let queue = rs.queue.clone();
@@ -1507,14 +1527,7 @@ impl FractalApp {
                 .unwrap_or_else(|| format!("fractal-{}.png", unix_timestamp()));
             std::thread::spawn(move || {
                 let er = ExportRender::new(
-                    &device,
-                    &queue,
-                    &handles,
-                    w,
-                    h,
-                    uniforms,
-                    reference.as_slice(),
-                    &lights,
+                    &device, &queue, &handles, w, h, uniforms, &reference, &lights,
                 );
                 let sh = Arc::clone(&shared);
                 let png =
@@ -1535,14 +1548,7 @@ impl FractalApp {
             const RENDER_END: f32 = 0.6;
             wasm_bindgen_futures::spawn_local(async move {
                 let er = ExportRender::new(
-                    &device,
-                    &queue,
-                    &handles,
-                    w,
-                    h,
-                    uniforms,
-                    reference.as_slice(),
-                    &lights,
+                    &device, &queue, &handles, w, h, uniforms, &reference, &lights,
                 );
 
                 // Render tile by tile, awaiting each submission so the browser
@@ -2451,7 +2457,7 @@ impl FractalApp {
                 && hh > 0.0
                 && hh.is_finite()
             {
-                self.view.half_height = hh;
+                self.view.half_height = hh.max(MIN_HALF_HEIGHT);
                 self.view.sync_precision();
             }
             self.zoom_edited = false;
@@ -2862,7 +2868,12 @@ impl FractalApp {
 
         self.screen_dim = [rect.width(), rect.height()];
         self.camera.set_aspect_ratio(aspect as f32);
-        let mut uniforms = self.make_uniforms(aspect);
+        // Full-resolution height (3D included), not the interaction-downscaled one.
+        let mut full_height = (rect.height() * ppp).round() as f64;
+        if self.effective_rendering_mode() == 2 {
+            full_height *= self.render_scale_3d as f64;
+        }
+        let mut uniforms = self.make_uniforms(aspect, full_height);
         // Supersampling is wasted on the low-res pass, and on a kind-switch
         // morph (every frame re-iterates, and the blend moves on next frame).
         // `ref_morph` too: the last morphed reference outlives `morph` by a

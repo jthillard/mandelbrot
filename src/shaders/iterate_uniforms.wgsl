@@ -48,6 +48,10 @@ struct Uniforms {
     // Kind-switch morph weight: each step is (1 - w)*f_kind + w*f_morph_from;
     // 0 = no morph. Only read by MORPH pipelines (see mandelbrot.wgsl).
     morph_w: f32,
+    // Deep views: binary exponent E of the view scale. `span` and `dc_offset`
+    // are uploaded multiplied by 2^-E so they stay in f32's range; 0 = not
+    // deep (plain f32 values). Only read by DEEP pipelines (mandelbrot.wgsl).
+    scale_exp: i32,
     // Complex binomial coefficients C(complex_power, k) for k = 1..16, two per
     // vec4 (k odd in .xy, k even in .zw), for the Complex Multibrot delta
     // series. Precomputed on the CPU since they only depend on the power.

@@ -54,7 +54,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
     let (device, queue) = pollster::block_on(request_device())?;
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let renderer = FractalRenderer::new(&device, format);
-    let uniforms = app.make_uniforms(width as f64 / height as f64);
+    let uniforms = app.make_uniforms(width as f64 / height as f64, height as f64);
     let handles = renderer.export_handles(&device, &uniforms);
 
     let er = ExportRender::new(
@@ -263,7 +263,7 @@ fn run_animation(
     let (png_tx, png_rx) = mpsc::sync_channel::<(usize, Vec<u8>, u32, bool)>(threads * 2);
     let png_rx = Mutex::new(png_rx);
     std::thread::scope(|scope| {
-        let (ref_tx, ref_rx) = mpsc::sync_channel::<(usize, Vec<[f32; 2]>)>(threads * 2);
+        let (ref_tx, ref_rx) = mpsc::sync_channel::<(usize, crate::fractal::RefOrbit)>(threads * 2);
         for _ in 0..threads {
             let ref_tx = ref_tx.clone();
             let (jobs, next_job, failed) = (&jobs, &next_job, &failed);
@@ -317,7 +317,7 @@ fn run_animation(
             apply_frame(&mut app, i as u32);
             app.finish_reference(jobs[i].clone(), points);
 
-            let uniforms = app.make_uniforms(aspect);
+            let uniforms = app.make_uniforms(aspect, height as f64);
             let handles = pipelines
                 .entry(PipelineKey::from_uniforms(&uniforms))
                 .or_insert_with(|| renderer.export_handles(&device, &uniforms));

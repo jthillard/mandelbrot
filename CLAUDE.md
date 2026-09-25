@@ -8,7 +8,11 @@ A deep-zoom fractal explorer (Rust + wgpu + egui + WGSL). It zooms past the
 ~10¹³× limit of plain `f64` using **perturbation theory**: one high-precision
 reference orbit is computed on the CPU (arbitrary precision via `dashu-float`),
 and every pixel is rendered on the GPU as a cheap `f32` delta from it, with
-rebasing to avoid glitches. The `f32` GPU tier reaches roughly 10³⁰×. Runs
+rebasing to avoid glitches. Plain `f32` deltas run out of exponent range
+once a pixel is ~2^-124 wide (~10³⁴× at 1080p), so from 2^-122 per pixel
+(`view::DEEP_PIXEL_SIZE`) a `DEEP` shader variant starts each pixel with
+rescaled deltas (f32 mantissa × 2^i32), reaching ~10³⁰⁰× (the `f64` limit of
+`half_height`, `view::MIN_HALF_HEIGHT`). Runs
 natively (Vulkan/Metal/DX12) and in the browser (WebGPU only — WebGL2 can't do
 storage buffers, which the fragment shader needs for the reference orbit).
 
@@ -90,8 +94,15 @@ what makes deep zoom cheap — one expensive high-precision orbit, then every
 pixel is a handful of `f32` complex multiplies.
 
 - `src/view.rs` — `ViewState`; center is arbitrary-precision `FBig` (`Big`
-  type alias), pixel scale stays `f64` (still in-range at 10³⁰×). Precision
-  (bits) scales with zoom depth (`precision_for`).
+  type alias), pixel scale stays `f64` (so zoom is clamped at
+  `MIN_HALF_HEIGHT` = 1e-300). Precision (bits) scales with zoom depth
+  (`precision_for`). `needs_deep` switches rendering to the deep pipeline
+  once a pixel of the full-resolution render is below `DEEP_PIXEL_SIZE`
+  (2^-122; the f32 path is exact down to 2^-124 with AA's quarter-pixel
+  offsets, measured, and the deep path is ~40% slower, so the switch is as
+  late as that allows). `deep_scale_exp` gives the scale exponent.
+  `make_uniforms(aspect, height_px)` takes that full-resolution height, the
+  same during the interaction-downscaled pass so the pipeline doesn't flip.
 - `src/fractal/kind.rs` — the `FractalKind` enum (Mandelbrot, Burning Ship,
   Tricorn, Multibrot, Celtic, Perpendicular, Buffalo, Phoenix, Lambda,
   Complex Multibrot) plus everything that only needs to switch on it:
@@ -104,7 +115,12 @@ pixel is a handful of `f32` complex multiplies.
   precision ≤ `F64_MAX_PRECISION` (80 bits, i.e. shallow views) it takes a
   plain-`f64` fast path (`compute_reference_f64`), so each kind's formula
   exists twice in this file (f64 + `FBig`) and both must stay in sync;
-  `f64_fast_path_matches_big` checks they agree. Requests are made with 1.5×
+  `f64_fast_path_matches_big` checks they agree. The result is a `RefOrbit`:
+  `points` plus a parallel `exps`. A point below 2^-100 (only possible on the
+  `FBig` path) is stored as a normalized mantissa with its exponent in `exps`
+  (the true value is `points[n]·2^exps[n]`). That happens when the orbit
+  passes near 0 at a deep minibrot. `has_scaled()` then forces the deep
+  pipeline, the only one that reads `exps`. Requests are made with 1.5×
   iteration headroom (`reference_iterations` in `app.rs`), so auto-iterations
   creeping up during a zoom doesn't recompute the orbit every frame.
 - `src/shaders/*.wgsl` — none of these are standalone WGSL modules; WGSL has
@@ -125,8 +141,8 @@ pixel is a handful of `f32` complex multiplies.
   pipeline creation. Read those constants in the shader, never `u.kind` /
   `u.is_julia` / `u.de_coloring` (they're still uploaded for layout reasons).
   `renderer.rs` builds one pipeline set per `PipelineKey` lazily on first
-  use, and `tests/shader_valid.rs` compiles every kind × Julia × DE variant to
-  SPIR-V. So a new kind needs no pipeline-list change, only its `KIND_*`
+  use, and `tests/shader_valid.rs` compiles every kind × Julia × DE × morph ×
+  deep variant to SPIR-V. So a new kind needs no pipeline-list change, only its `KIND_*`
   constant. `buddhabrot.wgsl` does the same with its own `override KIND`.
   Interior pixels exit early through **periodicity detection**. It uses
   Brent-style checkpoints plus two guards: the cycle's multiplier must be
@@ -157,12 +173,41 @@ pixel is a handful of `f32` complex multiplies.
   detection and the cardioid bypass. App side: `KindMorph` in
   `app.rs`; the uniforms use the morph the *current reference* was built with
   (`ref_morph`), not the live one, so orbit and delta formula never disagree.
+  **Deep views** (`DEEP` override, `u.scale_exp != 0`) handle zooms where
+  f32 deltas underflow. `make_uniforms` sets `scale_exp = E` (≈ log2 of the
+  half-height) and uploads `span`/`dc_offset` × 2^-E. The per-pixel `offset`
+  and `px` are therefore in units of 2^E. `iterate_sample` first runs a
+  **deep prologue**:
+  - The delta is carried as `w·2^sx` and the DE derivative as `v·2^sv`
+    (separate exponents, since they drift apart near the critical point).
+  - Each step goes through `advance_delta_scaled` →
+    `deep_step_kind` → `advance_delta_scaled_kind`. These return the step at
+    its own output scale `t`. Next to the critical point (X tiny or 0), the
+    linear term vanishes and the step's value is ~e^p, far below 2^sx.
+    `deep_step_kind` measures X and e in a common unit (the kinds are
+    p-homogeneous) and the loop moves `sx` there. Assuming the e² terms merely
+    flush when negligible was wrong exactly there: pixels near deep minibrots
+    lost their delta and followed the reference forever.
+  - Rebasing uses X at full range (`ref_fe`).
+  - Once `|e| > 2^DEEP_EXIT_LOG2` (and dzs is normal), the state converts to
+    f32 and the ordinary loop continues from the same `n`/`m`.
+  - Periodicity detection restarts after the prologue with a sentinel save,
+    because saving the hand-off `z` (an arbitrary phase) made exterior pixels
+    shadowing a periodic nucleus reference read as interior.
+
+  The deep path is exact at any depth: forcing it everywhere (raise
+  `DEEP_PIXEL_SIZE`, raise `DEEP_EXIT_LOG2` to about -8) must reproduce the
+  plain f32 renders on non-chaotic views. That's the check to rerun after
+  changing it. Known gaps: Lambda's critical point is 1/2, so its step keeps
+  the input scale. Lambda set mode's reference sits at the origin, so it
+  never reaches deep zooms anyway.
 - `src/fractal/renderer.rs` — `FractalRenderer` (wgpu pipelines, uniform +
   storage buffers, bind groups), `Uniforms` (repr(C) layout that must match
   the WGSL `Uniforms` struct field-for-field, including padding; it includes
   CPU-precomputed data: `cm_coef`, the Complex Multibrot binomial
-  coefficients from `app.rs::complex_binomials`, and `light_count` for the
-  packed `GpuLight` buffer from `lights.rs::gpu_lights`), and
+  coefficients from `app.rs::complex_binomials`, `light_count` for the
+  packed `GpuLight` buffer from `lights.rs::gpu_lights`, and `scale_exp`,
+  the deep view scale), `ref_exp_buffer` (binding 3, `RefOrbit::exps`), and
   `FractalCallback` (the `egui_wgpu::CallbackTrait` impl: `prepare()` uploads
   changed buffers and decides whether to re-run the iterate pass, the cheap
   colourise pass, or just blit the cached texture). Also `ExportRender`, a
@@ -195,7 +240,9 @@ Touches, in order: `kind.rs` (enum variant + `ALL` slot + `label`/
 `description`/`formula`/`share_tag`/`from_share_tag`/`default_set_view`
 arms), `reference.rs` (CPU iteration formula arm, and a test comparing
 against a naive `f64` iteration), `common.wgsl` (matching `KIND_*` const),
-`mandelbrot.wgsl` (matching `advance_delta`/`fprime` arms), `buddhabrot.wgsl`
+`mandelbrot.wgsl` (matching `advance_delta`/`fprime` arms, plus the deep
+path's `advance_delta_scaled_kind` arm, its degree in `deep_step_kind` and,
+if not z²-like, a `deep_fprime` arm), `buddhabrot.wgsl`
 (matching arm in `advance()`, if the kind makes sense as a Buddhabrot),
 `renderer.rs` `Uniforms` (only if the kind needs a new per-kind constant,
 e.g. Phoenix's `phoenix_p`), `app.rs` (`JULIA_PRESETS`/`SET_PRESETS` slot,
