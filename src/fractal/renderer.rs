@@ -1223,6 +1223,84 @@ pub fn export_to_png_blocking(
     png
 }
 
+/// Render every tile of `er` in one go (no per-tile GPU stall, unlike
+/// [`export_to_png_blocking`]), read it back, and return a copy of the padded
+/// readback bytes (`er.padded_bpr` per row) for [`encode_png`]. Used by the
+/// headless animation pipeline, which encodes on other threads.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn render_readback_blocking(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    er: &ExportRender,
+) -> Vec<u8> {
+    for t in 0..er.tiles {
+        er.render_tile(device, queue, t);
+    }
+    er.copy_to_readback(device, queue);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    er.readback()
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    let _ = rx.recv();
+
+    let bytes = er
+        .readback()
+        .slice(..)
+        .get_mapped_range()
+        .expect("map readback buffer")
+        .to_vec();
+    er.readback().unmap();
+    bytes
+}
+
+/// Like [`encode_png_with_progress`], but encodes the whole image at once
+/// (no progress) at the given compression level. Non-streaming, so the fast
+/// `fdeflate` levels don't pay the streaming-mode size penalty.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn encode_png(
+    padded: &[u8],
+    width: u32,
+    height: u32,
+    padded_bpr: u32,
+    swap_rb: bool,
+    compression: png::Compression,
+) -> Vec<u8> {
+    let row = (width * 4) as usize;
+    let mut pixels = Vec::with_capacity(row * height as usize);
+    for y in 0..height as usize {
+        let src_off = y * padded_bpr as usize;
+        let src = &padded[src_off..src_off + row];
+        if swap_rb {
+            pixels.extend(
+                src.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|&[b, g, r, a]| [r, g, b, a]),
+            );
+        } else {
+            pixels.extend_from_slice(src);
+        }
+    }
+
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(compression);
+        let mut writer = encoder.write_header().expect("png header");
+        writer.write_image_data(&pixels).expect("png data");
+    }
+    out
+}
+
 /// Convert a padded BGRA/RGBA readback into tightly-packed RGBA8 and encode it
 /// as PNG bytes, reporting progress in `[0, 1]` via `on_progress` as rows are
 /// streamed to the compressor (encoding is the slow, subdividable phase).

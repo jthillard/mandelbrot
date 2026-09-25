@@ -147,8 +147,61 @@ const SET_PRESETS: [&[SetPreset]; FractalKind::ComplexMultibrot as usize + 1] = 
     &[],
 ];
 
+/// A reference-orbit computation detached from the app (see
+/// `FractalApp::reference_job`), so it can run on any thread.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub(crate) struct RefJob {
+    key: RequestKey,
+    precision: usize,
+    /// The frame's iteration count (auto-iterations resolved).
+    max_iterations: u32,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RefJob {
+    /// Iterate the reference orbit at full precision (the expensive part).
+    pub(crate) fn compute(&self) -> Vec<[f32; 2]> {
+        let key = &self.key;
+        let precision = self.precision;
+        let morph = key.morph.map(|(k, w)| (k, w as f64));
+        if key.julia {
+            let jr = big_from_f64(key.julia_c.0, precision);
+            let ji = big_from_f64(key.julia_c.1, precision);
+            compute_reference(
+                &key.center_re,
+                &key.center_im,
+                &jr,
+                &ji,
+                key.iter,
+                precision,
+                key.kind,
+                key.power,
+                key.phoenix_p,
+                key.lambda_l,
+                key.complex_power,
+                morph,
+            )
+        } else {
+            compute_set_reference(
+                &key.center_re,
+                &key.center_im,
+                key.iter,
+                precision,
+                key.kind,
+                key.power,
+                key.phoenix_p,
+                key.lambda_l,
+                key.complex_power,
+                morph,
+            )
+        }
+    }
+}
+
 /// Parameters a reference orbit was (or will be) computed for. Used to decide
 /// when the current reference is stale enough to recompute.
+#[derive(Clone)]
 struct RequestKey {
     center_re: Big,
     center_im: Big,
@@ -1233,6 +1286,17 @@ impl FractalApp {
     /// poll a background result on and only ever needs one reference.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn compute_reference_blocking(&mut self) {
+        let job = self.reference_job();
+        let points = job.compute();
+        self.finish_reference(job, points);
+    }
+
+    /// Snapshot everything the reference orbit for the current view depends
+    /// on, as a self-contained job that can be computed on another thread
+    /// (headless animation computes many frames' orbits in parallel). Also
+    /// applies auto-iterations, like `compute_reference_blocking`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn reference_job(&mut self) -> RefJob {
         if self.auto_iterations {
             self.max_iterations = self.auto_iteration_count();
         }
@@ -1240,45 +1304,25 @@ impl FractalApp {
         // One-shot render: no later frames for iteration headroom to serve.
         key.iter = self.max_iterations.min(MAX_REF_POINTS as u32 - 1);
         let precision = self.view.precision_bits();
-        let max_iter = key.iter;
 
         // Lambda in Set mode has a static fractal centered at origin.
         if key.kind == FractalKind::Lambda && !key.julia && key.morph.is_none() {
             key.center_re = big_from_f64(0.0, precision);
             key.center_im = big_from_f64(0.0, precision);
         }
+        RefJob {
+            key,
+            precision,
+            max_iterations: self.max_iterations,
+        }
+    }
 
-        let points = if key.julia {
-            let jr = big_from_f64(key.julia_c.0, precision);
-            let ji = big_from_f64(key.julia_c.1, precision);
-            compute_reference(
-                &key.center_re,
-                &key.center_im,
-                &jr,
-                &ji,
-                max_iter,
-                precision,
-                key.kind,
-                key.power,
-                key.phoenix_p,
-                key.lambda_l,
-                key.complex_power,
-                key.morph.map(|(k, w)| (k, w as f64)),
-            )
-        } else {
-            compute_set_reference(
-                &key.center_re,
-                &key.center_im,
-                max_iter,
-                precision,
-                key.kind,
-                key.power,
-                key.phoenix_p,
-                key.lambda_l,
-                key.complex_power,
-                key.morph.map(|(k, w)| (k, w as f64)),
-            )
-        };
+    /// Install the orbit computed for `job` (from `reference_job`) as the
+    /// current reference, along with the iteration count it was made for.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn finish_reference(&mut self, job: RefJob, points: Vec<[f32; 2]>) {
+        self.max_iterations = job.max_iterations;
+        let key = job.key;
         self.apply_reference(
             points,
             key.center_re.clone(),

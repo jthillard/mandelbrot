@@ -64,6 +64,13 @@ iteration count auto-scales with zoom depth per frame (same
 `auto_iteration_count` the interactive app uses while zooming).
 `--to-yaw`/`--to-pitch` (degrees, from `--yaw`/`--pitch`, yaw unwrapped so
 `--to-yaw 720` is two turns) orbit the 3D camera with `--rendering-kind 3d`.
+Frames are pipelined across every core (`run_animation`): each frame's
+state is a pure function of `t` (`apply_frame`), so all frames'
+`FractalApp::reference_job`s are snapshotted up front and `RefJob::compute`d
+by a worker pool. The main thread renders them on the GPU as they arrive
+(out of order), and another pool PNG-encodes and writes them
+(`encode_png`, `Compression::Fast`). Channels are bounded. Once orbits and
+encoding are off the main thread, the GPU is usually the bottleneck.
 
 There's no GPU in most sandboxes: `cargo check`/`cargo test --test shader_valid`
 are the fast, headless way to validate a change. `cargo test` also runs but

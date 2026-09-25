@@ -5,12 +5,17 @@
 // once, and renders through the same `ExportRender` path the "Export PNG"
 // button uses.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, mpsc};
+
 use eframe::egui_wgpu::wgpu;
 
-use crate::app::{FractalApp, parse_complex_pair, unix_timestamp};
+use crate::app::{FractalApp, RefJob, parse_complex_pair, unix_timestamp};
 use crate::cli::Cli;
 use crate::fractal::{
-    ExportRender, FractalKind, FractalRenderer, PipelineKey, ShareState, export_to_png_blocking,
+    ExportRender, FractalKind, FractalRenderer, PipelineKey, ShareState, encode_png,
+    export_to_png_blocking, render_readback_blocking,
 };
 use crate::view::{
     ViewState, big_from_decimal_str, interpolate_f64, interpolate_view, parse_view_spec,
@@ -197,14 +202,9 @@ fn run_animation(
     let out_dir = export_path.unwrap_or_else(|| format!("frames-{}", unix_timestamp()));
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create {out_dir}: {e}"))?;
 
-    let (device, queue) = pollster::block_on(request_device())?;
-    let format = wgpu::TextureFormat::Bgra8Unorm;
-    let renderer = FractalRenderer::new(&device, format);
-    // The shader specialization (kind, Julia, DE, morph) can change between
-    // frames during a kind morph; rebuild the pipeline only when it does.
-    let mut pipeline_cache: Option<(PipelineKey, _)> = None;
-
-    for i in 0..frames {
+    // Everything about frame `i` is a pure function of its `t`, so the app can
+    // be put into any frame's state at any time, in any order.
+    let apply_frame = |app: &mut FractalApp, i: u32| {
         let raw_t = i as f64 / (frames - 1) as f64;
         let t = if targets.linear {
             raw_t
@@ -228,38 +228,126 @@ fn run_animation(
             interpolate_f64(yaw0 as f64, yaw1 as f64, t) as f32,
             interpolate_f64(pitch0 as f64, pitch1 as f64, t) as f32,
         );
+    };
 
-        eprintln!("[{:>4}/{frames}] computing reference orbit…", i + 1);
-        app.compute_reference_blocking();
+    // Snapshot every frame's reference-orbit job up front (cheap: just the
+    // parameters), so the orbits themselves can be computed in parallel.
+    let jobs: Vec<RefJob> = (0..frames)
+        .map(|i| {
+            apply_frame(&mut app, i);
+            app.reference_job()
+        })
+        .collect();
 
-        let uniforms = app.make_uniforms(width as f64 / height as f64);
-        let key = PipelineKey::from_uniforms(&uniforms);
-        if pipeline_cache.as_ref().is_none_or(|(k, _)| *k != key) {
-            pipeline_cache = Some((key, renderer.export_handles(&device, &uniforms)));
+    let (device, queue) = pollster::block_on(request_device())?;
+    let format = wgpu::TextureFormat::Bgra8Unorm;
+    let renderer = FractalRenderer::new(&device, format);
+    let aspect = width as f64 / height as f64;
+
+    // Three-stage pipeline, connected by bounded channels (which also cap
+    // memory): `threads` workers compute reference orbits (CPU, the expensive
+    // part at deep zoom) → this thread renders each frame on the GPU → `threads`
+    // workers PNG-encode and write frames. Frames flow through out of order
+    // (at most ~`threads` apart); each is written under its own index.
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let next_job = AtomicUsize::new(0);
+    let saved = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let error: Mutex<Option<String>> = Mutex::new(None);
+    let fail = |e: String| {
+        failed.store(true, Ordering::Relaxed);
+        error.lock().unwrap().get_or_insert(e);
+    };
+
+    eprintln!("rendering {frames} frames ({width}×{height}) on {threads} threads…");
+    let (png_tx, png_rx) = mpsc::sync_channel::<(usize, Vec<u8>, u32, bool)>(threads * 2);
+    let png_rx = Mutex::new(png_rx);
+    std::thread::scope(|scope| {
+        let (ref_tx, ref_rx) = mpsc::sync_channel::<(usize, Vec<[f32; 2]>)>(threads * 2);
+        for _ in 0..threads {
+            let ref_tx = ref_tx.clone();
+            let (jobs, next_job, failed) = (&jobs, &next_job, &failed);
+            scope.spawn(move || {
+                loop {
+                    let i = next_job.fetch_add(1, Ordering::Relaxed);
+                    if i >= jobs.len() || failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if ref_tx.send((i, jobs[i].compute())).is_err() {
+                        break;
+                    }
+                }
+            });
         }
-        let (_, handles) = pipeline_cache.as_ref().unwrap();
-        let er = ExportRender::new(
-            &device,
-            &queue,
-            handles,
-            width,
-            height,
-            uniforms,
-            app.reference_points(),
-            app.lights(),
-        );
+        drop(ref_tx);
 
-        let png = export_to_png_blocking(&device, &queue, &er, |phase, fraction| {
-            eprint!(
-                "\r[{:>4}/{frames}] {phase} {:>3.0}%",
-                i + 1,
-                fraction * 100.0
+        for _ in 0..threads {
+            let (png_rx, out_dir, saved, failed, fail) =
+                (&png_rx, &out_dir, &saved, &failed, &fail);
+            scope.spawn(move || {
+                loop {
+                    // Hold the lock only for the receive, not the encode.
+                    let Ok((i, padded, bpr, swap_rb)) = png_rx.lock().unwrap().recv() else {
+                        break;
+                    };
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let png =
+                        encode_png(&padded, width, height, bpr, swap_rb, png::Compression::Fast);
+                    let path = format!("{out_dir}/frame-{:05}.png", i + 1);
+                    if let Err(e) = std::fs::write(&path, &png) {
+                        fail(format!("save failed: {e}"));
+                        break;
+                    }
+                    let done = saved.fetch_add(1, Ordering::Relaxed) + 1;
+                    eprint!("\r[{done:>4}/{frames}] saved");
+                }
+            });
+        }
+
+        // GPU stage, on this thread (it owns the app and the device). The
+        // shader specialization (kind, Julia, DE, morph) can change between
+        // frames during a kind morph; build each pipeline once.
+        let mut pipelines = HashMap::new();
+        for (i, points) in ref_rx.iter() {
+            if failed.load(Ordering::Relaxed) {
+                break;
+            }
+            apply_frame(&mut app, i as u32);
+            app.finish_reference(jobs[i].clone(), points);
+
+            let uniforms = app.make_uniforms(aspect);
+            let handles = pipelines
+                .entry(PipelineKey::from_uniforms(&uniforms))
+                .or_insert_with(|| renderer.export_handles(&device, &uniforms));
+            let er = ExportRender::new(
+                &device,
+                &queue,
+                handles,
+                width,
+                height,
+                uniforms,
+                app.reference_points(),
+                app.lights(),
             );
-        });
-        eprintln!();
+            let padded = render_readback_blocking(&device, &queue, &er);
+            if png_tx.send((i, padded, er.padded_bpr, er.swap_rb)).is_err() {
+                break;
+            }
+        }
+        // Dropping the channel ends lets the workers drain and exit.
+        drop(png_tx);
+        drop(ref_rx);
+    });
+    eprintln!();
 
-        let path = format!("{out_dir}/frame-{:05}.png", i + 1);
-        std::fs::write(&path, &png).map_err(|e| format!("save failed: {e}"))?;
+    if let Some(e) = error.into_inner().unwrap() {
+        return Err(e);
+    }
+    let saved = saved.into_inner();
+    if saved != frames as usize {
+        return Err(format!("only {saved} of {frames} frames were rendered"));
     }
 
     println!("saved {frames} frames to {out_dir}/ ({width}×{height})");
