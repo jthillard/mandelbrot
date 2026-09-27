@@ -167,12 +167,13 @@ const LIPSCHITZ_STRIDE: u32 = 256;
 /// Step uniforms held: slot k holds step 2^k, enough for any texture size.
 const LIPSCHITZ_SLOTS: u32 = 32;
 
-/// Whether the 3D view of `u` rebuilds its height field as a distance field
-/// (see `lipschitz.wgsl`): only Complex Multibrot, whose branch cut makes the
-/// DE jump into walls. Every other kind keeps its DE as is.
+/// Whether the shadow / 3D view of `u` rebuilds its DE height field as a
+/// distance field (see `lipschitz.wgsl`): only Complex Multibrot, whose
+/// branch cut makes the DE jump (seams in shadow, walls in 3D). Every other
+/// kind and classic colouring keep the DE as is.
 fn wants_envelope(u: &Uniforms) -> bool {
     let cm = FractalKind::ComplexMultibrot as u32;
-    u.rendering_mode == 2 && (u.kind == cm || (u.morph_w > 0.0 && u.morph_from == cm))
+    u.rendering_mode != 0 && (u.kind == cm || (u.morph_w > 0.0 && u.morph_from == cm))
 }
 
 /// The distance-field passes (`lipschitz.wgsl`): seed, jump-flood and
@@ -490,7 +491,7 @@ struct CacheTarget {
     aa: Option<(wgpu::TextureView, wgpu::BindGroup)>,
     /// The distance-field rebuild of the refined (or 1-spp) data + the
     /// colourise bind group reading it. Allocated on first use, only for
-    /// 3D Complex Multibrot (see [`wants_envelope`]).
+    /// shadow / 3D Complex Multibrot (see [`wants_envelope`]).
     envelope: Option<(Envelope, wgpu::BindGroup)>,
     /// Blit pass input: the colour texture + sampler.
     blit_bind_group: wgpu::BindGroup,
@@ -541,7 +542,8 @@ pub struct FractalRenderer {
     /// Colourise pass: data texture → colour texture (palette mapping).
     colorize_pipeline: wgpu::RenderPipeline,
     colorize_bind_group_layout: wgpu::BindGroupLayout,
-    /// Distance-field passes for 3D Complex Multibrot (see [`wants_envelope`]).
+    /// Distance-field passes for shadow / 3D Complex Multibrot (see
+    /// [`wants_envelope`]).
     lipschitz: Lipschitz,
     /// Whether the cache's envelope matches the current data texture. Not
     /// implied by iteration: switching shadow → 3D doesn't re-iterate.
@@ -1055,7 +1057,8 @@ impl FractalRenderer {
     /// lock on the renderer), its bind-group layout, and the target format.
     /// In 3D mode (`rendering_mode == 2`) also the interactive iterate →
     /// refine → colourise chain, since the raymarcher needs a whole data
-    /// texture to march over and `fs_color` has no 3D path.
+    /// texture to march over and `fs_color` has no 3D path. Likewise for
+    /// the distance field ([`wants_envelope`]), which needs the whole image.
     pub fn export_handles(&self, device: &wgpu::Device, uniforms: &Uniforms) -> ExportHandles {
         let constants = PipelineKey::from_uniforms(uniforms).constants();
         let pipeline = fullscreen_pipeline(
@@ -1067,7 +1070,8 @@ impl FractalRenderer {
             self.target_format,
             &constants,
         );
-        let raymarch = (uniforms.rendering_mode == 2).then(|| RaymarchHandles {
+        let chain = uniforms.rendering_mode == 2 || wants_envelope(uniforms);
+        let raymarch = chain.then(|| RaymarchHandles {
             iterate: fullscreen_pipeline(
                 device,
                 "fractal export iterate pipeline",
@@ -1108,11 +1112,11 @@ pub struct ExportHandles {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     format: wgpu::TextureFormat,
-    /// The two-pass chain, for 3D mode only.
+    /// The two-pass chain, for 3D mode and the distance field only.
     raymarch: Option<RaymarchHandles>,
 }
 
-/// The interactive two-pass pipelines, for a 3D export.
+/// The interactive two-pass pipelines, for a 3D or distance-field export.
 #[derive(Clone)]
 struct RaymarchHandles {
     iterate: wgpu::RenderPipeline,
@@ -1124,10 +1128,10 @@ struct RaymarchHandles {
     lipschitz: Option<Lipschitz>,
 }
 
-/// A 3D export's own data textures and the passes that fill them: the tiles
-/// iterate into `data_view`, then one refine (if AA), the distance-field
-/// rebuild (if wanted) and a colourise pass raymarches the finished height
-/// field into the export target.
+/// A 3D (or distance-field shadow) export's own data textures and the passes
+/// that fill them: the tiles iterate into `data_view`, then one refine (if
+/// AA), the distance-field rebuild (if wanted) and a colourise pass render
+/// the finished height field into the export target.
 struct RaymarchExport {
     iterate: wgpu::RenderPipeline,
     /// Refine pipeline, output view and input bind group, when AA is on.
@@ -1156,7 +1160,8 @@ pub struct ExportRender {
     /// Number of horizontal tiles the render is split into.
     pub tiles: u32,
     pub swap_rb: bool,
-    /// 3D mode: tiles fill a data texture instead of the target.
+    /// 3D mode or the distance field: tiles fill a data texture instead of
+    /// the target.
     raymarch: Option<RaymarchExport>,
 }
 
@@ -1358,8 +1363,9 @@ impl ExportRender {
 
     /// Render one horizontal tile into the export texture and submit it. Tile 0
     /// clears the whole attachment; later tiles preserve earlier ones. In 3D
-    /// mode the tiles iterate into the data texture instead, and the last one
-    /// also runs the (whole-image) refine + raymarching colourise passes.
+    /// mode (or with the distance field) the tiles iterate into the data
+    /// texture instead, and the last one also runs the whole-image refine,
+    /// distance-field and colourise passes.
     pub fn render_tile(&self, device: &wgpu::Device, queue: &wgpu::Queue, t: u32) {
         let (y0, y1) = self.tile_rows(t);
         if y1 <= y0 {
@@ -1846,7 +1852,7 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
                 }
             }
 
-            // 3D Complex Multibrot: rebuild the DE as a distance field.
+            // Shadow / 3D Complex Multibrot: rebuild the DE as a distance field.
             let env = cache.envelope.as_ref().filter(|_| envelope);
             if let Some((env, _)) = env
                 && (iter_dirty || !renderer.envelope_valid)

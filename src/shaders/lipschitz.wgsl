@@ -1,10 +1,10 @@
-// Distance field for the 3D view of kinds whose map is discontinuous
-// (Complex Multibrot's principal-branch z^p). The per-pixel DE,
-// |z|·ln|z|/|dz| = G/|G'|, is only a distance when the potential G is
+// Distance field for the shadow and 3D views of kinds whose map is
+// discontinuous (Complex Multibrot's principal-branch z^p). The per-pixel
+// DE, |z|·ln|z|/|dz| = G/|G'|, is only a distance when the potential G is
 // continuous. Across a branch-cut preimage G jumps (|z| jumps by
 // e^(2π·Im p)), each side's DE describes the set as continued on its own
-// branch, and the raymarched terrain grows walls. A true distance to the set
-// is continuous, so this rebuilds one from the pixels that are unambiguously
+// branch: seams in shadow mode, walls in the raymarched terrain. A true
+// distance to the set is continuous, so this rebuilds one from the pixels that are unambiguously
 // next to the set ("seeds": interior texels, and exterior texels whose DE is
 // below SEED_DE, i.e. within about a pixel of it):
 //     h(x) = min over seeds y of  DE(y) + DIST_SLOPE·|x - y|
