@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use eframe::egui_wgpu::{self, wgpu};
+use wgpu::util::DeviceExt as _;
 
+use super::kind::FractalKind;
 use super::reference::RefOrbit;
 use crate::lights::{GpuLight, Light, MAX_LIGHT_COUNT, gpu_lights};
 
@@ -159,6 +161,239 @@ fn fullscreen_pipeline(
     })
 }
 
+/// Stride between the per-pass step uniforms in [`Lipschitz::steps`]
+/// (WebGPU's minimum uniform-buffer offset alignment).
+const LIPSCHITZ_STRIDE: u32 = 256;
+/// Step uniforms held: slot k holds step 2^k, enough for any texture size.
+const LIPSCHITZ_SLOTS: u32 = 32;
+
+/// Whether the 3D view of `u` rebuilds its height field as a distance field
+/// (see `lipschitz.wgsl`): only Complex Multibrot, whose branch cut makes the
+/// DE jump into walls. Every other kind keeps its DE as is.
+fn wants_envelope(u: &Uniforms) -> bool {
+    let cm = FractalKind::ComplexMultibrot as u32;
+    u.rendering_mode == 2 && (u.kind == cm || (u.morph_w > 0.0 && u.morph_from == cm))
+}
+
+/// The distance-field passes (`lipschitz.wgsl`): seed, jump-flood and
+/// compose pipelines, their shared input layout (data texture, seed texture,
+/// step uniform at a dynamic offset) and the buffer of every pass's step.
+#[derive(Clone)]
+struct Lipschitz {
+    seed: wgpu::RenderPipeline,
+    jump: wgpu::RenderPipeline,
+    compose: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    steps: wgpu::Buffer,
+}
+
+impl Lipschitz {
+    fn new(device: &wgpu::Device) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("lipschitz"),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(
+                    include_str!("../shaders/common.wgsl"),
+                    include_str!("../shaders/lipschitz.wgsl"),
+                )
+                .into(),
+            ),
+        });
+        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lipschitz bind group layout"),
+            entries: &[
+                texture_entry(0),
+                texture_entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(16),
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("lipschitz pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |label, entry| {
+            fullscreen_pipeline(device, label, &module, &pipeline_layout, entry, DATA_FORMAT, &[])
+        };
+        let mut contents = vec![0u8; (LIPSCHITZ_STRIDE * LIPSCHITZ_SLOTS) as usize];
+        for k in 0..LIPSCHITZ_SLOTS {
+            let at = (k * LIPSCHITZ_STRIDE) as usize;
+            contents[at..at + 4].copy_from_slice(&(1i32 << k.min(30)).to_ne_bytes());
+        }
+        let steps = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("lipschitz steps"),
+            contents: &contents,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        Self {
+            seed: pipeline("lipschitz seed pipeline", "fs_seed"),
+            jump: pipeline("lipschitz jump pipeline", "fs_jump"),
+            compose: pipeline("lipschitz compose pipeline", "fs_compose"),
+            layout,
+            steps,
+        }
+    }
+
+    /// A pass input reading the data texture `data` and seed texture `seeds`.
+    fn bind_group(
+        &self,
+        device: &wgpu::Device,
+        data: &wgpu::TextureView,
+        seeds: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lipschitz bind group"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(data),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(seeds),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.steps,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(16),
+                    }),
+                },
+            ],
+        })
+    }
+}
+
+/// Targets for the distance field of one data texture: two ping-pong seed
+/// textures for jump flooding, and the output (data with the rebuilt DE).
+struct Envelope {
+    /// `[seeds A, seeds B, output]`, kept so they can be `destroy()`ed with
+    /// the rest of the cache.
+    textures: [wgpu::Texture; 3],
+    views: [wgpu::TextureView; 3],
+    /// Pass inputs: the data texture with seeds A, and with seeds B.
+    inputs: [wgpu::BindGroup; 2],
+    /// Step slot of each jump pass, in order (see [`lipschitz_slots`]).
+    slots: Vec<u32>,
+}
+
+impl Envelope {
+    fn new(
+        device: &wgpu::Device,
+        lp: &Lipschitz,
+        data: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let make = |label| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DATA_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        let textures = [
+            make("DE distance seeds A"),
+            make("DE distance seeds B"),
+            make("DE distance field"),
+        ];
+        let views = textures
+            .each_ref()
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
+        let inputs = [
+            lp.bind_group(device, data, &views[0]),
+            lp.bind_group(device, data, &views[1]),
+        ];
+        Self {
+            textures,
+            views,
+            inputs,
+            slots: lipschitz_slots(width, height),
+        }
+    }
+
+    /// The data texture with the rebuilt DE.
+    fn output(&self) -> &wgpu::TextureView {
+        &self.views[2]
+    }
+
+    /// Record seed → jump passes → compose into [`Self::output`].
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, lp: &Lipschitz) {
+        let pass = |encoder: &mut wgpu::CommandEncoder,
+                    target: &wgpu::TextureView,
+                    pipeline: &wgpu::RenderPipeline,
+                    input: &wgpu::BindGroup,
+                    slot: u32| {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("lipschitz pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, input, &[slot * LIPSCHITZ_STRIDE]);
+            pass.draw(0..3, 0..1);
+        };
+        // Seeds into A (the bound seed texture, B, is unread).
+        pass(encoder, &self.views[0], &lp.seed, &self.inputs[1], 0);
+        // Pass i reads seeds i % 2 and writes the other.
+        for (i, &slot) in self.slots.iter().enumerate() {
+            pass(encoder, &self.views[(i + 1) % 2], &lp.jump, &self.inputs[i % 2], slot);
+        }
+        let last = self.slots.len() % 2;
+        pass(encoder, &self.views[2], &lp.compose, &self.inputs[last], 0);
+    }
+}
+
+/// Jump-flooding step slots (step = 2^slot) for a `width`×`height` texture:
+/// from about half its larger side down to 1, then one more step-1 pass,
+/// which fixes most of jump flooding's residual errors.
+fn lipschitz_slots(width: u32, height: u32) -> Vec<u32> {
+    let top = (width.max(height) / 2).max(1).ilog2();
+    (0..=top).rev().chain(std::iter::once(0)).collect()
+}
+
 /// The interactive iteration pipelines for one [`PipelineKey`].
 struct IteratePipelines {
     /// 1-spp perturbation iterate → data texture (`fs_data`).
@@ -253,6 +488,10 @@ struct CacheTarget {
     /// Refine pass output + the colourise bind group reading it. Only
     /// allocated while AA is on: it's a second full-size `Rgba32Float`.
     aa: Option<(wgpu::TextureView, wgpu::BindGroup)>,
+    /// The distance-field rebuild of the refined (or 1-spp) data + the
+    /// colourise bind group reading it. Allocated on first use, only for
+    /// 3D Complex Multibrot (see [`wants_envelope`]).
+    envelope: Option<(Envelope, wgpu::BindGroup)>,
     /// Blit pass input: the colour texture + sampler.
     blit_bind_group: wgpu::BindGroup,
     width: u32,
@@ -302,6 +541,11 @@ pub struct FractalRenderer {
     /// Colourise pass: data texture → colour texture (palette mapping).
     colorize_pipeline: wgpu::RenderPipeline,
     colorize_bind_group_layout: wgpu::BindGroupLayout,
+    /// Distance-field passes for 3D Complex Multibrot (see [`wants_envelope`]).
+    lipschitz: Lipschitz,
+    /// Whether the cache's envelope matches the current data texture. Not
+    /// implied by iteration: switching shadow → 3D doesn't re-iterate.
+    envelope_valid: bool,
 
     /// Blit pipeline + resources that copy the colour texture to egui's surface.
     blit_pipeline: wgpu::RenderPipeline,
@@ -633,6 +877,8 @@ impl FractalRenderer {
             uploaded_lights: None,
             colorize_pipeline,
             colorize_bind_group_layout,
+            lipschitz: Lipschitz::new(device),
+            envelope_valid: false,
             blit_pipeline,
             blit_bind_group_layout,
             blit_sampler,
@@ -662,7 +908,8 @@ impl FractalRenderer {
         // Any commands using them were submitted on earlier frames, and
         // `destroy()` defers the actual free until those finish.
         if let Some(old) = self.cache.take() {
-            for t in &old.textures {
+            let envelope = old.envelope.iter().flat_map(|e| &e.0.textures);
+            for t in old.textures.iter().chain(envelope) {
                 t.destroy();
             }
         }
@@ -715,24 +962,13 @@ impl FractalRenderer {
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let colorize_bind_group_for = |data: &wgpu::TextureView| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("colorize bind group"),
-                layout: &self.colorize_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.uniform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(data),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.lights_buffer.as_entire_binding(),
-                    },
-                ],
-            })
+            colorize_bind_group(
+                device,
+                &self.colorize_bind_group_layout,
+                &self.uniform_buffer,
+                &self.lights_buffer,
+                data,
+            )
         };
         let colorize_bind_group = colorize_bind_group_for(&data_view);
         let aa_target = data_aa_texture.as_ref().map(|t| {
@@ -775,6 +1011,7 @@ impl FractalRenderer {
             refine_bind_group,
             colorize_bind_group,
             aa: aa_target,
+            envelope: None,
             blit_bind_group,
             width,
             height,
@@ -852,6 +1089,7 @@ impl FractalRenderer {
             colorize: self.colorize_pipeline.clone(),
             refine_bind_group_layout: self.refine_bind_group_layout.clone(),
             colorize_bind_group_layout: self.colorize_bind_group_layout.clone(),
+            lipschitz: wants_envelope(uniforms).then(|| self.lipschitz.clone()),
         });
         ExportHandles {
             pipeline,
@@ -882,15 +1120,19 @@ struct RaymarchHandles {
     colorize: wgpu::RenderPipeline,
     refine_bind_group_layout: wgpu::BindGroupLayout,
     colorize_bind_group_layout: wgpu::BindGroupLayout,
+    /// The distance-field passes, when [`wants_envelope`].
+    lipschitz: Option<Lipschitz>,
 }
 
 /// A 3D export's own data textures and the passes that fill them: the tiles
-/// iterate into `data_view`, then one refine (if AA) + colourise pass
-/// raymarches the finished height field into the export target.
+/// iterate into `data_view`, then one refine (if AA), the distance-field
+/// rebuild (if wanted) and a colourise pass raymarches the finished height
+/// field into the export target.
 struct RaymarchExport {
     iterate: wgpu::RenderPipeline,
     /// Refine pipeline, output view and input bind group, when AA is on.
     refine: Option<(wgpu::RenderPipeline, wgpu::TextureView, wgpu::BindGroup)>,
+    envelope: Option<(Lipschitz, Envelope)>,
     colorize: wgpu::RenderPipeline,
     colorize_bind_group: wgpu::BindGroup,
     data_view: wgpu::TextureView,
@@ -1066,29 +1308,25 @@ impl ExportRender {
                     refine_bind_group,
                 )
             });
-            // Colourise reads the refined texture when AA is on.
-            let colorize_input = refine.as_ref().map_or(&data_view, |(_, v, _)| v);
-            let colorize_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("export colorize bind group"),
-                layout: &rm.colorize_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(colorize_input),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: lights_buffer.as_entire_binding(),
-                    },
-                ],
+            // The distance field reads the refined texture when AA is on,
+            // and colourise reads the distance field, else the same texture.
+            let refined = refine.as_ref().map_or(&data_view, |(_, v, _)| v);
+            let envelope = rm.lipschitz.as_ref().map(|lp| {
+                let env = Envelope::new(device, lp, refined, width, height);
+                (lp.clone(), env)
             });
+            let colorize_input = envelope.as_ref().map_or(refined, |(_, e)| e.output());
+            let colorize_bind_group = colorize_bind_group(
+                device,
+                &rm.colorize_bind_group_layout,
+                &uniform_buffer,
+                &lights_buffer,
+                colorize_input,
+            );
             RaymarchExport {
                 iterate: rm.iterate.clone(),
                 refine,
+                envelope,
                 colorize: rm.colorize.clone(),
                 colorize_bind_group,
                 data_view,
@@ -1175,6 +1413,9 @@ impl ExportRender {
                     refine,
                     &[&self.bind_group, refine_bind_group],
                 );
+            }
+            if let Some((lp, env)) = &rm.envelope {
+                env.record(&mut encoder, lp);
             }
             data_pass(
                 &mut encoder,
@@ -1399,6 +1640,35 @@ pub fn encode_png_with_progress(
     out
 }
 
+/// Colourise pass input: the uniforms, the data texture `data` to colour and
+/// the lights.
+fn colorize_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniforms: &wgpu::Buffer,
+    lights: &wgpu::Buffer,
+    data: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("colorize bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(data),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: lights.as_entire_binding(),
+            },
+        ],
+    })
+}
+
 /// Record one fullscreen-triangle pass drawing `pipeline` into `target`
 /// (cleared first), with `bind_groups` bound to groups 0, 1, ...
 fn data_pass(
@@ -1534,6 +1804,25 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
         if iter_dirty {
             renderer.ensure_pipelines(device, PipelineKey::from_uniforms(&self.uniforms));
         }
+        let envelope = wants_envelope(&self.uniforms);
+        if envelope
+            && let Some(cache) = &renderer.cache
+            && cache.envelope.is_none()
+        {
+            let src = cache.aa.as_ref().map_or(&cache.data_view, |(v, _)| v);
+            let env = Envelope::new(device, &renderer.lipschitz, src, cache.width, cache.height);
+            let bind_group = colorize_bind_group(
+                device,
+                &renderer.colorize_bind_group_layout,
+                &renderer.uniform_buffer,
+                &renderer.lights_buffer,
+                env.output(),
+            );
+            if let Some(cache) = &mut renderer.cache {
+                cache.envelope = Some((env, bind_group));
+            }
+        }
+        let mut envelope_ran = false;
         let pipelines = &renderer.pipelines[&PipelineKey::from_uniforms(&self.uniforms)];
         if let Some(cache) = &renderer.cache {
             if iter_dirty {
@@ -1557,11 +1846,23 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
                 }
             }
 
+            // 3D Complex Multibrot: rebuild the DE as a distance field.
+            let env = cache.envelope.as_ref().filter(|_| envelope);
+            if let Some((env, _)) = env
+                && (iter_dirty || !renderer.envelope_valid)
+            {
+                env.record(egui_encoder, &renderer.lipschitz);
+                envelope_ran = true;
+            }
+
             // Colourise pass: data texture → colour texture.
-            let colorize_bind_group = cache
-                .aa
-                .as_ref()
-                .map_or(&cache.colorize_bind_group, |(_, bg)| bg);
+            let colorize_bind_group = match env {
+                Some((_, bg)) => bg,
+                None => cache
+                    .aa
+                    .as_ref()
+                    .map_or(&cache.colorize_bind_group, |(_, bg)| bg),
+            };
             data_pass(
                 egui_encoder,
                 "fractal colorize pass",
@@ -1571,6 +1872,7 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
             );
         }
 
+        renderer.envelope_valid = envelope_ran || (renderer.envelope_valid && !iter_dirty);
         if iter_dirty {
             renderer.iterated = Some(IterState {
                 uniforms: self.uniforms,

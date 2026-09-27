@@ -123,6 +123,17 @@ fn colorize_shader_is_valid() {
 }
 
 #[test]
+fn lipschitz_shader_is_valid() {
+    validate(
+        "lipschitz.wgsl",
+        concat!(
+            include_str!("../src/shaders/common.wgsl"),
+            include_str!("../src/shaders/lipschitz.wgsl"),
+        ),
+    );
+}
+
+#[test]
 fn blit_shader_is_valid() {
     validate(
         "blit.wgsl",
