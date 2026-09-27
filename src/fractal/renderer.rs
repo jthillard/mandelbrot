@@ -1309,8 +1309,16 @@ impl ExportRender {
         });
 
         // ~128px bands, kept to a sane range so progress is smooth without too
-        // many submissions.
-        let tiles = (height / 128).clamp(8, 64).min(height.max(1));
+        // many submissions; more at high iteration counts so no single
+        // submission runs long enough to trip a GPU reset (see
+        // `WORK_PER_SUBMIT`). Export supersamples every pixel (×3 in shadow
+        // mode, which also iterates two neighbours).
+        let aa = uniforms.aa_level.max(1);
+        let samples = aa * aa * if uniforms.rendering_mode != 0 { 3 } else { 1 };
+        let tiles = (height / 128)
+            .clamp(8, 64)
+            .max(band_count(width, height, uniforms.max_iter, samples))
+            .min(height.max(1));
 
         let swap_rb = matches!(
             target_format,
@@ -1758,6 +1766,25 @@ fn data_pass(
     pipeline: &wgpu::RenderPipeline,
     bind_groups: &[&wgpu::BindGroup],
 ) {
+    band_pass(encoder, label, target, pipeline, bind_groups, None, true);
+}
+
+/// [`data_pass`] restricted to `rows` (`[y0, y1)` of a `width`-wide target),
+/// clearing the whole attachment first only if `clear`.
+fn band_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    target: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    bind_groups: &[&wgpu::BindGroup],
+    rows: Option<(u32, u32, u32)>,
+    clear: bool,
+) {
+    let load = if clear {
+        wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+    } else {
+        wgpu::LoadOp::Load
+    };
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1765,7 +1792,7 @@ fn data_pass(
             depth_slice: None,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                load,
                 store: wgpu::StoreOp::Store,
             },
         })],
@@ -1774,11 +1801,70 @@ fn data_pass(
         occlusion_query_set: None,
         multiview_mask: None,
     });
+    if let Some((width, y0, y1)) = rows {
+        // Full-viewport triangle (so the pixel→plane mapping is unchanged),
+        // scissored to the band.
+        pass.set_scissor_rect(0, y0, width, y1 - y0);
+    }
     pass.set_pipeline(pipeline);
     for (i, bg) in bind_groups.iter().enumerate() {
         pass.set_bind_group(i as u32, *bg, &[]);
     }
     pass.draw(0..3, 0..1);
+}
+
+/// Worst-case pixel·iteration work allowed in one GPU submission. Drivers
+/// reset the GPU when a single draw runs too long (i915 on integrated Intel
+/// gives up after ~640 ms when it can't preempt, and a fullscreen draw can't
+/// be preempted mid-way), which loses the device. At deep zooms the iteration
+/// count reaches millions, so iteration passes are split into row bands, each
+/// its own submission, so the driver can schedule other work in between.
+/// 2^30 is a few tens of ms at worst on an integrated GPU.
+const WORK_PER_SUBMIT: f64 = (1u64 << 30) as f64;
+
+/// Number of row bands a `width`×`height` pass of up to `samples` ×
+/// `max_iter` iterations per pixel needs to stay within [`WORK_PER_SUBMIT`]
+/// each (at most one band per row).
+fn band_count(width: u32, height: u32, max_iter: u32, samples: u32) -> u32 {
+    let work = width as f64 * height as f64 * max_iter.max(1) as f64 * samples.max(1) as f64;
+    ((work / WORK_PER_SUBMIT).ceil() as u32).clamp(1, height.max(1))
+}
+
+/// [`data_pass`] split into `bands` row bands. One band is recorded into
+/// `encoder` as usual; more are each submitted on their own right away (so
+/// they run before `encoder`, which is submitted later and reads the result).
+#[allow(clippy::too_many_arguments)]
+fn banded_data_pass(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    target: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    bind_groups: &[&wgpu::BindGroup],
+    [width, height]: [u32; 2],
+    bands: u32,
+) {
+    if bands <= 1 {
+        data_pass(encoder, label, target, pipeline, bind_groups);
+        return;
+    }
+    let band = height.div_ceil(bands);
+    for y0 in (0..height).step_by(band as usize) {
+        let y1 = (y0 + band).min(height);
+        let mut band_encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        band_pass(
+            &mut band_encoder,
+            label,
+            target,
+            pipeline,
+            bind_groups,
+            Some((width, y0, y1)),
+            y0 == 0,
+        );
+        queue.submit([band_encoder.finish()]);
+    }
 }
 
 /// A per-frame paint callback. Carries this frame's uniforms plus a reference to
@@ -1907,22 +1993,32 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
         let pipelines = &renderer.pipelines[&PipelineKey::from_uniforms(&self.uniforms)];
         if let Some(cache) = &renderer.cache {
             if iter_dirty {
+                let max_iter = self.uniforms.max_iter;
                 // Iteration pass: 1-spp perturbation iterate → data texture.
-                data_pass(
+                banded_data_pass(
+                    device,
+                    queue,
                     egui_encoder,
                     "fractal iterate pass",
                     &cache.data_view,
                     &pipelines.iterate,
                     &[&renderer.bind_group],
+                    [width, height],
+                    band_count(width, height, max_iter, 1),
                 );
                 if let Some((data_aa_view, _)) = &cache.aa {
                     // Adaptive AA: supersample only the non-smooth pixels.
-                    data_pass(
+                    let aa = self.uniforms.aa_level;
+                    banded_data_pass(
+                        device,
+                        queue,
                         egui_encoder,
                         "fractal AA refine pass",
                         data_aa_view,
                         &pipelines.refine,
                         &[&renderer.bind_group, &cache.refine_bind_group],
+                        [width, height],
+                        band_count(width, height, max_iter, aa * aa),
                     );
                 }
             }
