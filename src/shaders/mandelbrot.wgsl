@@ -1126,13 +1126,36 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         // leaves it unchanged near the set (G -> 0, and ~0.8x at the edge of
         // the default view) but caps it at 2, so far away DE grows like 2r
         // and the cone stops narrowing. G underflows to 0 past ~150
-        // iterations, where the factor is 1 anyway.
-        let g = log(zmag) * exp2(-f32(n));
+        // iterations, where the factor is 1 anyway. G divides by the map's
+        // degree d per step, not 2: with 2^-n, pixels either side of a band
+        // boundary got G off by d/2, a DE seam on every band for d != 2.
+        let g = log(zmag) * pow(escape_degree(), -f32(n));
         let far = select(1.0, 2.0 * (1.0 - exp(-g / 2.0)) / g, g > 1e-4);
         let max_de = select(1.0, 1e30, u.shadow != 0u);
         de = clamp(zmag * log(zmag) / dzmag * far, 0.0, max_de);
     }
     return Sample(ci, de, true);
+}
+
+// Degree d of the current map at infinity (|f(z)| ~ |z|^d), which sets how
+// fast the potential G = ln|z_n| / d^n shrinks per step. Complex Multibrot's
+// |z^p| = |z|^Re(p)·e^(-Im(p)·arg z) grows like |z|^Re(p) (arg is bounded).
+// A morph blend is dominated by the higher degree.
+fn kind_degree(kind: u32) -> f32 {
+    if kind == KIND_MULTIBROT {
+        return f32(clamp(u.power, 2u, MULTIBROT_MAX_POWER));
+    } else if kind == KIND_COMPLEX_MULTIBROT {
+        return max(u.complex_power.x, 1.0);
+    }
+    return 2.0;
+}
+
+fn escape_degree() -> f32 {
+    let d = kind_degree(KIND);
+    if MORPH {
+        return max(d, kind_degree(u.morph_from));
+    }
+    return d;
 }
 
 // 1 / ln(2), for the smooth iteration count's log2(ln|z| / ln 2).
