@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 
-use eframe::egui_wgpu::{self, wgpu};
+#[cfg(feature = "gui")]
+use eframe::egui_wgpu;
 
 /// Random samples dispatched per accumulating frame. Chosen so a frame stays
 /// interactive on a modest GPU even when most samples run the full `b_cap`
@@ -336,6 +337,7 @@ pub struct BuddhabrotCallback {
     pub size_px: [u32; 2],
 }
 
+#[cfg(feature = "gui")]
 impl egui_wgpu::CallbackTrait for BuddhabrotCallback {
     fn prepare(
         &self,

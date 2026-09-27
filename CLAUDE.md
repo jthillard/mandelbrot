@@ -25,6 +25,7 @@ cargo test                   # reference-orbit math, share-link round-trip, WGSL
 cargo test --test shader_valid   # just the WGSL parse/validate tests (naga, no GPU needed)
 cargo clippy
 cargo fmt                    # rustfmt.toml just pins edition = "2024"
+cargo build --release --no-default-features   # headless-only binary: no eframe/egui (the default `gui` feature)
 ```
 
 Web build (WebGPU):

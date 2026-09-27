@@ -12,7 +12,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use eframe::egui_wgpu::{self, wgpu};
+#[cfg(feature = "gui")]
+use eframe::egui_wgpu;
 use wgpu::util::DeviceExt as _;
 
 use super::kind::FractalKind;
@@ -1884,6 +1885,7 @@ pub struct FractalCallback {
     pub size_px: [u32; 2],
 }
 
+#[cfg(feature = "gui")]
 impl egui_wgpu::CallbackTrait for FractalCallback {
     fn prepare(
         &self,

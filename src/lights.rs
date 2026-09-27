@@ -1,7 +1,9 @@
 use std::f32::consts::PI;
 
 use bytemuck::{Pod, Zeroable};
-use egui::{Color32, Ui};
+use ecolor::Color32;
+#[cfg(feature = "gui")]
+use egui::Ui;
 
 /// Maximum number of simultaneous lights.
 pub const MAX_LIGHT_COUNT: usize = 16;
@@ -27,6 +29,7 @@ impl Default for Light {
 }
 
 impl Light {
+    #[cfg(feature = "gui")]
     pub fn widget(&mut self, ui: &mut Ui) -> bool {
         let formater = |v, _| format!("{}°", ((v * 180. / std::f64::consts::PI) as u32));
         let parser = |s: &str| {

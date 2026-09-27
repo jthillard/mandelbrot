@@ -9,8 +9,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 
-use eframe::egui_wgpu::wgpu;
-
 use crate::app::{FractalApp, RefJob, parse_complex_pair, unix_timestamp};
 use crate::cli::Cli;
 use crate::fractal::{

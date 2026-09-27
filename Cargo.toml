@@ -3,11 +3,18 @@ name = "mandelbrot"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["gui"]
+# Windowed egui app. Without it only `--headless` rendering is built.
+gui = ["dep:eframe", "dep:egui"]
+
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
 dashu-float = "0.6.0"
-eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "accesskit"] }
-egui = "0.36.2"
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "accesskit"], optional = true }
+egui = { version = "0.36.2", optional = true }
+ecolor = { version = "0.36.2", features = ["bytemuck"] }
+wgpu = "30.0.1"
 glam = "0.33.8"
 log = "0.4.34"
 png = "0.18.1"

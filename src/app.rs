@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "gui")]
 use eframe::CreationContext;
+#[cfg(feature = "gui")]
 use eframe::egui_wgpu;
-#[cfg(target_arch = "wasm32")]
-use eframe::egui_wgpu::wgpu;
 use glam::Vec4;
 use glam::Vec4Swizzles;
 
@@ -316,6 +316,7 @@ impl ConstOrbit {
 
     /// Checkbox + speed/radius sliders; (re)centers the orbit on `current`
     /// when switched on.
+    #[cfg(feature = "gui")]
     fn ui(&mut self, ui: &mut egui::Ui, name: &str, current: (f64, f64)) {
         if ui.checkbox(&mut self.on, format!("Morph {name}")).changed() && self.on {
             self.enable(current);
@@ -371,6 +372,7 @@ impl AxisOsc {
         self.base + self.amplitude * self.phase.sin()
     }
 
+    #[cfg(feature = "gui")]
     fn ui(&mut self, ui: &mut egui::Ui, name: &str, current: f64) {
         if ui
             .checkbox(&mut self.on, format!("Animate {name}"))
@@ -594,6 +596,7 @@ pub struct FractalApp {
     /// PNG export resolution multiplier over the on-screen size.
     export_scale: f32,
     /// Last on-screen fractal size in physical pixels (for export sizing).
+    #[cfg(feature = "gui")]
     last_size_px: egui::Vec2,
     /// egui time (seconds) of the most recent pan/zoom. While recent (within
     /// `INTERACT_SETTLE`) the fractal renders downscaled for smooth interaction.
@@ -646,6 +649,7 @@ fn parse_bits_for(s: &str, min_bits: usize) -> usize {
 }
 
 impl FractalApp {
+    #[cfg(feature = "gui")]
     pub fn new(cc: &CreationContext<'_>) -> Self {
         let render_state = cc
             .wgpu_render_state
@@ -740,6 +744,7 @@ impl FractalApp {
             pending: false,
             export_scale: 2.0,
             render_scale_3d: 2.0,
+            #[cfg(feature = "gui")]
             last_size_px: egui::vec2(1280.0, 720.0),
             last_interact_time: -1.0e9,
             export_requested: false,
@@ -1414,6 +1419,7 @@ impl FractalApp {
     /// 3D-mode zoom toward the screen point `off` (points from the widget
     /// center): unproject it through the camera onto the z = 0 fractal plane,
     /// then zoom the 2D view about the matching fractal-texture pixel.
+    #[cfg(feature = "gui")]
     fn zoom_3d_at(&mut self, off: egui::Vec2, rect: egui::Rect, height_px: f64, factor: f64) {
         let ndc = (off / rect.size()) * 2.;
         let camera_ndc_pos = self
@@ -1515,6 +1521,7 @@ impl FractalApp {
     /// Render the current view to a PNG at `export_scale` × the on-screen size,
     /// then save it (native: file in cwd; web: browser download). Runs off the
     /// UI thread so a progress bar can animate; progress lands in `self.export`.
+    #[cfg(feature = "gui")]
     fn do_export(&mut self, frame: &mut eframe::Frame) {
         if self.export.is_some() {
             return; // one export at a time
@@ -1641,6 +1648,7 @@ impl FractalApp {
 
     /// Pick up a finished export (setting the status line) and keep repainting
     /// while one is in flight so its progress bar animates.
+    #[cfg(feature = "gui")]
     fn poll_export(&mut self, ctx: &egui::Context) {
         if let Some(shared) = &self.export {
             let done = shared.lock().unwrap().result.take();
@@ -1661,6 +1669,7 @@ impl FractalApp {
     /// Floating top-left overlay with the panel toggle and fullscreen toggle.
     /// Always on top of the fractal, so both stay reachable when the controls
     /// panel is collapsed (the common case on a phone).
+    #[cfg(feature = "gui")]
     fn overlay_buttons(&mut self, ui: &mut egui::Ui) {
         egui::Area::new(egui::Id::new("overlay_buttons"))
             .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
@@ -1719,6 +1728,7 @@ impl FractalApp {
     /// "Fractal Info" window. Kept separate from `overlay_buttons` (top-left)
     /// so it stays out of the way of the panel toggle / fullscreen controls,
     /// but is still reachable even when the controls panel is collapsed.
+    #[cfg(feature = "gui")]
     fn info_button(&mut self, ui: &mut egui::Ui) {
         egui::Area::new(egui::Id::new("info_button"))
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
@@ -1740,6 +1750,7 @@ impl FractalApp {
     /// Window with details about what's currently on screen: formula, active
     /// per-kind constants, zoom depth, iteration count. Reads live state, so
     /// it stays correct as the user pans/zooms/switches kinds.
+    #[cfg(feature = "gui")]
     fn info_window(&mut self, ctx: &egui::Context) {
         let mut open = self.info_open;
         egui::Window::new("Fractal Info")
@@ -1796,6 +1807,7 @@ impl FractalApp {
 
     /// Help window: what the app does, plus a reference for mouse/touch and
     /// keyboard controls.
+    #[cfg(feature = "gui")]
     fn help_window(&mut self, ctx: &egui::Context) {
         let mut open = self.help_open;
         egui::Window::new("Help")
@@ -1886,7 +1898,7 @@ impl FractalApp {
     }
 
     /// Push the desired fullscreen state to the platform.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "gui", not(target_arch = "wasm32")))]
     fn apply_fullscreen(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
     }
@@ -1894,7 +1906,7 @@ impl FractalApp {
     /// Push the desired fullscreen state to the browser. `request_fullscreen`
     /// must run inside a user gesture; the button click provides the transient
     /// activation that carries into this frame.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(feature = "gui", target_arch = "wasm32"))]
     fn apply_fullscreen(&mut self, _ctx: &egui::Context) {
         let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
             return;
@@ -1910,14 +1922,14 @@ impl FractalApp {
 
     /// Refresh `self.fullscreen` from the real platform state, so the label is
     /// correct even when fullscreen is left by Esc/F11 or the browser UI.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "gui", not(target_arch = "wasm32")))]
     fn sync_fullscreen(&mut self, ctx: &egui::Context) {
         if let Some(fs) = ctx.input(|i| i.viewport().fullscreen) {
             self.fullscreen = fs;
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(feature = "gui", target_arch = "wasm32"))]
     fn sync_fullscreen(&mut self, _ctx: &egui::Context) {
         if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
             self.fullscreen = doc.fullscreen_element().is_some();
@@ -1929,6 +1941,7 @@ impl FractalApp {
     /// divides once the window closes, so the readout is steady rather than
     /// jittering every frame. Only advances when egui repaints — i.e. while the
     /// app is doing work — so an idle app shows its last measured rate.
+    #[cfg(feature = "gui")]
     fn update_fps(&mut self, ui: &egui::Ui) {
         let now = ui.input(|i| i.time);
         // Reset the window if time went backwards or hasn't started yet.
@@ -1948,6 +1961,7 @@ impl FractalApp {
     /// Advance any enabled animations by the frame's elapsed time, and request a
     /// repaint while active. Animations render at full resolution/AA (they do not
     /// trigger the interaction low-res pass).
+    #[cfg(feature = "gui")]
     fn tick_animations(&mut self, ui: &egui::Ui) {
         // Julia c only matters in Julia mode; Phoenix p only for the Phoenix kind; Lambda λ only for Lambda kind.
         let julia_on = self.anim.julia.on && self.mode == FractalMode::Julia;
@@ -2092,6 +2106,7 @@ impl FractalApp {
         }
     }
 
+    #[cfg(feature = "gui")]
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Fractal Explorer");
         ui.separator();
@@ -2574,6 +2589,7 @@ impl FractalApp {
 
     /// Controls for Buddhabrot mode: nested iteration caps (Nebulabrot R/G/B
     /// coloring), exposure, and the progressive-accumulation toggle.
+    #[cfg(feature = "gui")]
     fn buddhabrot_ui(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.add(
@@ -2614,6 +2630,7 @@ impl FractalApp {
         ui.small("PNG export isn't available in Buddhabrot mode yet.");
     }
 
+    #[cfg(feature = "gui")]
     fn fractal_ui(&mut self, ui: &mut egui::Ui) {
         let size = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
@@ -2939,6 +2956,7 @@ impl FractalApp {
     }
 }
 
+#[cfg(feature = "gui")]
 impl eframe::App for FractalApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll_export(ui.ctx());

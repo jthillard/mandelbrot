@@ -1,6 +1,8 @@
 // Without these, rust fails to infer Send/Sync trait impls
 // Probably caused by the new trait solver
 #![recursion_limit = "256"]
+// Without the `gui` feature, UI-only state and helpers go unused.
+#![cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
 
 // Fractal Explorer — Rust + wgpu + egui + WGSL deep-zoom Mandelbrot.
 //
@@ -21,7 +23,16 @@ mod headless;
 #[cfg(not(target_arch = "wasm32"))]
 mod worker;
 
+#[cfg(all(target_arch = "wasm32", not(feature = "gui")))]
+compile_error!("the web build needs the `gui` feature");
+
+#[cfg(feature = "gui")]
 use app::FractalApp;
+
+#[cfg(all(feature = "gui", not(target_arch = "wasm32")))]
+type MainResult = eframe::Result;
+#[cfg(all(not(feature = "gui"), not(target_arch = "wasm32")))]
+type MainResult = Result<(), String>;
 
 /// wgpu configuration for eframe. The fractal fragment shader reads the
 /// reference orbit from a **storage buffer**, so the device must allow storage
@@ -30,6 +41,7 @@ use app::FractalApp;
 ///   * request the adapter's real limits (which include storage buffers), and
 ///   * force the WebGPU backend on the web (WebGL2 can't do storage buffers at
 ///     all) — failing cleanly on browsers without WebGPU, per the design.
+#[cfg(feature = "gui")]
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     use eframe::egui_wgpu::{WgpuSetup, wgpu};
 
@@ -51,7 +63,7 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn main() -> eframe::Result {
+fn main() -> MainResult {
     use clap::Parser as _;
 
     env_logger::builder()
@@ -70,6 +82,13 @@ fn main() -> eframe::Result {
         };
     }
 
+    #[cfg(not(feature = "gui"))]
+    {
+        eprintln!("error: built without the \"gui\" feature; only --headless is supported");
+        std::process::exit(1);
+    }
+
+    #[cfg(feature = "gui")]
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: wgpu_options(),
@@ -80,6 +99,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    #[cfg(feature = "gui")]
     eframe::run_native(
         "Fractal Explorer",
         native_options,
