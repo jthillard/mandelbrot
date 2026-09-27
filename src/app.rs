@@ -43,6 +43,10 @@ fn bailout_sq(kind: FractalKind, power: u32) -> f32 {
 }
 /// Cap on exported image dimension (px), to stay within GPU texture limits.
 const MAX_EXPORT_DIM: u32 = 8192 * 16;
+/// Hard ceiling on the iteration count: the longest reference orbit the GPU
+/// buffer holds (past it, the shader would read pixels as escaped).
+const MAX_ITERATIONS: u32 = MAX_REF_POINTS as u32 - 1;
+
 /// While the user is actively panning/zooming, the fractal is rendered into a
 /// cache texture downscaled by this factor per axis (and with AA forced off), so
 /// each interacting frame is cheap; the linear blit upsamples it to the widget.
@@ -827,7 +831,7 @@ impl FractalApp {
         }
         if let Some(iterations) = cli.iterations {
             self.auto_iterations = false;
-            self.max_iterations = iterations;
+            self.max_iterations = iterations.clamp(32, MAX_ITERATIONS);
         }
         if let Some(half_height) = cli.half_height {
             self.apply_half_height_spec(&half_height);
@@ -858,7 +862,7 @@ impl FractalApp {
         self.view = view;
         if let Some(v) = iterations {
             self.auto_iterations = false;
-            self.max_iterations = v.clamp(32, MAX_REF_POINTS as u32 - 1);
+            self.max_iterations = v.clamp(32, MAX_ITERATIONS);
         }
         true
     }
@@ -912,7 +916,7 @@ impl FractalApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn set_max_iterations(&mut self, i: u32) {
         self.auto_iterations = false;
-        self.max_iterations = i;
+        self.max_iterations = i.clamp(32, MAX_ITERATIONS);
     }
 
     /// Per-kind constants `(julia_c, phoenix_p, lambda_l, complex_power)`.
@@ -1004,7 +1008,7 @@ impl FractalApp {
             self.morph = None;
             // Presets carry a hand-tuned count; don't let the auto-scaler clobber it.
             self.auto_iterations = false;
-            self.max_iterations = iterations.clamp(32, MAX_REF_POINTS as u32 - 1);
+            self.max_iterations = iterations.clamp(32, MAX_ITERATIONS);
         }
     }
 
@@ -1014,7 +1018,7 @@ impl FractalApp {
     fn auto_iteration_count(&self) -> u32 {
         let decades = self.view.magnification_log10().max(0.0);
         let iters = 400.0 + 900.0 * decades;
-        (iters.round() as u32).clamp(200, MAX_REF_POINTS as u32 - 1)
+        (iters.round() as u32).clamp(200, MAX_ITERATIONS)
     }
 
     /// Snapshot the current view as a shareable state.
@@ -1061,7 +1065,7 @@ impl FractalApp {
         // The link carries an explicit iteration count; honor it rather than
         // letting the auto-scaler immediately overwrite it.
         self.auto_iterations = false;
-        self.max_iterations = s.iterations.clamp(32, MAX_REF_POINTS as u32 - 1);
+        self.max_iterations = s.iterations.clamp(32, MAX_ITERATIONS);
         let bits = precision_for(s.half_height);
         if let (Some(re), Some(im)) = (
             big_from_decimal_str(&s.center_re, bits),
@@ -1157,7 +1161,7 @@ impl FractalApp {
             // while auto-iterations creep up during a zoom (the shader clamps
             // to `max_iterations`); only recompute once it's too short, or
             // far longer than needed.
-            || self.max_iterations > key.iter
+            || self.max_iterations.min(MAX_ITERATIONS) > key.iter
             || self.max_iterations.saturating_mul(4) < key.iter
             || key.kind != self.kind
             || key.power != self.power
@@ -2209,7 +2213,7 @@ impl FractalApp {
                     for &(name, re, im, iterations, phoenix) in JULIA_PRESETS[self.kind as usize] {
                         if ui.small_button(name).clicked() {
                             self.julia_c = (re, im);
-                            self.max_iterations = iterations.clamp(32, MAX_REF_POINTS as u32 - 1);
+                            self.max_iterations = iterations.clamp(32, MAX_ITERATIONS);
 
                             if let Some(phoenix) = phoenix {
                                 self.phoenix_p = phoenix;
@@ -2266,11 +2270,15 @@ impl FractalApp {
         if self.auto_iterations {
             ui.label(format!("iterations: {} (auto)", self.max_iterations));
         } else {
+            // Dragging stays within the slider's range, but a typed value
+            // isn't clamped to it: only to what the reference buffer can hold.
             ui.add(
                 egui::Slider::new(&mut self.max_iterations, 32..=100_000)
                     .text("iterations")
-                    .logarithmic(true),
+                    .logarithmic(true)
+                    .clamping(egui::SliderClamping::Never),
             );
+            self.max_iterations = self.max_iterations.clamp(32, MAX_ITERATIONS);
         }
         ui.checkbox(&mut self.antialias, "Antialiasing (2×2)")
             .on_hover_text("Supersample each pixel for smoother edges (~4× slower).");
@@ -2812,13 +2820,13 @@ impl FractalApp {
             }
             if ui.input(|i| i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)) {
                 self.auto_iterations = false;
-                self.max_iterations = ((self.max_iterations as f64 * 1.25).round() as u32)
-                    .clamp(32, MAX_REF_POINTS as u32 - 1);
+                self.max_iterations =
+                    ((self.max_iterations as f64 * 1.25).round() as u32).clamp(32, MAX_ITERATIONS);
             }
             if ui.input(|i| i.key_pressed(egui::Key::Minus)) {
                 self.auto_iterations = false;
-                self.max_iterations = ((self.max_iterations as f64 / 1.25).round() as u32)
-                    .clamp(32, MAX_REF_POINTS as u32 - 1);
+                self.max_iterations =
+                    ((self.max_iterations as f64 / 1.25).round() as u32).clamp(32, MAX_ITERATIONS);
             }
         }
 

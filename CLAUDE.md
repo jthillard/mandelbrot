@@ -128,7 +128,13 @@ pixel is a handful of `f32` complex multiplies.
   passes near 0 at a deep minibrot. `has_scaled()` then forces the deep
   pipeline, the only one that reads `exps`. Requests are made with 1.5×
   iteration headroom (`reference_iterations` in `app.rs`), so auto-iterations
-  creeping up during a zoom doesn't recompute the orbit every frame.
+  creeping up during a zoom doesn't recompute the orbit every frame. The
+  interactive reference buffers start at 2^17 points and grow on demand
+  (`FractalRenderer::ensure_ref_capacity`) up to `MAX_REF_POINTS` (2^24, the
+  128 MiB WebGPU default binding size). That is also the hard iteration
+  ceiling (`app.rs::MAX_ITERATIONS`), because the shader treats an exhausted
+  reference as escaped. The UI slider only goes to 100k when dragged; typed
+  values can go higher.
 - `src/shaders/*.wgsl` — none of these are standalone WGSL modules; WGSL has
   no `#include`, so each is compiled by concatenating plain-text fragments
   with `concat!`/`include_str!` at the `create_shader_module` call site (see

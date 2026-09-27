@@ -60,6 +60,9 @@ pub struct RefOrbit {
 
 impl RefOrbit {
     fn with_capacity(n: usize) -> Self {
+        // Most orbits escape long before `max_iter`; don't reserve hundreds of
+        // MB up front for a multi-million iteration request.
+        let n = n.min(1 << 17);
         Self {
             points: Vec::with_capacity(n),
             exps: Vec::with_capacity(n),

@@ -19,9 +19,15 @@ use super::kind::FractalKind;
 use super::reference::RefOrbit;
 use crate::lights::{GpuLight, Light, MAX_LIGHT_COUNT, gpu_lights};
 
-/// Maximum reference-orbit length (points) the storage buffer can hold. Also
-/// bounds the iteration count. 128k points * 8 bytes = 1 MiB.
-pub const MAX_REF_POINTS: usize = 1 << 17;
+/// Maximum reference-orbit length (points), and so the hard ceiling on the
+/// iteration count (the shader treats an exhausted reference as escaped).
+/// 16M points * 8 bytes = 128 MiB, WebGPU's default
+/// `max_storage_buffer_binding_size`, so every device can bind it.
+pub const MAX_REF_POINTS: usize = 1 << 24;
+
+/// Initial capacity (points) of the interactive reference buffers; they grow
+/// (by powers of two, up to `MAX_REF_POINTS`) when a longer orbit arrives.
+const INITIAL_REF_POINTS: usize = 1 << 17;
 
 /// Format of the intermediate iteration-data texture holding, per pixel,
 /// `(ci, DE factor, interior fraction)`. 32-bit float keeps the smooth iteration
@@ -233,7 +239,15 @@ impl Lipschitz {
             immediate_size: 0,
         });
         let pipeline = |label, entry| {
-            fullscreen_pipeline(device, label, &module, &pipeline_layout, entry, DATA_FORMAT, &[])
+            fullscreen_pipeline(
+                device,
+                label,
+                &module,
+                &pipeline_layout,
+                entry,
+                DATA_FORMAT,
+                &[],
+            )
         };
         let mut contents = vec![0u8; (LIPSCHITZ_STRIDE * LIPSCHITZ_SLOTS) as usize];
         for k in 0..LIPSCHITZ_SLOTS {
@@ -380,7 +394,13 @@ impl Envelope {
         pass(encoder, &self.views[0], &lp.seed, &self.inputs[1], 0);
         // Pass i reads seeds i % 2 and writes the other.
         for (i, &slot) in self.slots.iter().enumerate() {
-            pass(encoder, &self.views[(i + 1) % 2], &lp.jump, &self.inputs[i % 2], slot);
+            pass(
+                encoder,
+                &self.views[(i + 1) % 2],
+                &lp.jump,
+                &self.inputs[i % 2],
+                slot,
+            );
         }
         let last = self.slots.len() % 2;
         pass(encoder, &self.views[2], &lp.compose, &self.inputs[last], 0);
@@ -531,6 +551,8 @@ pub struct FractalRenderer {
     uniform_buffer: wgpu::Buffer,
     ref_buffer: wgpu::Buffer,
     ref_exp_buffer: wgpu::Buffer,
+    /// Points `ref_buffer` / `ref_exp_buffer` can hold (see `ensure_ref_capacity`).
+    ref_capacity: usize,
     lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     target_format: wgpu::TextureFormat,
@@ -562,6 +584,37 @@ pub struct FractalRenderer {
 }
 
 impl FractalRenderer {
+    /// Grow the reference buffers (and rebuild the bind group pointing at
+    /// them) so they hold at least `needed` points. The caller re-uploads the
+    /// orbit right after, so the old contents aren't copied over.
+    fn ensure_ref_capacity(&mut self, device: &wgpu::Device, needed: usize) {
+        if needed <= self.ref_capacity {
+            return;
+        }
+        let capacity = needed.next_power_of_two().min(MAX_REF_POINTS);
+        self.ref_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reference orbit"),
+            size: (capacity * std::mem::size_of::<[f32; 2]>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.ref_exp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reference orbit exponents"),
+            size: (capacity * std::mem::size_of::<i32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.bind_group = iterate_bind_group(
+            device,
+            &self.bind_group_layout,
+            &self.uniform_buffer,
+            &self.ref_buffer,
+            &self.lights_buffer,
+            &self.ref_exp_buffer,
+        );
+        self.ref_capacity = capacity;
+    }
+
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mandelbrot"),
@@ -584,7 +637,7 @@ impl FractalRenderer {
 
         let ref_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("reference orbit"),
-            size: (MAX_REF_POINTS * std::mem::size_of::<[f32; 2]>()) as u64,
+            size: (INITIAL_REF_POINTS * std::mem::size_of::<[f32; 2]>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -593,7 +646,7 @@ impl FractalRenderer {
         // read by deep pipelines.
         let ref_exp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("reference orbit exponents"),
-            size: (MAX_REF_POINTS * std::mem::size_of::<i32>()) as u64,
+            size: (INITIAL_REF_POINTS * std::mem::size_of::<i32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -654,28 +707,14 @@ impl FractalRenderer {
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fractal bind group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: ref_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: lights_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: ref_exp_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let bind_group = iterate_bind_group(
+            device,
+            &bind_group_layout,
+            &uniform_buffer,
+            &ref_buffer,
+            &lights_buffer,
+            &ref_exp_buffer,
+        );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("fractal pipeline layout"),
@@ -872,6 +911,7 @@ impl FractalRenderer {
             uniform_buffer,
             ref_buffer,
             ref_exp_buffer,
+            ref_capacity: INITIAL_REF_POINTS,
             lights_buffer,
             bind_group,
             target_format,
@@ -1648,6 +1688,40 @@ pub fn encode_png_with_progress(
 
 /// Colourise pass input: the uniforms, the data texture `data` to colour and
 /// the lights.
+/// Group 0 of the iterate/refine pipelines: uniforms, reference orbit,
+/// lights, reference exponents.
+fn iterate_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniform_buffer: &wgpu::Buffer,
+    ref_buffer: &wgpu::Buffer,
+    lights_buffer: &wgpu::Buffer,
+    ref_exp_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("fractal bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: ref_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: lights_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: ref_exp_buffer.as_entire_binding(),
+            },
+        ],
+    })
+}
+
 fn colorize_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -1779,6 +1853,7 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
             && !self.reference.is_empty()
         {
             let count = self.reference.len().min(MAX_REF_POINTS);
+            renderer.ensure_ref_capacity(device, count);
             queue.write_buffer(
                 &renderer.ref_buffer,
                 0,
