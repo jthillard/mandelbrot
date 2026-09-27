@@ -19,14 +19,28 @@ use crate::lights::{Light, gpu_lights};
 use crate::view::parse_half_height_spec;
 use crate::view::parse_re_im_spec;
 use crate::view::{
-    Big, DEFAULT_HALF_HEIGHT, MAX_PRECISION_BITS, Scale, ViewState, big_from_decimal_str, big_from_f64,
-    big_to_decimal_str, deep_scale_exp, interpolate_view, needs_deep, parse_view_spec,
-    precision_for,
+    Big, DEFAULT_HALF_HEIGHT, MAX_PRECISION_BITS, Scale, ViewState, big_from_decimal_str,
+    big_from_f64, big_to_decimal_str, deep_scale_exp, interpolate_view, needs_deep,
+    parse_view_spec, precision_for,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use clap::Parser;
 
 const BAILOUT_SQ: f32 = 1.0e6;
+
+/// Pixel bailout |z|^2 for `kind`. For Multibrot z^p, one step from |z| = R
+/// (with the reference within 2R, which rebasing guarantees) must stay a
+/// finite f32, |z|^2 included: (2R)^(2p) <= 2^126, i.e. R^2 <= 2^(126/p - 2).
+/// Otherwise inf - inf turns into NaN, which never compares above the bailout
+/// and paints exterior pixels as interior. Unchanged for p <= 5; still well
+/// above the escape radius (<= 2) at the maximum power.
+fn bailout_sq(kind: FractalKind, power: u32) -> f32 {
+    if kind == FractalKind::Multibrot {
+        BAILOUT_SQ.min((126.0 / power.max(2) as f32 - 2.0).exp2())
+    } else {
+        BAILOUT_SQ
+    }
+}
 /// Cap on exported image dimension (px), to stay within GPU texture limits.
 const MAX_EXPORT_DIM: u32 = 8192 * 16;
 /// While the user is actively panning/zooming, the fractal is rendered into a
@@ -1034,7 +1048,7 @@ impl FractalApp {
             FractalMode::Mandelbrot
         };
         self.kind = s.kind;
-        self.power = s.power.clamp(2, 200);
+        self.power = s.power.clamp(2, 20);
         self.julia_c = s.julia_c;
         self.phoenix_p = s.phoenix_p;
         self.lambda_l = s.lambda_l;
@@ -1078,10 +1092,18 @@ impl FractalApp {
     /// each kind's interesting region.
     fn default_view_for(mode: FractalMode, kind: FractalKind) -> ViewState {
         if mode == FractalMode::Julia {
-            return ViewState::with_center(big_from_f64(0.0, 53), big_from_f64(0.0, 53), Scale::from_f64(1.5));
+            return ViewState::with_center(
+                big_from_f64(0.0, 53),
+                big_from_f64(0.0, 53),
+                Scale::from_f64(1.5),
+            );
         }
         let (cr, ci, hh) = kind.default_set_view();
-        ViewState::with_center(big_from_f64(cr, 53), big_from_f64(ci, 53), Scale::from_f64(hh))
+        ViewState::with_center(
+            big_from_f64(cr, 53),
+            big_from_f64(ci, 53),
+            Scale::from_f64(hh),
+        )
     }
 
     /// The request key for the current state. Its `iter` is the reference
@@ -1110,8 +1132,12 @@ impl FractalApp {
     fn drift_from(&self, key: &RequestKey) -> f64 {
         let hh = self.view.half_height;
         let k = -hh.exponent() as isize;
-        let dre = ((&self.view.center_re - &key.center_re) << k).to_f64().value();
-        let dim = ((&self.view.center_im - &key.center_im) << k).to_f64().value();
+        let dre = ((&self.view.center_re - &key.center_re) << k)
+            .to_f64()
+            .value();
+        let dim = ((&self.view.center_im - &key.center_im) << k)
+            .to_f64()
+            .value();
         (dre * dre + dim * dim).sqrt() / hh.scaled_f64(-hh.exponent())
     }
 
@@ -1422,7 +1448,7 @@ impl FractalApp {
             ref_len: self.reference.len() as u32,
             color_offset: self.color_offset,
             color_scale: self.color_scale,
-            bailout_sq: BAILOUT_SQ,
+            bailout_sq: bailout_sq(self.ref_kind.unwrap_or(self.kind), self.power),
             is_julia: matches!(self.mode, FractalMode::Julia) as u32,
             palette_id: self.palette,
             shadow_palette_id: self.shadow_palette,
@@ -1465,7 +1491,7 @@ impl FractalApp {
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
             complex_power: [self.complex_power.0 as f32, self.complex_power.1 as f32],
-            bailout_sq: BAILOUT_SQ,
+            bailout_sq: bailout_sq(self.kind, self.power),
             kind: self.kind as u32,
             power: self.power,
             r_cap: self.buddha_r_cap,
@@ -2028,7 +2054,11 @@ impl FractalApp {
         if self.anim.zoom && self.anim.zoom_speed != 0.0 {
             let max_hh = Scale::from_f64(DEFAULT_HALF_HEIGHT * 4.0);
             let factor = (-(self.anim.zoom_speed as f64) * dt).exp();
-            let target = self.view.half_height.mul_f64(factor).clamp(Scale::MIN, max_hh);
+            let target = self
+                .view
+                .half_height
+                .mul_f64(factor)
+                .clamp(Scale::MIN, max_hh);
             let f = target.ratio(self.view.half_height);
             if (f - 1.0).abs() > 1.0e-9 {
                 self.view
@@ -2074,7 +2104,7 @@ impl FractalApp {
                 }
             });
         if self.kind == FractalKind::Multibrot {
-            ui.add(egui::Slider::new(&mut self.power, 2..=8).text("power"));
+            ui.add(egui::Slider::new(&mut self.power, 2..=20).text("power"));
         }
         if self.kind == FractalKind::Phoenix {
             ui.horizontal(|ui| {

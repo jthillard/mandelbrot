@@ -43,6 +43,10 @@ const KIND_MANDELBROT: u32 = 0u;
 const KIND_BURNING_SHIP: u32 = 1u;
 const KIND_TRICORN: u32 = 2u;
 const KIND_MULTIBROT: u32 = 3u;
+// Highest Multibrot power (the UI/CLI/share-link clamp in app.rs matches).
+// `bailout_sq` in app.rs shrinks the bailout with the power so z^p stays a
+// finite f32.
+const MULTIBROT_MAX_POWER: u32 = 20u;
 const KIND_CELTIC: u32 = 4u;
 const KIND_PERPENDICULAR: u32 = 5u;
 const KIND_BUFFALO: u32 = 6u;

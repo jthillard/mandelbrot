@@ -16,7 +16,7 @@ pub enum FractalKind {
     BurningShip = 1,
     /// `z -> conj(z)^2 + c` (the Mandelbar).
     Tricorn = 2,
-    /// `z -> z^power + c` (power >= 2).
+    /// `z -> z^power + c` (integer power in [2, 20]).
     Multibrot = 3,
     /// `z -> |Re(z^2)| + i·Im(z^2) + c` (abs on the real output of the square).
     Celtic = 4,

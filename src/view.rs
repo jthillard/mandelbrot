@@ -19,7 +19,6 @@ pub type Big = FBig<HalfAway, 2>;
 /// Half-height (complex units) of the default view; also the zoom-1 reference.
 pub const DEFAULT_HALF_HEIGHT: f64 = 1.25;
 
-
 /// Below this pixel size (complex units per pixel) the GPU renders with the
 /// deep pipeline, whose per-pixel deltas start out as an f32 mantissa times
 /// `2^scale_exp`. Plain f32 stays exact as long as the smallest per-pixel
@@ -89,7 +88,10 @@ impl Scale {
             return Self::MIN;
         }
         if m.is_infinite() {
-            return Scale { m: 1.0, e: i32::MAX / 2 };
+            return Scale {
+                m: 1.0,
+                e: i32::MAX / 2,
+            };
         }
         // Bring m into [1, 2) through its own binary exponent (exact).
         let k = m.log2().floor() as i32;
@@ -175,11 +177,7 @@ impl Scale {
 impl PartialOrd for Scale {
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         // Normalized and positive: the exponent decides, then the mantissa.
-        Some(
-            self.e
-                .cmp(&other.e)
-                .then(self.m.partial_cmp(&other.m)?),
-        )
+        Some(self.e.cmp(&other.e).then(self.m.partial_cmp(&other.m)?))
     }
 }
 
@@ -197,7 +195,12 @@ impl core::fmt::Display for Scale {
         }
         // Out of f64's range: round the exact decimal expansion instead.
         let sig = f.precision().map_or(17, |p| p + 1);
-        let dec = self.to_big().to_decimal().value().with_precision(sig).value();
+        let dec = self
+            .to_big()
+            .to_decimal()
+            .value()
+            .with_precision(sig)
+            .value();
         let repr = dec.repr();
         let digits = repr.significand().to_string();
         let digits = digits.trim_end_matches('0');
@@ -227,7 +230,11 @@ impl FromStr for Scale {
         if let Ok(x) = s.parse::<f64>()
             && x.is_normal()
         {
-            return if x > 0.0 { Ok(Self::from_f64(x)) } else { Err(()) };
+            return if x > 0.0 {
+                Ok(Self::from_f64(x))
+            } else {
+                Err(())
+            };
         }
         // Too small (or large) for f64: go through an exact decimal.
         let dec = DBig::from_str(s).map_err(|_| ())?;
@@ -490,7 +497,8 @@ mod tests {
     #[test]
     fn interpolate_view_hits_exact_endpoints() {
         let bits = precision_for(sc(1.0));
-        let from = ViewState::with_center(big_from_f64(-0.5, bits), big_from_f64(0.0, bits), sc(1.5));
+        let from =
+            ViewState::with_center(big_from_f64(-0.5, bits), big_from_f64(0.0, bits), sc(1.5));
         let to = ViewState::with_center(
             big_from_f64(-0.7515, precision_for(sc(1e-20))),
             big_from_f64(0.1013, precision_for(sc(1e-20))),
@@ -515,7 +523,8 @@ mod tests {
     #[test]
     fn interpolate_view_keeps_target_offset_bounded() {
         let bits = precision_for(sc(1.0));
-        let from = ViewState::with_center(big_from_f64(-0.5, bits), big_from_f64(0.0, bits), sc(1.5));
+        let from =
+            ViewState::with_center(big_from_f64(-0.5, bits), big_from_f64(0.0, bits), sc(1.5));
         let to = ViewState::with_center(
             big_from_f64(-0.7515, precision_for(sc(1e-20))),
             big_from_f64(0.1013, precision_for(sc(1e-20))),
@@ -539,7 +548,14 @@ mod tests {
 
     #[test]
     fn scale_parse_display_round_trip() {
-        for s in ["1.25", "1e-20", "1.5e-20", "3.7e-4000", "1e-400", "9.99999e-310"] {
+        for s in [
+            "1.25",
+            "1e-20",
+            "1.5e-20",
+            "3.7e-4000",
+            "1e-400",
+            "9.99999e-310",
+        ] {
             let a: Scale = s.parse().unwrap();
             let b: Scale = a.to_string().parse().unwrap();
             assert_eq!(a, b, "{s} -> {a}");
@@ -565,7 +581,10 @@ mod tests {
         assert_eq!(sc(1.0).exponent(), 0);
         assert_eq!(sc(0.75).exponent(), -1);
         assert_eq!(sc(4.0).scaled_f64(-2), 1.0);
-        assert_eq!(a.scaled_f64(-a.exponent()), a.mul_f64(1.0).scaled_f64(-a.exponent()));
+        assert_eq!(
+            a.scaled_f64(-a.exponent()),
+            a.mul_f64(1.0).scaled_f64(-a.exponent())
+        );
         assert!((1.0..2.0).contains(&a.scaled_f64(-a.exponent())));
         assert_eq!(a.to_f64(), 0.0);
         assert_eq!(Scale::MIN.mul_f64(0.5), Scale::MIN);
@@ -577,18 +596,11 @@ mod tests {
     /// same geometric pace as the half-height.
     #[test]
     fn interpolate_view_past_f64_range() {
-        let from = ViewState::with_center(
-            big_from_f64(-0.5, 64),
-            big_from_f64(0.0, 64),
-            sc(1.5),
-        );
+        let from = ViewState::with_center(big_from_f64(-0.5, 64), big_from_f64(0.0, 64), sc(1.5));
         let hh: Scale = "1e-1000".parse().unwrap();
         let bits = precision_for(hh);
-        let to = ViewState::with_center(
-            big_from_f64(-0.7515, bits),
-            big_from_f64(0.1013, bits),
-            hh,
-        );
+        let to =
+            ViewState::with_center(big_from_f64(-0.7515, bits), big_from_f64(0.1013, bits), hh);
         let end = interpolate_view(&from, &to, 1.0);
         assert_eq!(end.half_height, hh);
         assert_eq!(re_im_f64(&end), re_im_f64(&to));

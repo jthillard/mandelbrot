@@ -106,7 +106,7 @@ fn advance(z: vec2<f32>, zp: vec2<f32>, c: vec2<f32>) -> vec2<f32> {
     } else if KIND == KIND_TRICORN {
         return vec2<f32>(z.x * z.x - z.y * z.y, -2.0 * z.x * z.y) + c;
     } else if KIND == KIND_MULTIBROT {
-        return complex_pow(z, clamp(u.power, 2u, 8u)) + c;
+        return complex_pow(z, clamp(u.power, 2u, MULTIBROT_MAX_POWER)) + c;
     } else if KIND == KIND_CELTIC {
         return vec2<f32>(abs(z.x * z.x - z.y * z.y), 2.0 * z.x * z.y) + c;
     } else if KIND == KIND_PERPENDICULAR {

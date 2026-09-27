@@ -564,13 +564,17 @@ mod tests {
     fn f64_fast_path_matches_big() {
         let bits_fast = F64_MAX_PRECISION;
         let bits_big = F64_MAX_PRECISION + 64;
-        for kind in FractalKind::ALL {
+        let cases = FractalKind::ALL
+            .into_iter()
+            .map(|kind| (kind, 3))
+            .chain([(FractalKind::Multibrot, 20)]); // highest supported power
+        for (kind, power) in cases {
             for julia in [false, true] {
                 for morph in [None, Some((FractalKind::Phoenix, 0.3))] {
                     let run = |bits: usize| {
                         let (a, b) = (big_from_f64(-0.3, bits), big_from_f64(0.2, bits));
                         let (jr, ji) = (big_from_f64(-0.4, bits), big_from_f64(0.55, bits));
-                        let args = (60, bits, kind, 3, (0.1, -0.2), (0.9, 0.3), (2.3, 0.4));
+                        let args = (60, bits, kind, power, (0.1, -0.2), (0.9, 0.3), (2.3, 0.4));
                         if julia {
                             compute_reference(
                                 &a, &b, &jr, &ji, args.0, args.1, args.2, args.3, args.4, args.5,
@@ -583,7 +587,7 @@ mod tests {
                             )
                         }
                     };
-                    let ctx = format!("{kind:?} julia={julia} morph={morph:?}");
+                    let ctx = format!("{kind:?} power={power} julia={julia} morph={morph:?}");
                     let (fast, big) = (run(bits_fast), run(bits_big));
                     assert_eq!(fast.len(), big.len(), "{ctx}: length");
                     for (i, (f, b)) in fast.iter().zip(&big).enumerate() {

@@ -187,7 +187,7 @@ fn advance_delta_kind(kind: u32, z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
         let ce = conj(e);
         return 2.0 * cmul(cz, ce) + cmul(ce, ce);
     } else if kind == KIND_MULTIBROT {
-        return multibrot_delta(z, e, clamp(u.power, 2u, 8u));
+        return multibrot_delta(z, e, clamp(u.power, 2u, MULTIBROT_MAX_POWER));
     } else if kind == KIND_CELTIC {
         // z^2 delta split: sq.x = delta of Re(z^2), sq.y = delta of Im(z^2).
         // Celtic abs the real output, so |Re(z^2)| delta = diffabs(Re(Z^2), sq.x).
@@ -222,7 +222,7 @@ fn advance_delta_kind(kind: u32, z: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
 // enough to de-speckle filaments.
 fn fprime_kind(kind: u32, z: vec2<f32>) -> vec2<f32> {
     if kind == KIND_MULTIBROT {
-        let p = clamp(u.power, 2u, 8u);
+        let p = clamp(u.power, 2u, MULTIBROT_MAX_POWER);
         var zk = z; // Z^1
         for (var k: u32 = 2u; k < p; k = k + 1u) {
             zk = cmul(zk, z); // -> Z^{p-1}
@@ -382,7 +382,7 @@ fn advance_delta_scaled_kind(kind: u32, x: vec2<f32>, w: vec2<f32>, sc: f32, se:
         let cw = conj(w);
         return 2.0 * cmul(cx, cw) + sc * cmul(cw, cw);
     } else if kind == KIND_MULTIBROT {
-        return cmul(w, multibrot_sum(x, x + sc * w, clamp(u.power, 2u, 8u)));
+        return cmul(w, multibrot_sum(x, x + sc * w, clamp(u.power, 2u, MULTIBROT_MAX_POWER)));
     } else if kind == KIND_CELTIC {
         let sq = 2.0 * cmul(x, w) + sc * cmul(w, w);
         return vec2<f32>(diffabs_scaled(x.x * x.x - x.y * x.y, sq.x, se), sq.y);
@@ -434,7 +434,7 @@ fn deep_step_kind(kind: u32, x: vec2<f32>, xf: Fe, w: vec2<f32>, sc: f32, s: i32
     }
     var deg = 2;
     if kind == KIND_MULTIBROT {
-        deg = i32(clamp(u.power, 2u, 8u));
+        deg = i32(clamp(u.power, 2u, MULTIBROT_MAX_POWER));
     }
     let xk = ldexp2_sat(xf.m, xf.e - ue);
     let se = s - ue;
@@ -545,7 +545,7 @@ fn deep_fprime(xf: Fe, w: vec2<f32>, s: i32, yt: vec2<f32>) -> Fe {
         return Fe(fprime(vec2<f32>(0.0, 0.0)), 0);
     }
     if KIND == KIND_MULTIBROT {
-        let p = clamp(u.power, 2u, 8u);
+        let p = clamp(u.power, 2u, MULTIBROT_MAX_POWER);
         var ym = yf.m; // m^(p-1)
         for (var k: u32 = 2u; k < p; k = k + 1u) {
             ym = cmul(ym, yf.m);

@@ -25,7 +25,7 @@ pub struct Cli {
     #[arg(long)]
     pub rendering_kind: Option<RenderingKindArg>,
 
-    /// Exponent for the Multibrot kind (z -> z^power + c), clamped to [2, 8].
+    /// Exponent for the Multibrot kind (z -> z^power + c), clamped to [2, 20].
     #[arg(long)]
     pub power: Option<u32>,
 
