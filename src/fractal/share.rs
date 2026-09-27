@@ -2,13 +2,14 @@
 //! iterations, Julia constant, coloring) as a compact URL fragment so deep-zoom
 //! locations can be shared or bookmarked.
 //!
-//! Format: `m=m&f=<str>&re=<dec>&im=<dec>&hh=<f64>&it=<u32>&cs=<f32>&co=<f32>` with
+//! Format: `m=m&f=<str>&re=<dec>&im=<dec>&hh=<sci>&it=<u32>&cs=<f32>&co=<f32>` with
 //! `m=j&jr=<f64>&ji=<f64>` added for Julia. `re`/`im` are full-precision decimal
-//! strings.
+//! strings; `hh` is a `Scale` in scientific notation (any exponent).
 
 use std::collections::HashMap;
 
 use crate::fractal::FractalKind;
+use crate::view::Scale;
 
 #[derive(Clone, Debug)]
 pub struct ShareState {
@@ -18,7 +19,7 @@ pub struct ShareState {
     pub power: u32,
     pub center_re: String,
     pub center_im: String,
-    pub half_height: f64,
+    pub half_height: Scale,
     pub iterations: u32,
     pub julia_c: (f64, f64),
     /// Distortion constant for the Phoenix kind (ignored by others).
@@ -115,7 +116,7 @@ mod tests {
             power: 5,
             center_re: "-0.743643887037158704752191506114774".into(),
             center_im: "0.131825904205311970493132056385139".into(),
-            half_height: 1.5e-20,
+            half_height: Scale::from_f64(1.5e-20),
             iterations: 4000,
             julia_c: (-0.123, 0.745),
             phoenix_p: (-0.5, 0.1),
@@ -146,5 +147,15 @@ mod tests {
         let d = ShareState::decode("#m=m&re=0.0&im=0.0&hh=1.25&it=256").unwrap();
         assert!(!d.julia);
         assert_eq!(d.iterations, 256);
+        assert_eq!(d.half_height, Scale::from_f64(1.25));
+    }
+
+    /// Zooms past f64's range survive a round trip.
+    #[test]
+    fn round_trip_past_f64_range() {
+        let d = ShareState::decode("#m=m&re=0.0&im=0.0&hh=1.5e-1234&it=256").unwrap();
+        assert_eq!(d.half_height, "1.5e-1234".parse().unwrap());
+        let d2 = ShareState::decode(&d.encode()).unwrap();
+        assert_eq!(d2.half_height, d.half_height);
     }
 }

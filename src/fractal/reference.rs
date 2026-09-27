@@ -380,7 +380,7 @@ fn step(
         FractalKind::Perpendicular => {
             // (x^2 - y^2) - 2·x·|y| i: abs the imaginary input.
             let re = &zr.sqr() - &zi.sqr() + cr;
-            let im = if zi.to_f64().value() < 0.0 {
+            let im = if *zi < Big::ZERO {
                 ci + ((zr * zi) << 1)
             } else {
                 ci - ((zr * zi) << 1)
@@ -422,10 +422,10 @@ fn big_zero(precision: usize) -> Big {
     Big::from(0i32).with_precision(precision).value()
 }
 
-/// Absolute value of a `Big`. The sign check via f64 is exact except for values
-/// so tiny that |x| ≈ x either way — negligible against the f32 orbit storage.
+/// Absolute value of a `Big`. The sign comes from the `Big` itself: through
+/// f64, anything below ~1e-308 reads as ±0 and would keep its sign.
 fn big_abs(x: Big) -> Big {
-    if x.to_f64().value() < 0.0 { -x } else { x }
+    if x < Big::ZERO { -x } else { x }
 }
 
 /// `(zr + i zi)^power` by repeated complex multiply at `precision` bits.
@@ -442,10 +442,10 @@ fn complex_pow(zr: &Big, zi: &Big, power: u32, precision: usize) -> (Big, Big) {
     (rr, ri)
 }
 
-/// `true` if `x` is (numerically) zero. The f64 check is exact for a true
-/// zero; only matters here to special-case `ln(0)`.
+/// `true` if `x` is exactly zero (special-cases `ln(0)`). Not via f64,
+/// which flushes values below ~1e-308 to zero.
 fn is_big_zero(x: &Big) -> bool {
-    x.to_f64().value() == 0.0
+    x.repr().significand().is_zero()
 }
 
 /// `(zr + i zi)^(pr + i pi)` for a complex exponent, via the principal branch
@@ -503,6 +503,17 @@ pub fn compute_set_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sign and zero tests must hold far below f64's range, where
+    /// `to_f64` reads as ±0.
+    #[test]
+    fn sign_and_zero_below_f64_range() {
+        let tiny = Big::try_from(1.0_f64).unwrap().with_precision(64).value() >> 5000;
+        assert!(!is_big_zero(&tiny));
+        assert!(is_big_zero(&big_zero(64)));
+        assert_eq!(big_abs(-tiny.clone()), tiny);
+        assert_eq!(big_abs(tiny.clone()), tiny);
+    }
 
     /// The high-precision reference must agree with a plain f64 iteration for a
     /// shallow point (where f64 is accurate).

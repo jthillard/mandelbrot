@@ -19,7 +19,7 @@ use crate::lights::{Light, gpu_lights};
 use crate::view::parse_half_height_spec;
 use crate::view::parse_re_im_spec;
 use crate::view::{
-    Big, DEFAULT_HALF_HEIGHT, MIN_HALF_HEIGHT, ViewState, big_from_decimal_str, big_from_f64,
+    Big, DEFAULT_HALF_HEIGHT, MAX_PRECISION_BITS, Scale, ViewState, big_from_decimal_str, big_from_f64,
     big_to_decimal_str, deep_scale_exp, interpolate_view, needs_deep, parse_view_spec,
     precision_for,
 };
@@ -206,7 +206,7 @@ impl RefJob {
 struct RequestKey {
     center_re: Big,
     center_im: Big,
-    half_height: f64,
+    half_height: Scale,
     julia: bool,
     julia_c: (f64, f64),
     phoenix_p: (f64, f64),
@@ -556,7 +556,7 @@ pub struct FractalApp {
     /// slightly from the live view; the shader compensates via `dc_offset`).
     ref_center_re: Big,
     ref_center_im: Big,
-    ref_half_height: f64,
+    ref_half_height: Scale,
     /// Kind and kind-switch morph the current `reference` was computed with.
     /// The shader iterates with these (not the live kind/morph) so its delta
     /// formula always matches the orbit, even while the worker lags a frame
@@ -614,8 +614,8 @@ fn sig_digits_for(bits: usize) -> usize {
 }
 
 /// Format a magnification for the editable field (compact scientific).
-fn format_zoom(m: f64) -> String {
-    format!("{m:.4e}")
+fn format_zoom(m: Scale) -> String {
+    format!("{m:.4}")
 }
 
 /// Precision (bits) to parse a typed center at: at least what the current zoom
@@ -624,7 +624,7 @@ fn format_zoom(m: f64) -> String {
 fn parse_bits_for(s: &str, min_bits: usize) -> usize {
     let digits = s.chars().filter(char::is_ascii_digit).count();
     let from_input = (digits as f64 * std::f64::consts::LOG2_10).ceil() as usize + 16;
-    min_bits.max(from_input).min(2048)
+    min_bits.max(from_input).min(MAX_PRECISION_BITS)
 }
 
 impl FractalApp {
@@ -746,7 +746,7 @@ impl FractalApp {
         if let Some(k) = cli.kind {
             self.kind = k.into();
             if let Some(p) = cli.power {
-                self.power = p.clamp(2, 8);
+                self.power = p.clamp(2, 20);
             }
             self.view = Self::default_view_for(self.mode, self.kind);
         }
@@ -979,6 +979,7 @@ impl FractalApp {
     /// Jump to a preset Mandelbrot location: decimal center (parsed at the
     /// precision the zoom needs), half-height, and a fitting iteration count.
     fn go_to_place(&mut self, re: &str, im: &str, half_height: f64, iterations: u32) {
+        let half_height = Scale::from_f64(half_height);
         let bits = precision_for(half_height);
         if let (Some(cre), Some(cim)) = (
             big_from_decimal_str(re, bits),
@@ -997,7 +998,7 @@ impl FractalApp {
     /// `auto_iterations` is on. Grows roughly linearly with zoom decades so deep
     /// zooms keep enough iterations to stay sharp instead of banding.
     fn auto_iteration_count(&self) -> u32 {
-        let decades = self.view.magnification().log10().max(0.0);
+        let decades = self.view.magnification_log10().max(0.0);
         let iters = 400.0 + 900.0 * decades;
         (iters.round() as u32).clamp(200, MAX_REF_POINTS as u32 - 1)
     }
@@ -1033,7 +1034,7 @@ impl FractalApp {
             FractalMode::Mandelbrot
         };
         self.kind = s.kind;
-        self.power = s.power.clamp(2, 8);
+        self.power = s.power.clamp(2, 200);
         self.julia_c = s.julia_c;
         self.phoenix_p = s.phoenix_p;
         self.lambda_l = s.lambda_l;
@@ -1077,10 +1078,10 @@ impl FractalApp {
     /// each kind's interesting region.
     fn default_view_for(mode: FractalMode, kind: FractalKind) -> ViewState {
         if mode == FractalMode::Julia {
-            return ViewState::with_center(big_from_f64(0.0, 53), big_from_f64(0.0, 53), 1.5);
+            return ViewState::with_center(big_from_f64(0.0, 53), big_from_f64(0.0, 53), Scale::from_f64(1.5));
         }
         let (cr, ci, hh) = kind.default_set_view();
-        ViewState::with_center(big_from_f64(cr, 53), big_from_f64(ci, 53), hh)
+        ViewState::with_center(big_from_f64(cr, 53), big_from_f64(ci, 53), Scale::from_f64(hh))
     }
 
     /// The request key for the current state. Its `iter` is the reference
@@ -1104,10 +1105,14 @@ impl FractalApp {
     }
 
     /// Distance (complex units) the live view center has drifted from `key`.
+    /// Distance of the live center from `key`'s, in units of the live
+    /// half-height (measured at that scale, so it works past f64's range).
     fn drift_from(&self, key: &RequestKey) -> f64 {
-        let dre = (&self.view.center_re - &key.center_re).to_f64().value();
-        let dim = (&self.view.center_im - &key.center_im).to_f64().value();
-        (dre * dre + dim * dim).sqrt()
+        let hh = self.view.half_height;
+        let k = -hh.exponent() as isize;
+        let dre = ((&self.view.center_re - &key.center_re) << k).to_f64().value();
+        let dim = ((&self.view.center_im - &key.center_im) << k).to_f64().value();
+        (dre * dre + dim * dim).sqrt() / hh.scaled_f64(-hh.exponent())
     }
 
     /// Whether the reference should be (re)computed: parameters changed, or the
@@ -1143,19 +1148,22 @@ impl FractalApp {
             && self.morph.is_none()
         {
             // But still recompute on significant zoom changes for precision
-            let ratio = self.view.half_height / key.half_height;
+            let ratio = self.view.half_height.ratio(key.half_height);
             return !(0.5..=2.0).contains(&ratio);
         }
-        let ratio = self.view.half_height / key.half_height;
-        self.drift_from(key) > 0.5 * self.view.half_height || !(0.5..=2.0).contains(&ratio)
+        let ratio = self.view.half_height.ratio(key.half_height);
+        self.drift_from(key) > 0.5 || !(0.5..=2.0).contains(&ratio)
     }
 
-    /// Complex offset of the live view center from the reference center.
-    fn dc_offset(&self) -> (f64, f64) {
-        let dre = (&self.view.center_re - &self.ref_center_re)
+    /// Complex offset of the live view center from the reference center, in
+    /// units of `2^scale_exp` (shifted exactly in `Big`, so it doesn't
+    /// underflow f64 at deep zooms).
+    fn dc_offset(&self, scale_exp: i32) -> (f64, f64) {
+        let k = -scale_exp as isize;
+        let dre = ((&self.view.center_re - &self.ref_center_re) << k)
             .to_f64()
             .value();
-        let dim = (&self.view.center_im - &self.ref_center_im)
+        let dim = ((&self.view.center_im - &self.ref_center_im) << k)
             .to_f64()
             .value();
         (dre, dim)
@@ -1178,7 +1186,7 @@ impl FractalApp {
         points: RefOrbit,
         cre: Big,
         cim: Big,
-        hh: f64,
+        hh: Scale,
         kind: FractalKind,
         morph: Option<(FractalKind, f32)>,
     ) {
@@ -1404,10 +1412,12 @@ impl FractalApp {
         let mode = self.effective_rendering_mode();
         // Deep views upload the geometry pre-multiplied by 2^-E (exact).
         let scale_exp = self.scale_exp(height_px);
-        let inv_scale = 2f64.powi(-scale_exp);
-        let (dc_re, dc_im) = self.dc_offset();
+        let (dc_re, dc_im) = self.dc_offset(scale_exp);
         Uniforms {
-            span: [(span_x * inv_scale) as f32, (span_y * inv_scale) as f32],
+            span: [
+                span_x.scaled_f64(-scale_exp) as f32,
+                span_y.scaled_f64(-scale_exp) as f32,
+            ],
             max_iter: self.max_iterations.min(MAX_REF_POINTS as u32 - 1),
             ref_len: self.reference.len() as u32,
             color_offset: self.color_offset,
@@ -1420,7 +1430,7 @@ impl FractalApp {
             kind: self.ref_kind.unwrap_or(self.kind) as u32,
             power: self.power,
             morph_from: self.ref_morph.map_or(0, |(k, _)| k as u32),
-            dc_offset: [(dc_re * inv_scale) as f32, (dc_im * inv_scale) as f32],
+            dc_offset: [dc_re as f32, dc_im as f32],
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
             complex_power: [self.complex_power.0 as f32, self.complex_power.1 as f32],
@@ -1450,7 +1460,7 @@ impl FractalApp {
         ];
         BuddhabrotUniforms {
             center,
-            half_height: self.view.half_height as f32,
+            half_height: self.view.half_height.to_f64() as f32,
             aspect: aspect as f32,
             phoenix_p: [self.phoenix_p.0 as f32, self.phoenix_p.1 as f32],
             lambda_l: [self.lambda_l.0 as f32, self.lambda_l.1 as f32],
@@ -2016,11 +2026,10 @@ impl FractalApp {
             }
         }
         if self.anim.zoom && self.anim.zoom_speed != 0.0 {
-            let min_hh = DEFAULT_HALF_HEIGHT * 1.0e-26; // practical f32-perturbation depth
-            let max_hh = DEFAULT_HALF_HEIGHT * 4.0;
+            let max_hh = Scale::from_f64(DEFAULT_HALF_HEIGHT * 4.0);
             let factor = (-(self.anim.zoom_speed as f64) * dt).exp();
-            let target = (self.view.half_height * factor).clamp(min_hh, max_hh);
-            let f = target / self.view.half_height;
+            let target = self.view.half_height.mul_f64(factor).clamp(Scale::MIN, max_hh);
+            let f = target.ratio(self.view.half_height);
             if (f - 1.0).abs() > 1.0e-9 {
                 self.view
                     .zoom_at_pixel(0.0, 0.0, self.last_size_px.y.max(1.0) as f64, f);
@@ -2453,11 +2462,9 @@ impl FractalApp {
         }
         if zoom_resp.lost_focus() {
             if self.zoom_edited
-                && let Ok(hh) = self.zoom_edit.trim().parse::<f64>()
-                && hh > 0.0
-                && hh.is_finite()
+                && let Ok(hh) = self.zoom_edit.parse::<Scale>()
             {
-                self.view.half_height = hh.max(MIN_HALF_HEIGHT);
+                self.view.half_height = hh;
                 self.view.sync_precision();
             }
             self.zoom_edited = false;
@@ -2560,7 +2567,7 @@ impl FractalApp {
             });
         ui.checkbox(&mut self.buddha_accumulate, "Keep sampling")
             .on_hover_text("Dispatch a fresh batch of random samples every frame.");
-        if self.view.magnification() > 1.0e5 {
+        if self.view.magnification_log10() > 5.0 {
             ui.colored_label(
                 egui::Color32::LIGHT_YELLOW,
                 "deep zoom isn't supported here (f32 precision only)",

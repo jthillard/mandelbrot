@@ -10,12 +10,12 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 
 use crate::fractal::{FractalKind, RefOrbit, compute_reference, compute_set_reference};
-use crate::view::{Big, big_from_f64};
+use crate::view::{Big, Scale, big_from_f64};
 
 pub struct RefRequest {
     pub center_re: Big,
     pub center_im: Big,
-    pub half_height: f64,
+    pub half_height: Scale,
     pub julia: bool,
     pub julia_c: (f64, f64),
     pub max_iter: u32,
@@ -35,7 +35,7 @@ pub struct RefRequest {
 pub struct RefResult {
     pub center_re: Big,
     pub center_im: Big,
-    pub half_height: f64,
+    pub half_height: Scale,
     pub points: RefOrbit,
     /// The kind and morph `points` was computed with (echoed from the
     /// request).

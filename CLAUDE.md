@@ -11,8 +11,9 @@ and every pixel is rendered on the GPU as a cheap `f32` delta from it, with
 rebasing to avoid glitches. Plain `f32` deltas run out of exponent range
 once a pixel is ~2^-124 wide (~10³⁴× at 1080p), so from 2^-122 per pixel
 (`view::DEEP_PIXEL_SIZE`) a `DEEP` shader variant starts each pixel with
-rescaled deltas (f32 mantissa × 2^i32), reaching ~10³⁰⁰× (the `f64` limit of
-`half_height`, `view::MIN_HALF_HEIGHT`). Runs
+rescaled deltas (f32 mantissa × 2^i32). There's no practical depth limit:
+`half_height` is a `view::Scale` (f64 mantissa × 2^i32), floored only at
+`Scale::MIN` = 2^-(2^20) to keep shader exponent sums in i32. Runs
 natively (Vulkan/Metal/DX12) and in the browser (WebGPU only — WebGL2 can't do
 storage buffers, which the fragment shader needs for the reference orbit).
 
@@ -94,8 +95,13 @@ what makes deep zoom cheap — one expensive high-precision orbit, then every
 pixel is a handful of `f32` complex multiplies.
 
 - `src/view.rs` — `ViewState`; center is arbitrary-precision `FBig` (`Big`
-  type alias), pixel scale stays `f64` (so zoom is clamped at
-  `MIN_HALF_HEIGHT` = 1e-300). Precision (bits) scales with zoom depth
+  type alias). The pixel scale (`half_height`) is a `Scale`, an f64
+  mantissa with its own i32 exponent, so it goes past f64's ~1e-308. Never
+  collapse it (or a center difference) to a plain `f64` on a path used at
+  depth. Rescale first: `Scale::scaled_f64(k)`, or shift the `Big` by
+  `-scale_exp` before `to_f64()`, as `dc_offset`/`drift_from` do.
+  `Display`/`FromStr` use scientific notation of any exponent (share links,
+  `--view`, the zoom field). Precision (bits) scales with zoom depth
   (`precision_for`). `needs_deep` switches rendering to the deep pipeline
   once a pixel of the full-resolution render is below `DEEP_PIXEL_SIZE`
   (2^-122; the f32 path is exact down to 2^-124 with AA's quarter-pixel
