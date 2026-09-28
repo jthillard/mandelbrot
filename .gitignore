@@ -3,4 +3,4 @@ Cargo.lock
 dist
 frames*
 out.mp4
-
+__pycache__
