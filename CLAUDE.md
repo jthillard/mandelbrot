@@ -71,7 +71,10 @@ collects the targets; the export pipeline is rebuilt only when the
 does the camera: half-height geometrically (log-linear, since zoom spans many
 decades), center linearly through the complex plane at full `Big` precision;
 constants interpolate linearly. `--linear` swaps the default smoothstep
-easing for constant pacing. Without `--to-iterations` (or a share link's),
+easing for constant pacing. `--shards N --shard K` (1-based) renders only
+the K-th of N contiguous parts (`shard_range`), still timed against the whole
+animation (global `t`, global `frame-NNNNN.png` numbers; stdout streams just
+that part), so separately rendered clips join seamlessly. Without `--to-iterations` (or a share link's),
 iteration count auto-scales with zoom depth per frame (same
 `auto_iteration_count` the interactive app uses while zooming).
 `--to-yaw`/`--to-pitch` (degrees, from `--yaw`/`--pitch`, yaw unwrapped so

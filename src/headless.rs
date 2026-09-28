@@ -57,6 +57,10 @@ pub fn run(cli: Cli) -> Result<(), String> {
         check_stdout_piped()?;
     }
 
+    if targets.shard.is_some() && !targets.any() {
+        return Err("--shard/--shards only apply to animations (give a --to-* target)".into());
+    }
+
     let mut app = FractalApp::default_state();
     app.apply_cli(cli);
     app.set_output_size(width, height);
@@ -126,6 +130,8 @@ struct AnimTargets {
     fps: f64,
     duration: Option<f64>,
     linear: bool,
+    /// `--shard K --shards N`: render only the K-th (1-based) of N parts.
+    shard: Option<(u32, u32)>,
 }
 
 impl AnimTargets {
@@ -136,6 +142,16 @@ impl AnimTargets {
                 .transpose()
         };
         let to_cpow = pair("to-complex-power", &cli.to_complex_power)?;
+        let shard = match (cli.shard, cli.shards) {
+            (None, None) | (None, Some(1)) => None,
+            (Some(k), Some(n)) if (1..=n).contains(&k) => Some((k, n)),
+            (Some(k), Some(n)) => {
+                return Err(format!(
+                    "--shard {k} is out of range 1..={n} (--shards {n})"
+                ));
+            }
+            _ => return Err("--shard and --shards must be given together".into()),
+        };
         Ok(Self {
             to_view: cli.to_view.clone(),
             to_share: cli.to_share.clone(),
@@ -152,6 +168,7 @@ impl AnimTargets {
             fps: cli.fps,
             duration: cli.duration,
             linear: cli.linear,
+            shard,
         })
     }
 
@@ -198,6 +215,16 @@ fn run_animation(
     if frames < 2 {
         return Err("animation needs at least 2 frames".into());
     }
+    // Frames are still timed against the whole animation (`apply_frame` takes
+    // the global index); a shard only picks which of them this run renders.
+    let range = match targets.shard {
+        Some((_, n)) if n > frames => {
+            return Err(format!("--shards {n} is more than the {frames} frames"));
+        }
+        Some((k, n)) => shard_range(frames, k, n),
+        None => 0..frames,
+    };
+    let (first, count) = (range.start, range.len());
 
     let from = app.view_state().clone();
     let (to, to_iterations_share) =
@@ -270,7 +297,10 @@ fn run_animation(
 
     // Snapshot every frame's reference-orbit job up front (cheap: just the
     // parameters), so the orbits themselves can be computed in parallel.
-    let jobs: Vec<RefJob> = (0..frames)
+    // `jobs[j]` is global frame `first + j`; the pipeline below works in
+    // local indices `j`, so the stdout writer's ordering is per shard.
+    let jobs: Vec<RefJob> = range
+        .clone()
         .map(|i| {
             apply_frame(&mut app, i);
             app.reference_job()
@@ -305,7 +335,14 @@ fn run_animation(
         error.lock().unwrap().get_or_insert(e);
     };
 
-    eprintln!("rendering {frames} frames ({width}×{height}) on {threads} threads…");
+    if let Some((k, n)) = targets.shard {
+        eprintln!(
+            "shard {k}/{n}: frames {}–{} of {frames}",
+            range.start + 1,
+            range.end
+        );
+    }
+    eprintln!("rendering {count} frames ({width}×{height}) on {threads} threads…");
     let (png_tx, png_rx) = mpsc::sync_channel::<(usize, Vec<u8>, u32, bool)>(threads * 2);
     let png_rx = Mutex::new(png_rx);
     let (raw_tx, raw_rx) = mpsc::sync_channel::<(usize, Vec<u8>)>(threads * 2);
@@ -349,7 +386,7 @@ fn run_animation(
                         }
                         next += 1;
                         saved.store(next, Ordering::Relaxed);
-                        eprint!("\r[{next:>4}/{frames}] streamed");
+                        eprint!("\r[{next:>4}/{count}] streamed");
                     }
                 }
                 if let Err(e) = out.flush() {
@@ -383,13 +420,13 @@ fn run_animation(
                     }
                     let png =
                         encode_png(&padded, width, height, bpr, swap_rb, png::Compression::Fast);
-                    let path = format!("{out_dir}/frame-{:05}.png", i + 1);
+                    let path = format!("{out_dir}/frame-{:05}.png", first as usize + i + 1);
                     if let Err(e) = std::fs::write(&path, &png) {
                         fail(format!("save failed: {e}"));
                         continue;
                     }
                     let done = saved.fetch_add(1, Ordering::Relaxed) + 1;
-                    eprint!("\r[{done:>4}/{frames}] saved");
+                    eprint!("\r[{done:>4}/{count}] saved");
                 }
             });
         }
@@ -402,7 +439,7 @@ fn run_animation(
             if failed.load(Ordering::Relaxed) {
                 break;
             }
-            apply_frame(&mut app, i as u32);
+            apply_frame(&mut app, first + i as u32);
             app.finish_reference(jobs[i].clone(), points);
 
             let uniforms = app.make_uniforms(aspect, height as f64);
@@ -435,18 +472,27 @@ fn run_animation(
         return Err(e);
     }
     let saved = saved.into_inner();
-    if saved != frames as usize {
-        return Err(format!("only {saved} of {frames} frames were rendered"));
+    if saved != count {
+        return Err(format!("only {saved} of {count} frames were rendered"));
     }
 
     if stream {
-        eprintln!("streamed {frames} frames ({width}×{height})");
+        eprintln!("streamed {count} frames ({width}×{height})");
         return Ok(());
     }
-    println!("saved {frames} frames to {out_dir}/ ({width}×{height})");
-    println!(
-        "tip: ffmpeg -framerate {fps} -i {out_dir}/frame-%05d.png -c:v libx264 -pix_fmt yuv420p out.mp4"
-    );
+    println!("saved {count} frames to {out_dir}/ ({width}×{height})");
+    if targets.shard.is_some() {
+        println!(
+            "tip: once every shard is rendered into {out_dir}/, they form the full sequence; \
+             this shard alone: ffmpeg -framerate {fps} -start_number {} -i {out_dir}/frame-%05d.png \
+             -frames:v {count} -c:v libx264 -pix_fmt yuv420p out.mp4",
+            range.start + 1
+        );
+    } else {
+        println!(
+            "tip: ffmpeg -framerate {fps} -i {out_dir}/frame-%05d.png -c:v libx264 -pix_fmt yuv420p out.mp4"
+        );
+    }
     Ok(())
 }
 
@@ -480,6 +526,14 @@ fn parse_animation_target(
     )))
 }
 
+/// Global frame indices of shard `shard` (1-based) out of `shards` equal
+/// parts of a `frames`-frame animation. Consecutive shards tile `0..frames`
+/// with no gap or overlap.
+fn shard_range(frames: u32, shard: u32, shards: u32) -> std::ops::Range<u32> {
+    let bound = |k: u32| (k as u64 * frames as u64 / shards as u64) as u32;
+    bound(shard - 1)..bound(shard)
+}
+
 /// Ease-in/ease-out pacing: slow at both ends, fast through the middle.
 fn smoothstep(t: f64) -> f64 {
     t * t * (3.0 - 2.0 * t)
@@ -503,4 +557,31 @@ async fn request_device() -> Result<(wgpu::Device, wgpu::Queue), String> {
         })
         .await
         .map_err(|e| format!("failed to create device: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shard_range;
+
+    #[test]
+    fn shards_tile_all_frames() {
+        for frames in [2, 3, 10, 97, 1000, u32::MAX] {
+            for shards in [1, 2, 3, 7, 10] {
+                if shards > frames {
+                    continue;
+                }
+                let mut next = 0;
+                for k in 1..=shards {
+                    let r = shard_range(frames, k, shards);
+                    assert_eq!(
+                        r.start, next,
+                        "gap/overlap at shard {k}/{shards} of {frames}"
+                    );
+                    assert!(!r.is_empty(), "empty shard {k}/{shards} of {frames}");
+                    next = r.end;
+                }
+                assert_eq!(next, frames);
+            }
+        }
+    }
 }

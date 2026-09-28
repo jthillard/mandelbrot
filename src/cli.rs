@@ -167,6 +167,17 @@ pub struct Cli {
     #[arg(long)]
     pub linear: bool,
 
+    /// Split the animation into N equal parts (use with --shard) to render
+    /// it across several runs. Each part keeps the whole animation's timing
+    /// and easing, so the clips join seamlessly.
+    #[arg(long, value_name = "N")]
+    pub shards: Option<u32>,
+
+    /// Which part of --shards to render, 1-based. PNG frames keep their
+    /// global numbering, so all shards can share one --export-path directory.
+    #[arg(long, value_name = "K")]
+    pub shard: Option<u32>,
+
     /// Run without opening a window: render the current view to a PNG and
     /// exit. Combine with --kind/--julia/--share/--view etc. to pick what to
     /// render, or any --to-* flag (--to-view, --to-julia, --to-kind, ...) to
