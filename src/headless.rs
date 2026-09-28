@@ -3,9 +3,12 @@
 // event loop, no worker-thread debounce (nothing to debounce for a one-shot
 // render); it just creates its own wgpu device, computes the reference orbit
 // once, and renders through the same `ExportRender` path the "Export PNG"
-// button uses.
+// button uses. `--export-path -` writes to stdout instead: the PNG for a
+// single image, or a raw RGBA8 video stream for an animation (for piping
+// into ffmpeg).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 
@@ -13,7 +16,7 @@ use crate::app::{FractalApp, RefJob, parse_complex_pair, unix_timestamp};
 use crate::cli::Cli;
 use crate::fractal::{
     ExportRender, FractalKind, FractalRenderer, PipelineKey, ShareState, encode_png,
-    export_to_png_blocking, render_readback_blocking,
+    export_to_png_blocking, render_readback_blocking, unpad_rgba,
 };
 use crate::view::{
     ViewState, big_from_decimal_str, interpolate_f64, interpolate_view, parse_view_spec,
@@ -22,6 +25,21 @@ use crate::view::{
 
 /// Cap on the output image dimension (px), to stay within GPU texture limits.
 const MAX_DIM: u32 = 8192 * 16;
+
+/// `--export-path` value meaning "write to stdout".
+const STDOUT_PATH: &str = "-";
+
+/// Refuse to dump binary image data onto a terminal.
+fn check_stdout_piped() -> Result<(), String> {
+    if std::io::stdout().is_terminal() {
+        return Err(
+            "--export-path - writes binary data to stdout; pipe it somewhere \
+                    (e.g. `| ffmpeg ...`)"
+                .into(),
+        );
+    }
+    Ok(())
+}
 
 pub fn run(cli: Cli) -> Result<(), String> {
     if cli.buddhabrot {
@@ -35,6 +53,9 @@ pub fn run(cli: Cli) -> Result<(), String> {
     // consumes `cli` to build the start state.
     let targets = AnimTargets::from_cli(&cli)?;
     let export_path = cli.export_path.clone();
+    if export_path.as_deref() == Some(STDOUT_PATH) {
+        check_stdout_piped()?;
+    }
 
     let mut app = FractalApp::default_state();
     app.apply_cli(cli);
@@ -72,8 +93,16 @@ pub fn run(cli: Cli) -> Result<(), String> {
     });
     eprintln!();
 
-    std::fs::write(&export_path, &png).map_err(|e| format!("save failed: {e}"))?;
-    println!("saved {export_path} ({width}×{height})");
+    if export_path == STDOUT_PATH {
+        let mut out = std::io::stdout().lock();
+        out.write_all(&png)
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("writing to stdout failed: {e}"))?;
+        eprintln!("wrote PNG to stdout ({width}×{height})");
+    } else {
+        std::fs::write(&export_path, &png).map_err(|e| format!("save failed: {e}"))?;
+        println!("saved {export_path} ({width}×{height})");
+    }
     Ok(())
 }
 
@@ -146,7 +175,9 @@ impl AnimTargets {
 /// state to `targets`, for feeding into ffmpeg: the camera, iteration count,
 /// per-kind constants (c, p, λ, complex power) and, through a kind morph,
 /// the iteration formula, and the 3D camera angles. Everything else (colors, ...) stays fixed at
-/// whatever `apply_cli` set up for the start.
+/// whatever `apply_cli` set up for the start. With `--export-path -`, frames
+/// are streamed in order to stdout as raw RGBA8 (for ffmpeg's `rawvideo`
+/// demuxer) instead of being written as PNGs.
 fn run_animation(
     mut app: FractalApp,
     targets: AnimTargets,
@@ -197,8 +228,17 @@ fn run_animation(
     let yaw1 = targets.to_yaw.map_or(yaw0, f32::to_radians);
     let pitch1 = targets.to_pitch.map_or(pitch0, f32::to_radians);
 
+    let stream = export_path.as_deref() == Some(STDOUT_PATH);
     let out_dir = export_path.unwrap_or_else(|| format!("frames-{}", unix_timestamp()));
-    std::fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create {out_dir}: {e}"))?;
+    if stream {
+        eprintln!(
+            "streaming raw video to stdout; ffmpeg input: \
+             -f rawvideo -pix_fmt rgba -s {width}x{height} -r {fps} -i -"
+        );
+    } else {
+        std::fs::create_dir_all(&out_dir)
+            .map_err(|e| format!("failed to create {out_dir}: {e}"))?;
+    }
 
     // Everything about frame `i` is a pure function of its `t`, so the app can
     // be put into any frame's state at any time, in any order.
@@ -247,7 +287,15 @@ fn run_animation(
     // part at deep zoom) → this thread renders each frame on the GPU → `threads`
     // workers PNG-encode and write frames. Frames flow through out of order
     // (at most ~`threads` apart); each is written under its own index.
+    //
+    // When streaming, the last stage instead unpads frames to raw RGBA and a
+    // single writer thread puts them back in order before writing to stdout.
+    // Its reorder buffer can't apply backpressure (blocking it while waiting
+    // for frame `k` could stall the pipeline before `k` gets through), so the
+    // orbit workers bound it instead: they don't start a frame more than
+    // `window` ahead of the last one written.
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let window = threads * 4;
     let next_job = AtomicUsize::new(0);
     let saved = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
@@ -260,16 +308,23 @@ fn run_animation(
     eprintln!("rendering {frames} frames ({width}×{height}) on {threads} threads…");
     let (png_tx, png_rx) = mpsc::sync_channel::<(usize, Vec<u8>, u32, bool)>(threads * 2);
     let png_rx = Mutex::new(png_rx);
+    let (raw_tx, raw_rx) = mpsc::sync_channel::<(usize, Vec<u8>)>(threads * 2);
     std::thread::scope(|scope| {
         let (ref_tx, ref_rx) = mpsc::sync_channel::<(usize, crate::fractal::RefOrbit)>(threads * 2);
         for _ in 0..threads {
             let ref_tx = ref_tx.clone();
-            let (jobs, next_job, failed) = (&jobs, &next_job, &failed);
+            let (jobs, next_job, saved, failed) = (&jobs, &next_job, &saved, &failed);
             scope.spawn(move || {
                 loop {
                     let i = next_job.fetch_add(1, Ordering::Relaxed);
                     if i >= jobs.len() || failed.load(Ordering::Relaxed) {
                         break;
+                    }
+                    while stream
+                        && i >= saved.load(Ordering::Relaxed) + window
+                        && !failed.load(Ordering::Relaxed)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
                     }
                     if ref_tx.send((i, jobs[i].compute())).is_err() {
                         break;
@@ -279,7 +334,34 @@ fn run_animation(
         }
         drop(ref_tx);
 
+        if stream {
+            let (saved, fail) = (&saved, &fail);
+            scope.spawn(move || {
+                let mut out = std::io::stdout().lock();
+                let mut pending = BTreeMap::new();
+                let mut next = 0;
+                for (i, raw) in raw_rx.iter() {
+                    pending.insert(i, raw);
+                    while let Some(raw) = pending.remove(&next) {
+                        if let Err(e) = out.write_all(&raw) {
+                            fail(format!("writing to stdout failed: {e}"));
+                            return;
+                        }
+                        next += 1;
+                        saved.store(next, Ordering::Relaxed);
+                        eprint!("\r[{next:>4}/{frames}] streamed");
+                    }
+                }
+                if let Err(e) = out.flush() {
+                    fail(format!("writing to stdout failed: {e}"));
+                }
+            });
+        } else {
+            drop(raw_rx);
+        }
+
         for _ in 0..threads {
+            let raw_tx = raw_tx.clone();
             let (png_rx, out_dir, saved, failed, fail) =
                 (&png_rx, &out_dir, &saved, &failed, &fail);
             scope.spawn(move || {
@@ -288,15 +370,23 @@ fn run_animation(
                     let Ok((i, padded, bpr, swap_rb)) = png_rx.lock().unwrap().recv() else {
                         break;
                     };
+                    // After a failure, keep draining (without work) until the
+                    // GPU stage hangs up, so it can't block on a full channel.
                     if failed.load(Ordering::Relaxed) {
-                        break;
+                        continue;
+                    }
+                    if stream {
+                        let raw = unpad_rgba(&padded, width, height, bpr, swap_rb);
+                        // Only fails once the writer has failed and hung up.
+                        let _ = raw_tx.send((i, raw));
+                        continue;
                     }
                     let png =
                         encode_png(&padded, width, height, bpr, swap_rb, png::Compression::Fast);
                     let path = format!("{out_dir}/frame-{:05}.png", i + 1);
                     if let Err(e) = std::fs::write(&path, &png) {
                         fail(format!("save failed: {e}"));
-                        break;
+                        continue;
                     }
                     let done = saved.fetch_add(1, Ordering::Relaxed) + 1;
                     eprint!("\r[{done:>4}/{frames}] saved");
@@ -335,6 +425,7 @@ fn run_animation(
             }
         }
         // Dropping the channel ends lets the workers drain and exit.
+        drop(raw_tx);
         drop(png_tx);
         drop(ref_rx);
     });
@@ -348,6 +439,10 @@ fn run_animation(
         return Err(format!("only {saved} of {frames} frames were rendered"));
     }
 
+    if stream {
+        eprintln!("streamed {frames} frames ({width}×{height})");
+        return Ok(());
+    }
     println!("saved {frames} frames to {out_dir}/ ({width}×{height})");
     println!(
         "tip: ffmpeg -framerate {fps} -i {out_dir}/frame-%05d.png -c:v libx264 -pix_fmt yuv420p out.mp4"

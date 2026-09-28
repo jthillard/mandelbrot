@@ -59,7 +59,13 @@ position/zoom/iterations are pulled out of the link), `--to-iterations`,
 and `--to-kind` (per-step formula blend via `KindMorph`, camera untouched).
 Anything without a target stays at its start value; colors stay fixed.
 `--export-path` then names an output *directory* of `frame-00001.png`,
-`frame-00002.png`, ... instead of a single file. `headless.rs::AnimTargets`
+`frame-00002.png`, ... instead of a single file. `--export-path -` writes
+to stdout instead (refused on a terminal): the PNG for a still, or for an
+animation raw RGBA8 frames in order (`unpad_rgba`, no PNG encode) for
+`ffmpeg -f rawvideo -pix_fmt rgba -s WxH -r FPS -i -`. A single writer
+thread reorders the frames. Its buffer is bounded by the orbit workers not
+starting a frame more than `window` past the last one written, not by
+blocking the writer, which could deadlock. `headless.rs::AnimTargets`
 collects the targets; the export pipeline is rebuilt only when the
 `PipelineKey` changes between frames (kind morph). `view::interpolate_view`
 does the camera: half-height geometrically (log-linear, since zoom spans many

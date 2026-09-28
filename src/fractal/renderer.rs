@@ -1608,17 +1608,15 @@ pub fn render_readback_blocking(
     bytes
 }
 
-/// Like [`encode_png_with_progress`], but encodes the whole image at once
-/// (no progress) at the given compression level. Non-streaming, so the fast
-/// `fdeflate` levels don't pay the streaming-mode size penalty.
+/// Strip a readback's row padding and convert it to tightly-packed RGBA8
+/// (`width * height * 4` bytes, rows top to bottom).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn encode_png(
+pub fn unpad_rgba(
     padded: &[u8],
     width: u32,
     height: u32,
     padded_bpr: u32,
     swap_rb: bool,
-    compression: png::Compression,
 ) -> Vec<u8> {
     let row = (width * 4) as usize;
     let mut pixels = Vec::with_capacity(row * height as usize);
@@ -1636,6 +1634,22 @@ pub fn encode_png(
             pixels.extend_from_slice(src);
         }
     }
+    pixels
+}
+
+/// Like [`encode_png_with_progress`], but encodes the whole image at once
+/// (no progress) at the given compression level. Non-streaming, so the fast
+/// `fdeflate` levels don't pay the streaming-mode size penalty.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn encode_png(
+    padded: &[u8],
+    width: u32,
+    height: u32,
+    padded_bpr: u32,
+    swap_rb: bool,
+    compression: png::Compression,
+) -> Vec<u8> {
+    let pixels = unpad_rgba(padded, width, height, padded_bpr, swap_rb);
 
     let mut out = Vec::new();
     {

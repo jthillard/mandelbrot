@@ -81,7 +81,9 @@ pub struct Cli {
     /// Output path for --headless (default: fractal-<timestamp>.png). When
     /// animating (--to-view/--to-share), this is a directory of
     /// frame-00001.png, frame-00002.png, ... instead (default:
-    /// frames-<timestamp>/).
+    /// frames-<timestamp>/). "-" writes to stdout: the PNG for a single
+    /// image, or raw RGBA8 frames in order for an animation, to pipe into
+    /// `ffmpeg -f rawvideo -pix_fmt rgba -s WxH -r FPS -i - ...`.
     #[arg(long, value_name = "PATH")]
     pub export_path: Option<String>,
 

@@ -16,5 +16,5 @@ pub use renderer::PipelineKey;
 pub use renderer::encode_png_with_progress;
 pub use renderer::{ExportRender, FractalCallback, FractalRenderer, MAX_REF_POINTS, Uniforms};
 #[cfg(not(target_arch = "wasm32"))]
-pub use renderer::{encode_png, export_to_png_blocking, render_readback_blocking};
+pub use renderer::{encode_png, export_to_png_blocking, render_readback_blocking, unpad_rgba};
 pub use share::ShareState;
