@@ -41,7 +41,8 @@ Native CLI flags (`src/cli.rs`, applied in `FractalApp::apply_cli`): `--kind`,
 `--power`, `--julia re,im`, `--phoenix-p re,im`, `--lambda-l re,im`,
 `--palette`, `--share <fragment>`,
 `--view re,im,half_height[,iterations]`, `--rendering-kind`,
-`--yaw`/`--pitch` (3D camera, degrees), `--de`, `--buddhabrot`,
+`--yaw`/`--pitch` (3D camera, degrees), `--de`, `--antialias` (2×2),
+`--buddhabrot`,
 `--buddha-palette`. `--headless` (`src/headless.rs`) skips the window
 entirely: it builds the same view from the other flags, creates its own
 offscreen wgpu device, and renders straight to a PNG (`--width`/`--height`,

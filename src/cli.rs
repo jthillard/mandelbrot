@@ -74,6 +74,10 @@ pub struct Cli {
     #[arg(long)]
     pub de: bool,
 
+    /// Enable 2×2 antialiasing (supersampling; ~4× slower).
+    #[arg(long)]
+    pub antialias: bool,
+
     /// Coloring palette index.
     #[arg(long, value_name = "INDEX")]
     pub palette: Option<u32>,

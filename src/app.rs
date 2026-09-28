@@ -847,6 +847,9 @@ impl FractalApp {
         if cli.de {
             self.de_coloring = true;
         }
+        if cli.antialias {
+            self.antialias = true;
+        }
         if cli.buddhabrot {
             self.mode = FractalMode::Buddhabrot;
         }
