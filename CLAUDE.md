@@ -28,6 +28,7 @@ cargo test --test shader_valid   # just the WGSL parse/validate tests (naga, no 
 cargo clippy
 cargo fmt                    # rustfmt.toml just pins edition = "2024"
 cargo build --release --no-default-features   # headless-only binary: no eframe/egui (the default `gui` feature)
+tools/bench/bench.sh --rev HEAD   # perf of uncommitted edits vs HEAD (hyperfine; see tools/bench/README.md)
 ```
 
 Web build (WebGPU):
