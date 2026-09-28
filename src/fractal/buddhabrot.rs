@@ -126,16 +126,21 @@ pub struct BuddhabrotRenderer {
 
 impl BuddhabrotRenderer {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("buddhabrot"),
-            source: wgpu::ShaderSource::Wgsl(
-                concat!(
-                    include_str!("../shaders/common.wgsl"),
-                    include_str!("../shaders/buddhabrot.wgsl"),
-                )
-                .into(),
-            ),
-        });
+        let shader = unsafe {
+            device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("buddhabrot"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        concat!(
+                            include_str!("../shaders/common.wgsl"),
+                            include_str!("../shaders/buddhabrot.wgsl"),
+                        )
+                        .into(),
+                    ),
+                },
+                wgpu::ShaderRuntimeChecks::unchecked(),
+            )
+        };
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("buddhabrot uniforms"),

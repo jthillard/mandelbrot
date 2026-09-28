@@ -197,16 +197,21 @@ struct Lipschitz {
 
 impl Lipschitz {
     fn new(device: &wgpu::Device) -> Self {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("lipschitz"),
-            source: wgpu::ShaderSource::Wgsl(
-                concat!(
-                    include_str!("../shaders/common.wgsl"),
-                    include_str!("../shaders/lipschitz.wgsl"),
-                )
-                .into(),
-            ),
-        });
+        let module = unsafe {
+            device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("lipschitz"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        concat!(
+                            include_str!("../shaders/common.wgsl"),
+                            include_str!("../shaders/lipschitz.wgsl"),
+                        )
+                        .into(),
+                    ),
+                },
+                wgpu::ShaderRuntimeChecks::unchecked(),
+            )
+        };
         let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -617,17 +622,22 @@ impl FractalRenderer {
     }
 
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mandelbrot"),
-            source: wgpu::ShaderSource::Wgsl(
-                concat!(
-                    include_str!("../shaders/common.wgsl"),
-                    include_str!("../shaders/iterate_uniforms.wgsl"),
-                    include_str!("../shaders/mandelbrot.wgsl"),
-                )
-                .into(),
-            ),
-        });
+        let shader = unsafe {
+            device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("mandelbrot"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        concat!(
+                            include_str!("../shaders/common.wgsl"),
+                            include_str!("../shaders/iterate_uniforms.wgsl"),
+                            include_str!("../shaders/mandelbrot.wgsl"),
+                        )
+                        .into(),
+                    ),
+                },
+                wgpu::ShaderRuntimeChecks::unchecked(),
+            )
+        };
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fractal uniforms"),
@@ -748,17 +758,22 @@ impl FractalRenderer {
             });
 
         // Colourise pass: data texture + colour uniforms → colour texture.
-        let colorize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("colorize"),
-            source: wgpu::ShaderSource::Wgsl(
-                concat!(
-                    include_str!("../shaders/common.wgsl"),
-                    include_str!("../shaders/iterate_uniforms.wgsl"),
-                    include_str!("../shaders/colorize.wgsl"),
-                )
-                .into(),
-            ),
-        });
+        let colorize_shader = unsafe {
+            device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("colorize"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        concat!(
+                            include_str!("../shaders/common.wgsl"),
+                            include_str!("../shaders/iterate_uniforms.wgsl"),
+                            include_str!("../shaders/colorize.wgsl"),
+                        )
+                        .into(),
+                    ),
+                },
+                wgpu::ShaderRuntimeChecks::unchecked(),
+            )
+        };
         let colorize_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("colorize bind group layout"),
@@ -829,16 +844,21 @@ impl FractalRenderer {
         });
 
         // Blit pipeline: samples the cache texture onto egui's surface.
-        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit"),
-            source: wgpu::ShaderSource::Wgsl(
-                concat!(
-                    include_str!("../shaders/common.wgsl"),
-                    include_str!("../shaders/blit.wgsl"),
-                )
-                .into(),
-            ),
-        });
+        let blit_shader = unsafe {
+            device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("blit"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        concat!(
+                            include_str!("../shaders/common.wgsl"),
+                            include_str!("../shaders/blit.wgsl"),
+                        )
+                        .into(),
+                    ),
+                },
+                wgpu::ShaderRuntimeChecks::unchecked(),
+            )
+        };
 
         let blit_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
