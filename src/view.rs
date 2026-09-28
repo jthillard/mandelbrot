@@ -1,6 +1,6 @@
 //! Camera / view state over the complex plane.
 //!
-//! The center is stored in arbitrary precision (`FBig`) — this is what lets us
+//! The center is stored in arbitrary precision ([`Big`]) — this is what lets us
 //! zoom far past f64's ~1e13x limit. The pixel *scale* is a [`Scale`]: an
 //! f64 mantissa with its own `i32` binary exponent, so it isn't bound by
 //! f64's ~1e-308 range either (the floor, `Scale::MIN`, only keeps the GPU's
@@ -10,11 +10,7 @@
 
 use core::str::FromStr;
 
-use dashu_float::round::mode::HalfAway;
-use dashu_float::{DBig, FBig};
-
-/// Arbitrary-precision binary float (base 2, round-half-away). One coordinate.
-pub type Big = FBig<HalfAway, 2>;
+pub use crate::bignum::Big;
 
 /// Half-height (complex units) of the default view; also the zoom-1 reference.
 pub const DEFAULT_HALF_HEIGHT: f64 = 1.25;
@@ -194,28 +190,37 @@ impl core::fmt::Display for Scale {
             };
         }
         // Out of f64's range: round the exact decimal expansion instead.
-        let sig = f.precision().map_or(17, |p| p + 1);
-        let dec = self
-            .to_big()
-            .to_decimal()
-            .value()
-            .with_precision(sig)
-            .value();
-        let repr = dec.repr();
-        let digits = repr.significand().to_string();
-        let digits = digits.trim_end_matches('0');
-        let digits = if digits.is_empty() { "0" } else { digits };
-        // value = significand · 10^exponent; move the point after the first digit.
-        let exp10 = repr.exponent() + repr.significand().to_string().len() as isize - 1;
-        let (head, tail) = digits.split_at(1);
-        let tail = match f.precision() {
-            Some(p) => format!("{tail:0<p$}"),
-            None => tail.to_string(),
+        let big = self.to_big();
+        let sci = |sig: usize, pad: Option<usize>| {
+            let parts = big.to_decimal_parts(sig);
+            let digits = if parts.digits.is_empty() {
+                "0"
+            } else {
+                &parts.digits
+            };
+            // value = 0.digits · 10^exp10; move the point after the first digit.
+            let exp10 = parts.exp10 - 1;
+            let (head, tail) = digits.split_at(1);
+            let tail = match pad {
+                Some(p) => format!("{tail:0<p$}"),
+                None => tail.to_string(),
+            };
+            if tail.is_empty() {
+                format!("{head}e{exp10}")
+            } else {
+                format!("{head}.{tail}e{exp10}")
+            }
         };
-        if tail.is_empty() {
-            write!(f, "{head}e{exp10}")
-        } else {
-            write!(f, "{head}.{tail}e{exp10}")
+        match f.precision() {
+            Some(p) => f.write_str(&sci(p + 1, Some(p))),
+            None => {
+                // Like `{:e}` on f64: the shortest string that parses back.
+                let s = (1..17)
+                    .map(|sig| sci(sig, None))
+                    .find(|s| s.parse::<Scale>() == Ok(*self))
+                    .unwrap_or_else(|| sci(17, None));
+                f.write_str(&s)
+            }
         }
     }
 }
@@ -237,18 +242,12 @@ impl FromStr for Scale {
             };
         }
         // Too small (or large) for f64: go through an exact decimal.
-        let dec = DBig::from_str(s).map_err(|_| ())?;
-        let bin: Big = dec.with_base_and_precision::<2>(64).value();
-        if bin < Big::ZERO {
+        let bin = Big::from_decimal_str(s, 64).ok_or(())?;
+        if bin.is_negative() {
             return Err(());
         }
-        let repr = bin.repr();
-        let digits = repr.digits();
-        if digits == 0 {
-            return Err(());
-        }
-        let top = repr.exponent() + digits as isize - 1;
-        let m = (bin.clone() >> top).to_f64().value();
+        let top = bin.log2_floor().ok_or(())?;
+        let m = (bin >> top).to_f64();
         let e = top.clamp(i32::MIN as isize, i32::MAX as isize) as i32;
         Ok(Self::from_parts(m, e))
     }
@@ -312,10 +311,10 @@ impl ViewState {
     pub fn sync_precision(&mut self) {
         let bits = self.precision_bits();
         if self.center_re.precision() < bits {
-            self.center_re = self.center_re.clone().with_precision(bits).value();
+            self.center_re = self.center_re.clone().with_precision(bits);
         }
         if self.center_im.precision() < bits {
-            self.center_im = self.center_im.clone().with_precision(bits).value();
+            self.center_im = self.center_im.clone().with_precision(bits);
         }
     }
 
@@ -360,8 +359,7 @@ impl ViewState {
 /// Parse a decimal string (any number of digits) losslessly into a `Big` with at
 /// least `bits` of precision. Used for share links and debug view specs.
 pub fn big_from_decimal_str(s: &str, bits: usize) -> Option<Big> {
-    let dec = DBig::from_str(s.trim()).ok()?;
-    Some(dec.with_base_and_precision::<2>(bits.max(53)).value())
+    Big::from_decimal_str(s, bits)
 }
 
 /// Parse a "re,im,half_height[,iterations]" spec (re/im decimal, parsed at
@@ -440,10 +438,10 @@ pub fn interpolate_view(from: &ViewState, to: &ViewState, t: f64) -> ViewState {
         // Zooming out: g = (1 - q^(t-1)) / (1 - q^-1), every term bounded.
         big_from_f64(((t - 1.0) * d * ln2).exp_m1() / (-d * ln2).exp_m1(), bits)
     };
-    let re0 = from.center_re.clone().with_precision(bits).value();
-    let im0 = from.center_im.clone().with_precision(bits).value();
-    let re1 = to.center_re.clone().with_precision(bits).value();
-    let im1 = to.center_im.clone().with_precision(bits).value();
+    let re0 = from.center_re.clone().with_precision(bits);
+    let im0 = from.center_im.clone().with_precision(bits);
+    let re1 = to.center_re.clone().with_precision(bits);
+    let im1 = to.center_im.clone().with_precision(bits);
     let center_re = &re1 + &(&(&re0 - &re1) * &g_big);
     let center_im = &im1 + &(&(&im0 - &im1) * &g_big);
     ViewState::with_center(center_re, center_im, half_height)
@@ -456,12 +454,7 @@ pub fn interpolate_f64(from: f64, to: f64, t: f64) -> f64 {
 
 /// Render a `Big` as a decimal string with `sig_digits` significant digits.
 pub fn big_to_decimal_str(x: &Big, sig_digits: usize) -> String {
-    let dec = x
-        .to_decimal()
-        .value()
-        .with_precision(sig_digits.max(1))
-        .value();
-    format!("{dec}")
+    x.to_decimal_string(sig_digits)
 }
 
 /// Precision (bits) needed to resolve the center at a given half-height.
@@ -472,12 +465,9 @@ pub fn precision_for(half_height: Scale) -> usize {
     (zoom_bits + GUARD_BITS).clamp(53, MAX_PRECISION_BITS)
 }
 
-/// Build an `FBig` from an f64 with an explicit precision context.
+/// Build a `Big` from an f64 with an explicit precision.
 pub fn big_from_f64(x: f64, bits: usize) -> Big {
-    Big::try_from(x)
-        .unwrap_or_default()
-        .with_precision(bits)
-        .value()
+    Big::from_f64(x, bits)
 }
 
 #[cfg(test)]
@@ -489,8 +479,8 @@ mod tests {
     }
 
     fn re_im_f64(v: &ViewState) -> (f64, f64) {
-        let re: f64 = v.center_re.to_decimal().value().to_f64().value();
-        let im: f64 = v.center_im.to_decimal().value().to_f64().value();
+        let re: f64 = v.center_re.to_f64();
+        let im: f64 = v.center_im.to_f64();
         (re, im)
     }
 
@@ -612,8 +602,8 @@ mod tests {
             prev = mid.half_height;
             // Offset from the target, in units of the view's half-height.
             let k = -mid.half_height.exponent() as isize;
-            let dre = ((&mid.center_re - &to.center_re) << k).to_f64().value();
-            let dim = ((&mid.center_im - &to.center_im) << k).to_f64().value();
+            let dre = ((&mid.center_re - &to.center_re) << k).to_f64();
+            let dim = ((&mid.center_im - &to.center_im) << k).to_f64();
             let ratio = (dre * dre + dim * dim).sqrt() / mid.half_height.scaled_f64(k as i32);
             assert!(ratio > 0.01 && ratio < 10.0, "t={t}: ratio {ratio}");
         }

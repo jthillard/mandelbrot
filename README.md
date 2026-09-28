@@ -3,7 +3,8 @@
 A fast, interactive deep-zoom fractal explorer — Mandelbrot and Julia sets —
 built with **Rust + wgpu + egui + WGSL**. It zooms far past the ~10¹³× limit of
 plain `f64` using **perturbation theory**: one high-precision reference orbit is
-computed on the CPU (arbitrary precision via `dashu-float`), and every pixel is
+computed on the CPU (arbitrary precision via `rug` natively, `malachite-float`
+on the web), and every pixel is
 rendered on the GPU as a cheap `f32` delta from it, with **rebasing** to avoid
 glitches. Runs natively (Vulkan/Metal/DX12) and in the browser (WebGPU).
 
@@ -27,6 +28,9 @@ The `f32` GPU tier reaches roughly **10³⁰× magnification** with sharp detail
 cargo run --release
 ```
 
+Native builds use `rug` (GMP/MPFR) for the reference orbit, which needs a C
+toolchain and `m4` (on Windows, MSYS2).
+
 ## Build & run — web (WebGPU)
 
 Requires the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` (matching the
@@ -37,6 +41,7 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.128   # once
 
 ./build-web.sh                       # outputs ./dist (index.html, .js, .wasm)
+                                     # (builds with --features wasm: pure-Rust big floats)
 python3 -m http.server -d dist 8080  # serve over http
 ```
 
@@ -60,7 +65,8 @@ qualifies. Deploy by serving the `dist/` directory as static files.
 
 ## How it works
 
-- `src/view.rs` — view state. Center is arbitrary precision (`FBig`); the pixel
+- `src/view.rs` — view state. Center is arbitrary precision (`Big`, from
+  `src/bignum/`); the pixel
   scale stays `f64` (even at 10³⁰× it is ~10⁻³³, within `f64` range).
 - `src/fractal/reference.rs` — high-precision reference orbit `Z_{n+1}=Z_n²+C`.
 - `src/shaders/mandelbrot.wgsl` — per-pixel perturbation `e_{n+1}=2·Z_n·e_n+e_n²+δc`
@@ -84,6 +90,7 @@ reference computation to a Web Worker.
 
 ```sh
 cargo test
+cargo test --features wasm   # same suite on the web build's big-float backend
 ```
 
 Covers the reference orbit (vs. a naive `f64` iteration, Mandelbrot and Julia)

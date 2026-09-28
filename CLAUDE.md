@@ -6,7 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A deep-zoom fractal explorer (Rust + wgpu + egui + WGSL). It zooms past the
 ~10¹³× limit of plain `f64` using **perturbation theory**: one high-precision
-reference orbit is computed on the CPU (arbitrary precision via `dashu-float`),
+reference orbit is computed on the CPU (arbitrary precision via `bignum::Big`:
+`rug` natively, `malachite-float` on the web),
 and every pixel is rendered on the GPU as a cheap `f32` delta from it, with
 rebasing to avoid glitches. Plain `f32` deltas run out of exponent range
 once a pixel is ~2^-124 wide (~10³⁴× at 1080p), so from 2^-122 per pixel
@@ -22,6 +23,7 @@ storage buffers, which the fragment shader needs for the reference orbit).
 ```sh
 cargo run --release          # native, run (release matters: fractal math is hot)
 cargo test                   # reference-orbit math, share-link round-trip, WGSL validation
+cargo test --features wasm   # same, on the web build's malachite big-float backend
 cargo test --test shader_valid   # just the WGSL parse/validate tests (naga, no GPU needed)
 cargo clippy
 cargo fmt                    # rustfmt.toml just pins edition = "2024"
@@ -33,7 +35,7 @@ Web build (WebGPU):
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.128   # must match the wasm-bindgen crate version
-./build-web.sh                                     # -> ./dist
+./build-web.sh                                     # -> ./dist (builds with --features wasm)
 python3 -m http.server -d dist 8080
 ```
 
@@ -105,8 +107,19 @@ runs out), rebase: `e ← y_n − X_0`, restart the reference index at 0. This i
 what makes deep zoom cheap — one expensive high-precision orbit, then every
 pixel is a handful of `f32` complex multiplies.
 
-- `src/view.rs` — `ViewState`; center is arbitrary-precision `FBig` (`Big`
-  type alias). The pixel scale (`half_height`) is a `Scale`, an f64
+- `src/bignum/` — `Big`, the arbitrary-precision binary float, with one
+  backend per library behind the same inherent API + operators: `rug`
+  (GMP/MPFR, default, fastest, can't target wasm32) and `malachite-float`
+  (pure Rust, the `wasm` feature, required for the web build; a
+  `compile_error!` enforces it). Cargo features are additive, so rug is a
+  non-wasm32 target dependency and the backend is picked by
+  `cfg(feature = "wasm")`. Both follow the precision rule: a result has the
+  larger operand precision, rounded to nearest; shifts are exact. Malachite's
+  zero has no precision, so its wrapper stores `prec` alongside. Any new
+  `Big` operation must be added to both backends (`cargo test` and
+  `cargo test --features wasm` run the same tests on each).
+- `src/view.rs` — `ViewState`; center is arbitrary-precision `Big`
+  (re-exported as `view::Big`). The pixel scale (`half_height`) is a `Scale`, an f64
   mantissa with its own i32 exponent, so it goes past f64's ~1e-308. Never
   collapse it (or a center difference) to a plain `f64` on a path used at
   depth. Rescale first: `Scale::scaled_f64(k)`, or shift the `Big` by
@@ -131,10 +144,10 @@ pixel is a handful of `f32` complex multiplies.
   `f32` pairs — that's the reference orbit the GPU perturbs from. At
   precision ≤ `F64_MAX_PRECISION` (80 bits, i.e. shallow views) it takes a
   plain-`f64` fast path (`compute_reference_f64`), so each kind's formula
-  exists twice in this file (f64 + `FBig`) and both must stay in sync;
+  exists twice in this file (f64 + `Big`) and both must stay in sync;
   `f64_fast_path_matches_big` checks they agree. The result is a `RefOrbit`:
   `points` plus a parallel `exps`. A point below 2^-100 (only possible on the
-  `FBig` path) is stored as a normalized mantissa with its exponent in `exps`
+  `Big` path) is stored as a normalized mantissa with its exponent in `exps`
   (the true value is `points[n]·2^exps[n]`). That happens when the orbit
   passes near 0 at a deep minibrot. `has_scaled()` then forces the deep
   pipeline, the only one that reads `exps`. Requests are made with 1.5×
@@ -190,7 +203,7 @@ pixel is a handful of `f32` complex multiplies.
   are `advance_delta_kind`/`fprime_kind`; `advance_delta`/`fprime` wrap them
   to blend two kinds during the kind-switch morph (`u.morph_from`,
   `u.morph_w`: each step is `(1-w)·f_kind + w·f_from`, mirrored on the CPU by
-  the `morph` argument of `compute_reference`, in both its f64 and `FBig`
+  the `morph` argument of `compute_reference`, in both its f64 and `Big`
   paths). The blend only exists in pipelines built with the `MORPH` override
   (part of `PipelineKey`, on while `morph_w > 0`); those also skip periodicity
   detection and the cardioid bypass. App side: `KindMorph` in

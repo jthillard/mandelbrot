@@ -1,7 +1,7 @@
 //! Native background worker for reference-orbit computation.
 //!
 //! At deep zoom the high-precision reference can take many milliseconds (tens of
-//! thousands of `FBig` iterations), which would stutter the UI if done inline.
+//! thousands of `Big` iterations), which would stutter the UI if done inline.
 //! This runs it on a thread and coalesces bursts of requests (e.g. during a
 //! drag) down to the most recent one. On the web we compute inline instead
 //! (browsers need a Web Worker for threads); see `app.rs`.

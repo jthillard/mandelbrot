@@ -1144,12 +1144,8 @@ impl FractalApp {
     fn drift_from(&self, key: &RequestKey) -> f64 {
         let hh = self.view.half_height;
         let k = -hh.exponent() as isize;
-        let dre = ((&self.view.center_re - &key.center_re) << k)
-            .to_f64()
-            .value();
-        let dim = ((&self.view.center_im - &key.center_im) << k)
-            .to_f64()
-            .value();
+        let dre = ((&self.view.center_re - &key.center_re) << k).to_f64();
+        let dim = ((&self.view.center_im - &key.center_im) << k).to_f64();
         (dre * dre + dim * dim).sqrt() / hh.scaled_f64(-hh.exponent())
     }
 
@@ -1198,12 +1194,8 @@ impl FractalApp {
     /// underflow f64 at deep zooms).
     fn dc_offset(&self, scale_exp: i32) -> (f64, f64) {
         let k = -scale_exp as isize;
-        let dre = ((&self.view.center_re - &self.ref_center_re) << k)
-            .to_f64()
-            .value();
-        let dim = ((&self.view.center_im - &self.ref_center_im) << k)
-            .to_f64()
-            .value();
+        let dre = ((&self.view.center_re - &self.ref_center_re) << k).to_f64();
+        let dim = ((&self.view.center_im - &self.ref_center_im) << k).to_f64();
         (dre, dim)
     }
 
@@ -1494,8 +1486,8 @@ impl FractalApp {
     /// Buddhabrot mode doesn't support deep zoom (see `fractal::buddhabrot`).
     fn make_buddhabrot_uniforms(&self, aspect: f64) -> BuddhabrotUniforms {
         let center = [
-            self.view.center_re.to_f64().value() as f32,
-            self.view.center_im.to_f64().value() as f32,
+            self.view.center_re.to_f64() as f32,
+            self.view.center_im.to_f64() as f32,
         ];
         BuddhabrotUniforms {
             center,

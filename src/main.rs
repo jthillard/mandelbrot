@@ -11,6 +11,7 @@
 // and calls the wasm `main`, which boots eframe onto the page's <canvas>.
 
 mod app;
+mod bignum;
 mod camera;
 mod fractal;
 mod lights;

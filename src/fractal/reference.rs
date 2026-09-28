@@ -1,7 +1,7 @@
 //! High-precision reference-orbit computation for perturbation rendering.
 //!
 //! We iterate the fractal's formula `Z_{n+1} = f(Z_n, C)` at high precision
-//! (`dashu-float`), storing each `Z_n` as an `f32` pair. Every pixel is then
+//! ([`Big`]: `rug` natively, pure Rust on the web), storing each `Z_n` as an `f32` pair. Every pixel is then
 //! rendered on the GPU as a small `f32` delta from this orbit — that is what
 //! makes deep zoom cheap. See `shaders/mandelbrot.wgsl` for the delta side; the
 //! delta formula there must match the orbit formula here.
@@ -24,7 +24,7 @@ use crate::view::{Big, big_from_f64};
 const REFERENCE_ESCAPE_SQ: f64 = 1.0e10;
 
 /// Up to this working precision (bits) the orbit is iterated in plain `f64`
-/// instead of `FBig` — orders of magnitude faster, which matters most on the
+/// instead of `Big` — orders of magnitude faster, which matters most on the
 /// web (where the reference is computed inline on the UI thread).
 ///
 /// `precision_for` asks for `zoom_bits + 48` guard bits, but the GPU only
@@ -96,29 +96,21 @@ impl<'a> IntoIterator for &'a RefOrbit {
     }
 }
 
-/// `floor(log2|x|)`, or `None` for zero. Exact (from the binary
-/// representation), and works far below f64's range.
-fn big_log2_floor(x: &Big) -> Option<isize> {
-    let repr = x.repr();
-    let digits = repr.digits();
-    (digits > 0).then(|| repr.exponent() + digits as isize - 1)
-}
-
 /// Store `(zr, zi)` into `orbit`, as plain f32 unless its magnitude is below
 /// `2^TINY_LOG2`, in which case both components share an exponent `k` and
 /// the stored mantissa `Z * 2^-k` has its larger component in `[0.5, 1)`.
 fn push_big_point(orbit: &mut RefOrbit, zr: &Big, zi: &Big) {
-    let (lr, li) = (big_log2_floor(zr), big_log2_floor(zi));
+    let (lr, li) = (zr.log2_floor(), zi.log2_floor());
     let top = lr.max(li);
     match top {
         Some(top) if top < TINY_LOG2 as isize => {
             let k = top + 1;
-            let mr = (zr.clone() << -k).to_f64().value() as f32;
-            let mi = (zi.clone() << -k).to_f64().value() as f32;
+            let mr = (zr.clone() << -k).to_f64() as f32;
+            let mi = (zi.clone() << -k).to_f64() as f32;
             orbit.points.push([mr, mi]);
             orbit.exps.push(k as i32);
         }
-        _ => orbit.push([zr.to_f64().value() as f32, zi.to_f64().value() as f32]),
+        _ => orbit.push([zr.to_f64() as f32, zi.to_f64() as f32]),
     }
 }
 
@@ -147,23 +139,17 @@ pub fn compute_reference(
     let morph = morph.filter(|&(_, w)| w != 0.0);
     if precision <= F64_MAX_PRECISION {
         let k = StepConstsF64 {
-            c: (c_re.to_f64().value(), c_im.to_f64().value()),
+            c: (c_re.to_f64(), c_im.to_f64()),
             p: phoenix_p,
             l: lambda_l,
             cpow: complex_power,
             power,
         };
-        return compute_reference_f64(
-            (z0_re.to_f64().value(), z0_im.to_f64().value()),
-            max_iter,
-            kind,
-            &k,
-            morph,
-        );
+        return compute_reference_f64((z0_re.to_f64(), z0_im.to_f64()), max_iter, kind, &k, morph);
     }
     let k = StepConsts {
-        cr: c_re.clone().with_precision(precision).value(),
-        ci: c_im.clone().with_precision(precision).value(),
+        cr: c_re.clone().with_precision(precision),
+        ci: c_im.clone().with_precision(precision),
         pr: big_from_f64(phoenix_p.0, precision),
         pi: big_from_f64(phoenix_p.1, precision),
         lr: big_from_f64(lambda_l.0, precision),
@@ -292,7 +278,7 @@ struct StepConsts {
     precision: usize,
 }
 
-/// [`compute_reference`] at arbitrary precision (`FBig`), for deep views.
+/// [`compute_reference`] at arbitrary precision ([`Big`]), for deep views.
 fn compute_reference_big(
     z0_re: &Big,
     z0_im: &Big,
@@ -304,11 +290,11 @@ fn compute_reference_big(
     let precision = k.precision;
     let morph = morph.map(|(from, w)| (from, big_from_f64(w, precision)));
 
-    let mut zr = z0_re.clone().with_precision(precision).value();
-    let mut zi = z0_im.clone().with_precision(precision).value();
+    let mut zr = z0_re.clone().with_precision(precision);
+    let mut zi = z0_im.clone().with_precision(precision);
     // Previous iterate, for the Phoenix two-term recurrence (Y_{-1} = 0).
-    let mut zr_prev = big_zero(precision);
-    let mut zi_prev = big_zero(precision);
+    let mut zr_prev = Big::zero(precision);
+    let mut zi_prev = Big::zero(precision);
 
     let mut points = RefOrbit::with_capacity(max_iter as usize + 1);
 
@@ -332,8 +318,8 @@ fn compute_reference_big(
         // Shift the previous iterate (only the Phoenix arm reads it).
         zr_prev = zr;
         zi_prev = zi;
-        zr = new_zr.with_precision(precision).value();
-        zi = new_zi.with_precision(precision).value();
+        zr = new_zr.with_precision(precision);
+        zi = new_zi.with_precision(precision);
     }
 
     points
@@ -361,7 +347,7 @@ fn step(
         FractalKind::BurningShip => {
             // (|zr| + i|zi|)^2 = (zr^2 - zi^2) + 2|zr zi| i.
             let re = &zr.sqr() - &zi.sqr() + cr;
-            let im = big_abs((zr * zi) << 1) + ci;
+            let im = ((zr * zi) << 1).abs() + ci;
             (re, im)
         }
         FractalKind::Tricorn => {
@@ -376,14 +362,14 @@ fn step(
         }
         FractalKind::Celtic => {
             // |Re(z^2)| + i·Im(z^2): abs the real output of the square.
-            let re = big_abs(&zr.sqr() - &zi.sqr()) + cr;
+            let re = (&zr.sqr() - &zi.sqr()).abs() + cr;
             let im = ((zr * zi) << 1) + ci;
             (re, im)
         }
         FractalKind::Perpendicular => {
             // (x^2 - y^2) - 2·x·|y| i: abs the imaginary input.
             let re = &zr.sqr() - &zi.sqr() + cr;
-            let im = if *zi < Big::ZERO {
+            let im = if zi.is_negative() {
                 ci + ((zr * zi) << 1)
             } else {
                 ci - ((zr * zi) << 1)
@@ -392,8 +378,8 @@ fn step(
         }
         FractalKind::Buffalo => {
             // |Re(z^2)| - |Im(z^2)| i: abs both outputs.
-            let re = big_abs(&zr.sqr() - &zi.sqr()) + cr;
-            let im = ci - big_abs((zr * zi) << 1);
+            let re = (&zr.sqr() - &zi.sqr()).abs() + cr;
+            let im = ci - ((zr * zi) << 1).abs();
             (re, im)
         }
         FractalKind::Phoenix => {
@@ -406,7 +392,7 @@ fn step(
         }
         FractalKind::Lambda => {
             // λ·z(1 - z) + c: logistic map plus the usual additive `c`.
-            let re2 = 1 - zr;
+            let re2 = Big::from_f64(1.0, k.precision) - zr;
             let im2 = -zi;
             let lzr = &k.lr * zr - &k.li * zi;
             let lzi = &k.lr * zi + &k.li * zr;
@@ -421,34 +407,18 @@ fn step(
     }
 }
 
-fn big_zero(precision: usize) -> Big {
-    Big::from(0i32).with_precision(precision).value()
-}
-
-/// Absolute value of a `Big`. The sign comes from the `Big` itself: through
-/// f64, anything below ~1e-308 reads as ±0 and would keep its sign.
-fn big_abs(x: Big) -> Big {
-    if x < Big::ZERO { -x } else { x }
-}
-
 /// `(zr + i zi)^power` by repeated complex multiply at `precision` bits.
 fn complex_pow(zr: &Big, zi: &Big, power: u32, precision: usize) -> (Big, Big) {
-    let mut rr = Big::from(1i32).with_precision(precision).value();
-    let mut ri = big_zero(precision);
+    let mut rr = Big::from_f64(1.0, precision);
+    let mut ri = Big::zero(precision);
     for _ in 0..power {
         // (rr + i ri)(zr + i zi) = (rr zr - ri zi) + (rr zi + ri zr) i.
-        let nr = (&rr * zr - &ri * zi).with_precision(precision).value();
-        let ni = (&rr * zi + &ri * zr).with_precision(precision).value();
+        let nr = (&rr * zr - &ri * zi).with_precision(precision);
+        let ni = (&rr * zi + &ri * zr).with_precision(precision);
         rr = nr;
         ri = ni;
     }
     (rr, ri)
-}
-
-/// `true` if `x` is exactly zero (special-cases `ln(0)`). Not via f64,
-/// which flushes values below ~1e-308 to zero.
-fn is_big_zero(x: &Big) -> bool {
-    x.repr().significand().is_zero()
 }
 
 /// `(zr + i zi)^(pr + i pi)` for a complex exponent, via the principal branch
@@ -458,14 +428,14 @@ fn is_big_zero(x: &Big) -> bool {
 /// panic; this is the correct limit for the `Re(p) > 0` region the UI
 /// exposes).
 fn complex_pow_complex(zr: &Big, zi: &Big, pr: &Big, pi: &Big, precision: usize) -> (Big, Big) {
-    if is_big_zero(zr) && is_big_zero(zi) {
-        return (big_zero(precision), big_zero(precision));
+    if zr.is_zero() && zi.is_zero() {
+        return (Big::zero(precision), Big::zero(precision));
     }
     let r2 = &zr.sqr() + &zi.sqr();
     let ln_r = r2.ln() >> 1; // 0.5 * ln(r2) = ln(sqrt(r2)); exact halving.
     let theta = zi.atan2(zr);
-    let exp_re = (pr * &ln_r - pi * &theta).with_precision(precision).value();
-    let exp_im = (pr * &theta + pi * &ln_r).with_precision(precision).value();
+    let exp_re = (pr * &ln_r - pi * &theta).with_precision(precision);
+    let exp_im = (pr * &theta + pi * &ln_r).with_precision(precision);
     let mag = exp_re.exp();
     let (sin_a, cos_a) = exp_im.sin_cos();
     (&mag * &cos_a, &mag * &sin_a)
@@ -486,7 +456,7 @@ pub fn compute_set_reference(
     complex_power: (f64, f64),
     morph: Option<(FractalKind, f64)>,
 ) -> RefOrbit {
-    let zero = big_zero(precision);
+    let zero = Big::zero(precision);
     compute_reference(
         &zero,
         &zero,
@@ -511,19 +481,19 @@ mod tests {
     /// `to_f64` reads as ±0.
     #[test]
     fn sign_and_zero_below_f64_range() {
-        let tiny = Big::try_from(1.0_f64).unwrap().with_precision(64).value() >> 5000;
-        assert!(!is_big_zero(&tiny));
-        assert!(is_big_zero(&big_zero(64)));
-        assert_eq!(big_abs(-tiny.clone()), tiny);
-        assert_eq!(big_abs(tiny.clone()), tiny);
+        let tiny = Big::from_f64(1.0, 64) >> 5000;
+        assert!(!tiny.is_zero());
+        assert!(Big::zero(64).is_zero());
+        assert_eq!((-tiny.clone()).abs(), tiny);
+        assert_eq!(tiny.clone().abs(), tiny);
     }
 
     /// The high-precision reference must agree with a plain f64 iteration for a
     /// shallow point (where f64 is accurate).
     #[test]
     fn reference_matches_naive_f64() {
-        let cr = Big::try_from(-0.75_f64).unwrap();
-        let ci = Big::try_from(0.1_f64).unwrap();
+        let cr = Big::from_f64(-0.75, 53);
+        let ci = Big::from_f64(0.1, 53);
         let points = compute_set_reference(
             &cr,
             &ci,
@@ -656,8 +626,8 @@ mod tests {
     /// A point inside the main cardioid never escapes: full-length orbit.
     #[test]
     fn interior_orbit_runs_full_length() {
-        let cr = Big::try_from(-0.2_f64).unwrap();
-        let ci = Big::try_from(0.0_f64).unwrap();
+        let cr = Big::from_f64(-0.2, 53);
+        let ci = Big::from_f64(0.0, 53);
         let points = compute_set_reference(
             &cr,
             &ci,
@@ -676,8 +646,8 @@ mod tests {
     /// Burning Ship reference matches a naive f64 iteration of the same formula.
     #[test]
     fn burning_ship_reference_matches_naive_f64() {
-        let cr = Big::try_from(-1.75_f64).unwrap();
-        let ci = Big::try_from(-0.03_f64).unwrap();
+        let cr = Big::from_f64(-1.75, 53);
+        let ci = Big::from_f64(-0.03, 53);
         let points = compute_set_reference(
             &cr,
             &ci,
@@ -707,8 +677,8 @@ mod tests {
     /// Multibrot (power 3) reference matches a naive f64 cube iteration.
     #[test]
     fn multibrot3_reference_matches_naive_f64() {
-        let cr = Big::try_from(0.3_f64).unwrap();
-        let ci = Big::try_from(0.2_f64).unwrap();
+        let cr = Big::from_f64(0.3, 53);
+        let ci = Big::from_f64(0.2, 53);
         let points = compute_set_reference(
             &cr,
             &ci,
@@ -740,10 +710,10 @@ mod tests {
     /// Julia orbit (fixed c, z0 = center) matches a naive f64 iteration.
     #[test]
     fn julia_reference_matches_naive_f64() {
-        let z0_re = Big::try_from(0.15_f64).unwrap();
-        let z0_im = Big::try_from(-0.1_f64).unwrap();
-        let c_re = Big::try_from(-0.8_f64).unwrap();
-        let c_im = Big::try_from(0.156_f64).unwrap();
+        let z0_re = Big::from_f64(0.15, 53);
+        let z0_im = Big::from_f64(-0.1, 53);
+        let c_re = Big::from_f64(-0.8, 53);
+        let c_im = Big::from_f64(0.156, 53);
         let points = compute_reference(
             &z0_re,
             &z0_im,
@@ -778,10 +748,10 @@ mod tests {
         let (lr, li) = (-0.5_f64, 0.2_f64);
         let (cr, ci) = (0.1_f64, -0.3_f64);
         let points = compute_reference(
-            &Big::try_from(0.2_f64).unwrap(),
-            &Big::try_from(0.1_f64).unwrap(),
-            &Big::try_from(cr).unwrap(),
-            &Big::try_from(ci).unwrap(),
+            &Big::from_f64(0.2, 53),
+            &Big::from_f64(0.1, 53),
+            &Big::from_f64(cr, 53),
+            &Big::from_f64(ci, 53),
             60,
             200,
             FractalKind::Lambda,
@@ -807,8 +777,8 @@ mod tests {
     /// Celtic reference matches a naive f64 iteration: real = |x^2 - y^2| + cr.
     #[test]
     fn celtic_reference_matches_naive_f64() {
-        let cr = Big::try_from(-0.6_f64).unwrap();
-        let ci = Big::try_from(0.4_f64).unwrap();
+        let cr = Big::from_f64(-0.6, 53);
+        let ci = Big::from_f64(0.4, 53);
         let points = compute_set_reference(
             &cr,
             &ci,
@@ -839,8 +809,8 @@ mod tests {
     /// real = x^2 - y^2 + cr, imag = -2·x·|y| + ci.
     #[test]
     fn perpendicular_reference_matches_naive_f64() {
-        let cr = Big::try_from(-0.7_f64).unwrap();
-        let ci = Big::try_from(-0.2_f64).unwrap();
+        let cr = Big::from_f64(-0.7, 53);
+        let ci = Big::from_f64(-0.2, 53);
         let points = compute_set_reference(
             &cr,
             &ci,
@@ -871,8 +841,8 @@ mod tests {
     /// real = |x^2 - y^2| + cr, imag = -|2·x·y| + ci.
     #[test]
     fn buffalo_reference_matches_naive_f64() {
-        let cr = Big::try_from(-1.2_f64).unwrap();
-        let ci = Big::try_from(-0.35_f64).unwrap();
+        let cr = Big::from_f64(-1.2, 53);
+        let ci = Big::from_f64(-0.35, 53);
         let points = compute_set_reference(
             &cr,
             &ci,
@@ -903,8 +873,8 @@ mod tests {
     /// `z_{n+1} = z_n^2 + c + p·z_{n-1}` (z_0 = 0, z_{-1} = 0).
     #[test]
     fn phoenix_reference_matches_naive_f64() {
-        let cr = Big::try_from(0.5667_f64).unwrap();
-        let ci = Big::try_from(0.0_f64).unwrap();
+        let cr = Big::from_f64(0.5667, 53);
+        let ci = Big::from_f64(0.0, 53);
         let p = (-0.5_f64, 0.0_f64);
         let points = compute_set_reference(
             &cr,
@@ -942,8 +912,8 @@ mod tests {
     /// iteration of `z^p = exp(p·ln z)`.
     #[test]
     fn complex_multibrot_reference_matches_naive_f64() {
-        let cr = Big::try_from(0.1_f64).unwrap();
-        let ci = Big::try_from(-0.2_f64).unwrap();
+        let cr = Big::from_f64(0.1, 53);
+        let ci = Big::from_f64(-0.2, 53);
         let power = (2.5_f64, 0.3_f64);
         let points = compute_set_reference(
             &cr,
@@ -987,8 +957,8 @@ mod tests {
 
     fn set_ref(cr: f64, ci: f64, kind: FractalKind, morph: Option<(FractalKind, f64)>) -> RefOrbit {
         compute_set_reference(
-            &Big::try_from(cr).unwrap(),
-            &Big::try_from(ci).unwrap(),
+            &Big::from_f64(cr, 53),
+            &Big::from_f64(ci, 53),
             60,
             200,
             kind,

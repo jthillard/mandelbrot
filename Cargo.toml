@@ -7,10 +7,12 @@ edition = "2024"
 default = ["gui"]
 # Windowed egui app. Without it only `--headless` rendering is built.
 gui = ["dep:eframe", "dep:egui"]
+# Pure-Rust big floats for the web build (`rug` needs GMP/MPFR, which can't
+# target wasm32). Required for wasm32, optional natively (to test that backend).
+wasm = ["dep:malachite-float", "dep:malachite-base"]
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
-dashu-float = "0.6.0"
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "accesskit"], optional = true }
 egui = { version = "0.36.2", optional = true }
 ecolor = { version = "0.36.2", features = ["bytemuck"] }
@@ -18,11 +20,14 @@ wgpu = "30.0.1"
 glam = "0.33.8"
 log = "0.4.34"
 png = "0.18.1"
+malachite-float = { version = "0.12", optional = true }
+malachite-base = { version = "0.12", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = "0.11.11"
 clap = { version = "4.5.51", features = ["derive"] }
 pollster = "1.0.1"
+rug = { version = "1.30.0", default-features = false, features = ["float", "std"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-channel = { version = "0.3.34", default-features = false, features = ["alloc", "std"] }
@@ -39,7 +44,7 @@ opt-level = 3
 # codegen-units = 1
 debug = true
 
-# Dev: keep our own crate debuggable, but optimize dependencies (dashu, wgpu,
+# Dev: keep our own crate debuggable, but optimize dependencies (big floats, wgpu,
 # egui) so the explorer is actually interactive during development.
 [profile.dev]
 opt-level = 1

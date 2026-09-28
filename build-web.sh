@@ -8,7 +8,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 OUT="${1:-dist}"
 
 echo "==> cargo build (wasm32, release)"
-cargo build --release --target wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown --features wasm
 
 echo "==> wasm-bindgen -> $OUT"
 mkdir -p "$OUT"
