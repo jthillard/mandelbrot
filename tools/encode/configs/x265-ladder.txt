@@ -1,0 +1,13 @@
+# x265 candidate ladders: compare combinations at matched bitrate (results/x265-ladder.tsv)
+x265-c0-12             | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 12 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92
+x265-c0-16             | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 16 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92
+x265-c0-20             | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92
+x265-rect-12           | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 12 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1
+x265-rect-16           | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 16 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1
+x265-rect-20           | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1
+x265-rect-psyrdoq-12   | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 12 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1:rdoq-level=2:psy-rdoq=1.0
+x265-rect-psyrdoq-16   | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 16 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1:rdoq-level=2:psy-rdoq=1.0
+x265-rect-psyrdoq-20   | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1:rdoq-level=2:psy-rdoq=1.0
+x265-rect-aq4-12       | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 12 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=4:no-sao=1:merange=92:rect=1
+x265-rect-aq4-16       | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 16 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=4:no-sao=1:merange=92:rect=1
+x265-rect-aq4-20       | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=4:no-sao=1:merange=92:rect=1

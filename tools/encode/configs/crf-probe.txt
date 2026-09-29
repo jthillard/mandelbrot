@@ -1,0 +1,9 @@
+# Coarse CRF probe: where do VMAF 95-97 land on each clip? (pass-1 baselines)
+x265-crf22 | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 22 -x265-params log-level=error:aq-mode=3:no-sao=1
+x265-crf26 | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 26 -x265-params log-level=error:aq-mode=3:no-sao=1
+x265-crf30 | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 30 -x265-params log-level=error:aq-mode=3:no-sao=1
+x265-crf34 | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 34 -x265-params log-level=error:aq-mode=3:no-sao=1
+av1-crf32  | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 32 -svtav1-params film-grain=0
+av1-crf38  | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 38 -svtav1-params film-grain=0
+av1-crf44  | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 44 -svtav1-params film-grain=0
+av1-crf50  | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 50 -svtav1-params film-grain=0

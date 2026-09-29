@@ -1,0 +1,12 @@
+# SVT-AV1 round 2: tune0+VB without QM, default qm-min, delivery-range CRFs (results/av1-ladder2.tsv)
+av1-vb-tune0-14            | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 14 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0:enable-variance-boost=1
+av1-vb-tune0-20            | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 20 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0:enable-variance-boost=1
+av1-vb-tune0-26            | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 26 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0:enable-variance-boost=1
+av1-vb-tune0-32            | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 32 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0:enable-variance-boost=1
+av1-qm8-vb-tune0-14        | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 14 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0:enable-qm=1:enable-variance-boost=1
+av1-qm8-vb-tune0-20        | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 20 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0:enable-qm=1:enable-variance-boost=1
+av1-qm8-vb-tune0-26        | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 26 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0:enable-qm=1:enable-variance-boost=1
+av1-qm8-vb-tune0-32        | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 32 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0:enable-qm=1:enable-variance-boost=1
+av1-qm-vb-tune0-32         | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 32 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0:enable-qm=1:qm-min=0:enable-variance-boost=1
+av1-qm-vb-tune0-38         | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 38 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0:enable-qm=1:qm-min=0:enable-variance-boost=1
+av1-tune0-10               | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 10 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0

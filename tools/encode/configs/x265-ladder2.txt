@@ -1,0 +1,7 @@
+# x265 round 2: preset fast for speed, aq-strength 1.2 for julia (results/x265-ladder2.tsv)
+x265-fast-rp-12            | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset fast -crf 12 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1:rdoq-level=2:psy-rdoq=1.0
+x265-fast-rp-16            | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset fast -crf 16 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1:rdoq-level=2:psy-rdoq=1.0
+x265-fast-rp-20            | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset fast -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1:rdoq-level=2:psy-rdoq=1.0
+x265-rp-aqs12-12           | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 12 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1:rdoq-level=2:psy-rdoq=1.0:aq-strength=1.2
+x265-rp-aqs12-16           | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 16 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1:rdoq-level=2:psy-rdoq=1.0:aq-strength=1.2
+x265-rp-aqs12-20           | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92:rect=1:rdoq-level=2:psy-rdoq=1.0:aq-strength=1.2

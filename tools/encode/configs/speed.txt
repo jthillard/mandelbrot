@@ -1,0 +1,8 @@
+# Pass 1: which presets fit the 3-5 fps budget at 4K on this machine.
+x265-fast      | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset fast   -crf 18 -x265-params log-level=error:aq-mode=3:no-sao=1
+x265-medium    | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 18 -x265-params log-level=error:aq-mode=3:no-sao=1
+x265-slow      | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset slow   -crf 18 -x265-params log-level=error:aq-mode=3:no-sao=1
+av1-p5         | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 5 -crf 26 -svtav1-params film-grain=0
+av1-p6         | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 26 -svtav1-params film-grain=0
+av1-p7         | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 7 -crf 26 -svtav1-params film-grain=0
+av1-p8         | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 8 -crf 26 -svtav1-params film-grain=0

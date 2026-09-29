@@ -1,0 +1,20 @@
+# x265 per-axis sweep: each line changes one thing from x265-base.
+# Base = pass-1 settings (preset medium, aq-mode 3, no SAO) plus a 10 s GOP.
+x265-base      | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1
+# Adaptive quantisation
+x265-aq4       | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=4:no-sao=1
+x265-aqs08     | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:aq-strength=0.8:no-sao=1
+x265-aqs12     | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:aq-strength=1.2:no-sao=1
+# In-loop filters
+x265-sao       | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3
+x265-selsao2   | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:selective-sao=2
+x265-deblk-1   | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:deblock=-1,-1
+# Psychovisual: medium has rdoq-level 0, so psy-rdoq needs rdoq-level 2 to do anything
+x265-psyrdoq   | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:rdoq-level=2:psy-rdoq=1.0
+x265-psyrd1    | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:psy-rd=1.0
+# Motion: zooms are scaling, not translation
+x265-star      | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:me=star
+x265-mer92     | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:merange=92
+x265-bf8       | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:bframes=8
+x265-la60      | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:rc-lookahead=60
+x265-rect      | -pix_fmt yuv420p10le -c:v libx265 -profile:v main10 -preset medium -crf 20 -x265-params log-level=error:keyint=600:min-keyint=60:aq-mode=3:no-sao=1:rect=1

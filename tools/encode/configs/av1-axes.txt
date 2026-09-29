@@ -1,0 +1,16 @@
+# SVT-AV1 4.2 per-axis sweep: each line changes one thing from av1-base.
+# Base = pass-1 settings (preset 6, no film grain) plus a 10 s GOP and scene-cut detection.
+av1-base       | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 30 -svtav1-params film-grain=0:keyint=600:scd=1
+# ffmpeg's libsvtav1 defaults to tune=1 (PSNR); 0 is the visual-quality tune
+av1-tune0      | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 30 -svtav1-params film-grain=0:keyint=600:scd=1:tune=0
+# Alt-ref temporal filter: prime suspect for smeared filaments during zooms
+av1-tf0        | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 30 -svtav1-params film-grain=0:keyint=600:scd=1:enable-tf=0
+av1-tfs1       | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 30 -svtav1-params film-grain=0:keyint=600:scd=1:tf-strength=1
+# Variance boost: more bits to flat, low-variance blocks (gradient banding)
+av1-vb         | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 30 -svtav1-params film-grain=0:keyint=600:scd=1:enable-variance-boost=1
+av1-vb3        | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 30 -svtav1-params film-grain=0:keyint=600:scd=1:enable-variance-boost=1:variance-boost-strength=3
+# Quantisation matrices, deblocking sharpness, AC bias (texture), overlays
+av1-qm         | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 30 -svtav1-params film-grain=0:keyint=600:scd=1:enable-qm=1:qm-min=0
+av1-sharp1     | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 30 -svtav1-params film-grain=0:keyint=600:scd=1:sharpness=1
+av1-acb1       | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 30 -svtav1-params film-grain=0:keyint=600:scd=1:ac-bias=1.0
+av1-ov1        | -pix_fmt yuv420p10le -c:v libsvtav1 -preset 6 -crf 30 -svtav1-params film-grain=0:keyint=600:scd=1:enable-overlays=1
