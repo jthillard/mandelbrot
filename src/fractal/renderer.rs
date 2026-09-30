@@ -16,6 +16,7 @@ use std::sync::Arc;
 use eframe::egui_wgpu;
 use wgpu::util::DeviceExt as _;
 
+use super::bla::BlaTable;
 use super::kind::FractalKind;
 use super::reference::RefOrbit;
 use crate::lights::{GpuLight, Light, MAX_LIGHT_COUNT, gpu_lights};
@@ -101,6 +102,9 @@ pub struct PipelineKey {
     /// Deep view: the delta starts out in rescaled (mantissa + exponent)
     /// form (`scale_exp != 0`).
     deep: bool,
+    /// BLA jumps (`bla::applies`; disabling BLA uploads an empty table
+    /// instead, see `BlaTable::empty`).
+    bla: bool,
 }
 
 impl PipelineKey {
@@ -111,16 +115,18 @@ impl PipelineKey {
             de: u.de_coloring != 0,
             morph: u.morph_w > 0.0,
             deep: u.scale_exp != 0,
+            bla: super::bla::applies(u),
         }
     }
 
-    fn constants(&self) -> [(&'static str, f64); 5] {
+    fn constants(&self) -> [(&'static str, f64); 6] {
         [
             ("KIND", self.kind as f64),
             ("IS_JULIA", self.julia as u32 as f64),
             ("DE", self.de as u32 as f64),
             ("MORPH", self.morph as u32 as f64),
             ("DEEP", self.deep as u32 as f64),
+            ("BLA", self.bla as u32 as f64),
         ]
     }
 }
@@ -769,6 +775,7 @@ struct CacheTarget {
 struct IterState {
     uniforms: Uniforms,
     generation: u64,
+    bla_generation: u64,
     width: u32,
     height: u32,
 }
@@ -780,6 +787,48 @@ struct ColorState {
     lights: [GpuLight; MAX_LIGHT_COUNT],
     width: u32,
     height: u32,
+}
+
+/// GPU copy of a [`BlaTable`] (bindings 4 and 5 of the iterate group).
+struct BlaBuffers {
+    nodes: wgpu::Buffer,
+    meta: wgpu::Buffer,
+}
+
+impl BlaBuffers {
+    /// Buffers holding exactly `table` (plus room to grow into, `min_*`).
+    fn new(device: &wgpu::Device, table: &BlaTable, min_nodes: usize, min_meta: usize) -> Self {
+        // Padded with zeros up to the requested capacity.
+        let init = |label, data: &[u8], size: usize| {
+            let mut bytes = data.to_vec();
+            bytes.resize(size.max(data.len()), 0);
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let node_size = std::mem::size_of::<super::bla::GpuBla>();
+        Self {
+            nodes: init(
+                "bla nodes",
+                bytemuck::cast_slice(&table.nodes),
+                min_nodes * node_size,
+            ),
+            meta: init("bla meta", bytemuck::cast_slice(&table.meta), min_meta * 4),
+        }
+    }
+
+    fn write(&self, queue: &wgpu::Queue, table: &BlaTable) {
+        queue.write_buffer(&self.nodes, 0, bytemuck::cast_slice(&table.nodes));
+        queue.write_buffer(&self.meta, 0, bytemuck::cast_slice(&table.meta));
+    }
+
+    fn fits(&self, table: &BlaTable) -> bool {
+        let node_size = std::mem::size_of::<super::bla::GpuBla>() as u64;
+        table.nodes.len() as u64 * node_size <= self.nodes.size()
+            && table.meta.len() as u64 * 4 <= self.meta.size()
+    }
 }
 
 pub struct FractalRenderer {
@@ -798,6 +847,9 @@ pub struct FractalRenderer {
     ref_exp_buffer: wgpu::Buffer,
     /// Points `ref_buffer` / `ref_exp_buffer` can hold (see `ensure_ref_capacity`).
     ref_capacity: usize,
+    bla: BlaBuffers,
+    /// Generation of the BLA table currently in `bla`.
+    uploaded_bla_generation: u64,
     lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     target_format: wgpu::TextureFormat,
@@ -851,6 +903,11 @@ impl FractalRenderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        self.rebuild_bind_group(device);
+        self.ref_capacity = capacity;
+    }
+
+    fn rebuild_bind_group(&mut self, device: &wgpu::Device) {
         self.bind_group = iterate_bind_group(
             device,
             &self.bind_group_layout,
@@ -858,8 +915,18 @@ impl FractalRenderer {
             &self.ref_buffer,
             &self.lights_buffer,
             &self.ref_exp_buffer,
+            &self.bla,
         );
-        self.ref_capacity = capacity;
+    }
+
+    /// Upload `table`, growing the BLA buffers (by powers of two) if needed.
+    fn upload_bla(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, table: &BlaTable) {
+        if self.bla.fits(table) {
+            self.bla.write(queue, table);
+            return;
+        }
+        self.bla = BlaBuffers::new(device, table, table.nodes.len().next_power_of_two(), 64);
+        self.rebuild_bind_group(device);
     }
 
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
@@ -956,9 +1023,31 @@ impl FractalRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // BLA table nodes / meta (`fractal::bla`).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
+        let bla = BlaBuffers::new(device, &BlaTable::empty(), 1 << 14, 64);
         let bind_group = iterate_bind_group(
             device,
             &bind_group_layout,
@@ -966,6 +1055,7 @@ impl FractalRenderer {
             &ref_buffer,
             &lights_buffer,
             &ref_exp_buffer,
+            &bla,
         );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1174,6 +1264,8 @@ impl FractalRenderer {
             ref_buffer,
             ref_exp_buffer,
             ref_capacity: INITIAL_REF_POINTS,
+            bla,
+            uploaded_bla_generation: u64::MAX,
             lights_buffer,
             bind_group,
             target_format,
@@ -1539,6 +1631,7 @@ impl ExportRender {
         height: u32,
         uniforms: Uniforms,
         reference: &RefOrbit,
+        bla: &BlaTable,
         lights: &[Light],
     ) -> Self {
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1582,6 +1675,8 @@ impl ExportRender {
         let (gpu_lights, _) = gpu_lights(lights);
         queue.write_buffer(&lights_buffer, 0, bytemuck::cast_slice(&gpu_lights));
 
+        let bla_buffers = BlaBuffers::new(device, bla, 0, 0);
+
         let target_format = handles.format;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("export bind group"),
@@ -1602,6 +1697,14 @@ impl ExportRender {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: ref_exp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: bla_buffers.nodes.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: bla_buffers.meta.as_entire_binding(),
                 },
             ],
         });
@@ -2129,6 +2232,7 @@ fn iterate_bind_group(
     ref_buffer: &wgpu::Buffer,
     lights_buffer: &wgpu::Buffer,
     ref_exp_buffer: &wgpu::Buffer,
+    bla: &BlaBuffers,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("fractal bind group"),
@@ -2149,6 +2253,14 @@ fn iterate_bind_group(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: ref_exp_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: bla.nodes.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: bla.meta.as_entire_binding(),
             },
         ],
     })
@@ -2304,6 +2416,10 @@ pub struct FractalCallback {
     pub lights: [GpuLight; MAX_LIGHT_COUNT],
     pub reference: Arc<RefOrbit>,
     pub generation: u64,
+    /// BLA table for `reference` and this view's `dc` range, and its
+    /// generation (bumped on every rebuild).
+    pub bla: Arc<BlaTable>,
+    pub bla_generation: u64,
     /// Widget size in physical pixels — the cache texture resolution.
     pub size_px: [u32; 2],
     /// Histogram each new iteration for the auto colour scale
@@ -2346,6 +2462,7 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
         // camera moves skip the perturbation entirely.
         let iter_dirty = renderer.iterated.as_ref().is_none_or(|r| {
             r.generation != self.generation
+                || r.bla_generation != self.bla_generation
                 || r.width != width
                 || r.height != height
                 || geom_differs(&r.uniforms, &self.uniforms)
@@ -2401,6 +2518,10 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
                 bytemuck::cast_slice(&self.reference.exps[..count]),
             );
             renderer.uploaded_generation = self.generation;
+        }
+        if iter_dirty && renderer.uploaded_bla_generation != self.bla_generation {
+            renderer.upload_bla(device, queue, &self.bla);
+            renderer.uploaded_bla_generation = self.bla_generation;
         }
 
         // Every pass reads the uniform buffer; refresh it once.
@@ -2510,6 +2631,7 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
             renderer.iterated = Some(IterState {
                 uniforms: self.uniforms,
                 generation: self.generation,
+                bla_generation: self.bla_generation,
                 width,
                 height,
             });

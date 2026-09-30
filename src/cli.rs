@@ -78,6 +78,11 @@ pub struct Cli {
     #[arg(long)]
     pub antialias: bool,
 
+    /// Disable bivariate linear approximation (BLA), i.e. iterate every
+    /// perturbation step (for A/B comparisons; much slower at deep zoom).
+    #[arg(long)]
+    pub no_bla: bool,
+
     /// Coloring palette index.
     #[arg(long, value_name = "INDEX")]
     pub palette: Option<u32>,

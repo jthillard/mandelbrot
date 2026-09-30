@@ -14,6 +14,7 @@ use std::sync::{Mutex, mpsc};
 
 use crate::app::{FractalApp, RefJob, parse_complex_pair, unix_timestamp};
 use crate::cli::Cli;
+use crate::fractal::bla;
 use crate::fractal::{
     ExportRender, FractalKind, FractalRenderer, PipelineKey, ShareState, encode_png,
     export_to_png_blocking, render_readback_blocking, unpad_rgba,
@@ -89,6 +90,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         height,
         uniforms,
         app.reference_points(),
+        &bla::for_uniforms(app.reference_points(), &uniforms, app.use_bla()),
         app.lights(),
     );
     if auto_color {
@@ -513,6 +515,9 @@ fn run_animation(
                 height,
                 uniforms,
                 app.reference_points(),
+                // Built here rather than in the orbit pool: it needs this
+                // frame's uniforms, and costs ~1 ms per 100k points.
+                &bla::for_uniforms(app.reference_points(), &uniforms, app.use_bla()),
                 app.lights(),
             );
             if auto_color {

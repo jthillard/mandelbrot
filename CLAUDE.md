@@ -45,7 +45,7 @@ Native CLI flags (`src/cli.rs`, applied in `FractalApp::apply_cli`): `--kind`,
 `--palette`, `--share <fragment>`,
 `--view re,im,half_height[,iterations]`, `--rendering-kind`,
 `--yaw`/`--pitch` (3D camera, degrees), `--de`, `--antialias` (2×2),
-`--auto-color-scale`, `--color-scale`, `--buddhabrot`,
+`--auto-color-scale`, `--color-scale`, `--no-bla`, `--buddhabrot`,
 `--buddha-palette`. `--headless` (`src/headless.rs`) skips the window
 entirely: it builds the same view from the other flags, creates its own
 offscreen wgpu device, and renders straight to a PNG (`--width`/`--height`,
@@ -245,6 +245,25 @@ pixel is a handful of `f32` complex multiplies.
   changing it. Known gaps: Lambda's critical point is 1/2, so its step keeps
   the input scale. Lambda set mode's reference sits at the origin, so it
   never reaches deep zooms anyway.
+- `src/fractal/bla.rs` — **bivariate linear approximation**: a table of
+  merged linear steps `e' = A·e + B·dc` (valid while `|e| < R`) built on
+  the CPU from the reference orbit, so the shader's `bla_lookup` jumps each
+  pixel over whole runs of steps. Plain Mandelbrot only (set + Julia, no
+  morph; `bla::applies`, the `BLA` override). This is what makes deep zoom
+  fast: every pixel follows the reference for tens of thousands of steps
+  before diverging (1e-200: 12.7 s → 0.7 s at 960×540). Level `l` node `i`
+  covers steps `1 + i·2^l ..`, and only levels ≥ 3 are uploaded (bindings 4/5,
+  `bla_meta` = `[min_level, levels, offsets…]`). Coefficients are
+  floatexp (f32 mantissa + i32 exponent), so a jump in the deep prologue
+  lands straight at its output scale. `R` depends on the view's largest
+  `|dc|` (`dc_max_log2`), so `FractalApp::bla_table` rebuilds on reference
+  change or when the dc range grows (or shrinks by `BLA_DC_SLACK` binades);
+  exports/headless build per frame via `bla::for_uniforms`. The table stops
+  before the reference crosses the pixel bailout, so a jump never skips an
+  escape. Measure `|e|` with `log2_mag`, never `log2(dot(e, e))`: a
+  2^-100 delta squares to 0 in f32 and passed every radius test.
+  `--no-bla` / the "Skip iterations (BLA)" checkbox upload an empty table
+  for A/B checks (it must render like `--no-bla` up to f32 noise).
 - `src/fractal/renderer.rs` — `FractalRenderer` (wgpu pipelines, uniform +
   storage buffers, bind groups), `Uniforms` (repr(C) layout that must match
   the WGSL `Uniforms` struct field-for-field, including padding; it includes

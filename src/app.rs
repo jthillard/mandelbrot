@@ -10,6 +10,7 @@ use glam::Vec4Swizzles;
 use crate::camera::Camera;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::cli::Cli;
+use crate::fractal::bla::{self, BlaTable};
 use crate::fractal::{
     BuddhabrotCallback, BuddhabrotRenderer, BuddhabrotUniforms, ExportRender, FractalCallback,
     FractalKind, FractalRenderer, MAX_REF_POINTS, RefOrbit, ShareState, Uniforms,
@@ -46,6 +47,19 @@ const MAX_EXPORT_DIM: u32 = 8192 * 16;
 /// Hard ceiling on the iteration count: the longest reference orbit the GPU
 /// buffer holds (past it, the shader would read pixels as escaped).
 const MAX_ITERATIONS: u32 = MAX_REF_POINTS as u32 - 1;
+
+/// Binades of dc range a BLA table may overcover before it's rebuilt for a
+/// zoomed-in view (it stays valid, but its radii shrink with dc_max).
+const BLA_DC_SLACK: i32 = 2;
+
+/// What the current BLA table was built for (see `FractalApp::bla_table`).
+#[derive(Clone, Copy, PartialEq)]
+struct BlaKey {
+    generation: u64,
+    on: bool,
+    julia: bool,
+    dc_log2: i32,
+}
 
 /// While the user is actively panning/zooming, the fractal is rendered into a
 /// cache texture downscaled by this factor per axis (and with AA forced off), so
@@ -528,6 +542,8 @@ pub struct FractalApp {
     shadow_palette: u32,
     /// Supersample each pixel 2×2 for smoother edges (costs ~4× fragment work).
     antialias: bool,
+    /// Skip perturbation steps with the BLA table (`fractal::bla`).
+    use_bla: bool,
     /// Distance-estimation shading: darkens toward the set boundary using the
     /// orbit derivative, giving crisp filaments at deep zoom instead of speckle.
     de_coloring: bool,
@@ -582,6 +598,11 @@ pub struct FractalApp {
     reference: Arc<RefOrbit>,
     /// Bumped whenever `reference` is replaced, so the GPU re-uploads it.
     generation: u64,
+    /// BLA table for `reference` (see `bla_table`), what it was built for,
+    /// and its own generation for the GPU upload.
+    bla: Arc<BlaTable>,
+    bla_key: Option<BlaKey>,
+    bla_generation: u64,
     /// Center + zoom the current `reference` was computed at (may differ
     /// slightly from the live view; the shader compensates via `dc_offset`).
     ref_center_re: Big,
@@ -728,6 +749,7 @@ impl FractalApp {
             palette: 0,
             shadow_palette: 0,
             antialias: false,
+            use_bla: true,
             de_coloring: false,
             rendering_mode: 0,
             lights: vec![Light::default()],
@@ -748,6 +770,9 @@ impl FractalApp {
             fps_window_start: 0.0,
             reference: Arc::new(RefOrbit::default()),
             generation: 0,
+            bla: Arc::new(BlaTable::empty()),
+            bla_key: None,
+            bla_generation: 0,
             ref_center_re,
             ref_center_im,
             ref_half_height,
@@ -865,6 +890,9 @@ impl FractalApp {
         }
         if cli.antialias {
             self.antialias = true;
+        }
+        if cli.no_bla {
+            self.use_bla = false;
         }
         if cli.buddhabrot {
             self.mode = FractalMode::Buddhabrot;
@@ -1263,6 +1291,39 @@ impl FractalApp {
         &self.reference
     }
 
+    /// Whether BLA is on (headless builds its own tables per frame).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn use_bla(&self) -> bool {
+        self.use_bla
+    }
+
+    /// The BLA table for rendering `u` from the current reference, rebuilt
+    /// when the reference changed or the view's dc range left what the table
+    /// covers. A table built for a larger dc range is still valid, just
+    /// jumps less, so zooming in only rebuilds every `BLA_DC_SLACK` binades.
+    fn bla_table(&mut self, u: &Uniforms) -> Arc<BlaTable> {
+        let want = BlaKey {
+            generation: self.generation,
+            on: self.use_bla && bla::applies(u),
+            julia: u.is_julia != 0,
+            dc_log2: bla::dc_max_log2(u),
+        };
+        let fresh = self.bla_key.as_ref().is_some_and(|k| {
+            k.generation == want.generation
+                && k.on == want.on
+                && k.julia == want.julia
+                && (!want.on
+                    || want.julia
+                    || (want.dc_log2 <= k.dc_log2 && want.dc_log2 + BLA_DC_SLACK >= k.dc_log2))
+        });
+        if !fresh {
+            self.bla = Arc::new(bla::for_uniforms(&self.reference, u, self.use_bla));
+            self.bla_key = Some(want);
+            self.bla_generation = self.bla_generation.wrapping_add(1);
+        }
+        Arc::clone(&self.bla)
+    }
+
     /// The configured shadow-style lights, for headless export's `ExportRender`
     /// (which has no `FractalCallback` to source them from).
     #[cfg(not(target_arch = "wasm32"))]
@@ -1632,6 +1693,7 @@ impl FractalApp {
             renderer.export_handles(&device, &uniforms, false)
         };
         let reference = Arc::clone(&self.reference);
+        let use_bla = self.use_bla;
         let lights = self.lights.clone();
 
         let shared = Arc::new(Mutex::new(ExportShared {
@@ -1649,8 +1711,9 @@ impl FractalApp {
                 .clone()
                 .unwrap_or_else(|| format!("fractal-{}.png", unix_timestamp()));
             std::thread::spawn(move || {
+                let bla = bla::for_uniforms(&reference, &uniforms, use_bla);
                 let er = ExportRender::new(
-                    &device, &queue, &handles, w, h, uniforms, &reference, &lights,
+                    &device, &queue, &handles, w, h, uniforms, &reference, &bla, &lights,
                 );
                 let sh = Arc::clone(&shared);
                 let png =
@@ -1670,8 +1733,9 @@ impl FractalApp {
             // Progress budget: rendering fills [0, RENDER_END], encoding the rest.
             const RENDER_END: f32 = 0.6;
             wasm_bindgen_futures::spawn_local(async move {
+                let bla = bla::for_uniforms(&reference, &uniforms, use_bla);
                 let er = ExportRender::new(
-                    &device, &queue, &handles, w, h, uniforms, &reference, &lights,
+                    &device, &queue, &handles, w, h, uniforms, &reference, &bla, &lights,
                 );
 
                 // Render tile by tile, awaiting each submission so the browser
@@ -2373,6 +2437,11 @@ impl FractalApp {
         }
         ui.checkbox(&mut self.antialias, "Antialiasing (2×2)")
             .on_hover_text("Supersample each pixel for smoother edges (~4× slower).");
+        ui.checkbox(&mut self.use_bla, "Skip iterations (BLA)")
+            .on_hover_text(
+                "Bivariate linear approximation: jump over runs of iterations where \
+             every pixel follows the reference linearly. Much faster at deep zoom.",
+            );
         if self.rendering_mode == 0 {
             ui.checkbox(&mut self.de_coloring, "Distance shading")
                 .on_hover_text(
@@ -3058,6 +3127,7 @@ impl FractalApp {
         if interacting || self.morph.is_some() || self.ref_morph.is_some() {
             uniforms.aa_level = 1;
         }
+        let bla = self.bla_table(&uniforms);
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
             FractalCallback {
@@ -3065,6 +3135,8 @@ impl FractalApp {
                 lights: gpu_lights(&self.lights).0,
                 reference: Arc::clone(&self.reference),
                 generation: self.generation,
+                bla,
+                bla_generation: self.bla_generation,
                 size_px,
                 auto_color: self.auto_color_active(),
             },

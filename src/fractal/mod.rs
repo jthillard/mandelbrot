@@ -1,6 +1,7 @@
 //! GPU fractal rendering: wgpu pipeline, uniforms, reference orbit, and the
 //! egui paint callback.
 
+pub mod bla;
 pub mod buddhabrot;
 pub mod kind;
 pub mod reference;

@@ -30,6 +30,21 @@
 // f32's range, which only deep references contain; only `DEEP` pipelines read
 // it (see `ref_at`).
 @group(0) @binding(3) var<storage, read> ref_exp: array<i32>;
+// Bivariate linear approximation table (`fractal::bla`): node i of level l
+// maps the delta at reference step 1 + i·2^l to the one 2^l steps later as
+// e' = A·e + B·dc, valid while log2|e| < r_log2. `bla_meta` is
+// [min_level, level_count, off_0, ..., off_{level_count}]; only `BLA`
+// pipelines read either.
+struct Bla {
+    a: vec2<f32>,
+    b: vec2<f32>,
+    a_exp: i32,
+    b_exp: i32,
+    r_log2: f32,
+    _pad: u32,
+};
+@group(0) @binding(4) var<storage, read> bla_nodes: array<Bla>;
+@group(0) @binding(5) var<storage, read> bla_meta: array<u32>;
 
 // Pipeline-overridable specialization constants, set per pipeline from the
 // uniforms' `kind` / `is_julia` / `de_coloring` (see `PipelineKey` in
@@ -49,6 +64,9 @@ override MORPH: bool = false;
 // and `u.span` / `u.dc_offset` are all in units of 2^scale_exp, and each pixel
 // starts in the rescaled deep phase (see `iterate_sample`).
 override DEEP: bool = false;
+// Jump over runs of reference steps with the BLA table (plain Mandelbrot,
+// no morph; see `bla_lookup`).
+override BLA: bool = false;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -578,6 +596,49 @@ const DEEP_RENORM_LOG2: i32 = 16;
 // binades above the delta's scale (|w| < 2^DEEP_RENORM_LOG2).
 const DEEP_NEAR_LOG2: i32 = 24;
 
+// log2|v|, from above (|v| <= sqrt(2)·max component). Not via dot(v, v):
+// a delta ~2^-100 (a pixel offset at 1e-30 zoom) squares below f32's range,
+// and log2(0) = -inf passed every radius test, jumping pixels far too early.
+fn log2_mag(v: vec2<f32>) -> f32 {
+    return log2(max(abs(v.x), abs(v.y))) + 0.5;
+}
+
+// Longest BLA jump available at reference index `m` for a delta of
+// log2 magnitude `e_log2`, of at most `budget` steps: (node index, steps),
+// steps = 0 when there's none. Nodes start at 1 + i·2^l, so level l needs
+// m - 1 aligned to 2^l. A longer run's radius is never larger than its first
+// half's, so the search goes up from the shortest and stops at the first
+// invalid level (usually right away: one load per failed attempt).
+fn bla_lookup(m: u32, e_log2: f32, budget: u32) -> vec2<u32> {
+    var best = vec2<u32>(0u, 0u);
+    let levels = bla_meta[1];
+    if levels == 0u || m == 0u {
+        return best;
+    }
+    let lmin = bla_meta[0];
+    let j = m - 1u;
+    let tz = countTrailingZeros(j); // 32 when j == 0
+    if tz < lmin {
+        return best;
+    }
+    let top = min(tz - lmin, levels - 1u);
+    for (var k: u32 = 0u; k <= top; k = k + 1u) {
+        let l = lmin + k;
+        let steps = 1u << l;
+        let base = bla_meta[2u + k];
+        let local = j >> l;
+        if steps > budget || local >= bla_meta[3u + k] - base {
+            break;
+        }
+        let idx = base + local;
+        if !(e_log2 < bla_nodes[idx].r_log2) {
+            break;
+        }
+        best = vec2<u32>(idx, steps);
+    }
+    return best;
+}
+
 // Weight of the Phoenix kind's p*z_{n-1} term in the current map: 1 for plain
 // Phoenix, its morph share while switching to/from Phoenix, else 0.
 fn phoenix_weight() -> f32 {
@@ -792,6 +853,47 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
                 break;
             }
 
+            // BLA: jump the whole run the table covers, straight to its
+            // output scale (usually many binades up, towards the f32 hand-off).
+            var jumped = false;
+            if BLA {
+                let e_log2 = f32(sx) + log2_mag(w);
+                let hit = bla_lookup(m, e_log2, min(max_iter - n, ref_len - 1u - m));
+                if hit.y != 0u {
+                    let nd = bla_nodes[hit.x];
+                    if DE {
+                        var accv = fe_make(cmul(nd.a, v), nd.a_exp + sv);
+                        if !IS_JULIA {
+                            accv = fe_add(accv, fe_make(nd.b * px, nd.b_exp + scale_e));
+                        }
+                        v = accv.m;
+                        if accv.m.x != 0.0 || accv.m.y != 0.0 {
+                            sv = accv.e;
+                            if !IS_JULIA {
+                                pd = ldexp_sat(px, scale_e - sv);
+                            }
+                        }
+                    }
+                    var acc = fe_make(cmul(nd.a, w), nd.a_exp + sx);
+                    if !IS_JULIA {
+                        acc = fe_add(acc, fe_make(cmul(nd.b, offset), nd.b_exp + scale_e));
+                    }
+                    w = acc.m;
+                    if acc.m.x != 0.0 || acc.m.y != 0.0 {
+                        sx = acc.e;
+                        sc = ldexp_sat(1.0, sx);
+                        if !IS_JULIA {
+                            d = ldexp2_sat(offset, scale_e - sx);
+                        }
+                    }
+                    w_old = w;
+                    m = m + hit.y;
+                    n = n + hit.y;
+                    jumped = true;
+                }
+            }
+
+            if !jumped {
             if DE {
                 let fp = deep_fprime(xf, w, sx, yt);
                 if fp.e == 0 {
@@ -873,6 +975,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
             }
             m = m + 1u;
             n = n + 1u;
+            }
 
             if m >= ref_len {
                 escaped = true; // see the f32 loop's reference-exhausted case
@@ -994,6 +1097,43 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         // which only re-expresses the same value). Only when DE is enabled.
         // Phoenix's two-term map adds p·dz_{n-1} and carries the previous dz.
         // f'(z) of this step, shared by DE and the periodicity multiplier.
+        // BLA jump (see the deep phase). dc and px are taken unscaled from
+        // `offset`/`px`: at depth `step_add`/`px_t` have flushed to 0, but
+        // B·dc hasn't. The skipped steps' |f'|^2 product is |A|^2. No
+        // skipped iterate can be the window's closest to the critical point:
+        // a run's radius is below ε·|X| for every X in it.
+        let e_old = e;
+        let z_old = z;
+        var jumped = false;
+        if BLA && m != 0u {
+            let hit = bla_lookup(m, log2_mag(e), min(max_iter - n, ref_len - 1u - m));
+            if hit.y != 0u {
+                let nd = bla_nodes[hit.x];
+                let se = select(0, u.scale_exp, DEEP);
+                if periodic {
+                    let a2 = ldexp_sat(dot(nd.a, nd.a), 2 * nd.a_exp);
+                    mult2 = mult2 * a2;
+                    mult2_cand = mult2_cand * a2;
+                }
+                if DE {
+                    var dn = ldexp2_sat(cmul(nd.a, dzs), nd.a_exp);
+                    if !IS_JULIA {
+                        dn = dn + ldexp2_sat(nd.b * px, nd.b_exp + se);
+                    }
+                    dzs = dn;
+                }
+                var en = ldexp2_sat(cmul(nd.a, e), nd.a_exp);
+                if !IS_JULIA {
+                    en = en + ldexp2_sat(cmul(nd.b, offset), nd.b_exp + se);
+                }
+                e = en;
+                m = m + hit.y;
+                n = n + hit.y;
+                jumped = true;
+            }
+        }
+
+        if !jumped {
         var fp = vec2<f32>(0.0, 0.0);
         if DE || periodic {
             fp = fprime(z);
@@ -1017,8 +1157,6 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
 
         // Advance the delta by this fractal's formula (+ dc for the set plane).
         // Phoenix additionally adds p·e_{n-1} and carries the previous delta.
-        let e_old = e;
-        let z_old = z;
         e = advance_delta(xm, e) + step_add;
         if phoenix_w > 0.0 {
             e = e + phoenix_w * cmul(u.phoenix_p, e_prev);
@@ -1026,6 +1164,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         }
         m = m + 1u;
         n = n + 1u;
+        }
 
         // Keep the reference index valid and the delta small.
         if m >= ref_len {
@@ -1069,7 +1208,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
                 z_cand = z;
                 mult2_cand = 1.0;
             }
-            if n == check_at {
+            if n >= check_at {
                 if !period_hit {
                     period_streak = 0u;
                 }
@@ -1077,7 +1216,10 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
                 z_saved = z_cand;
                 mult2 = mult2_cand;
                 cand_d2 = 3.0e38;
-                check_at = check_at * 2u;
+                // (A BLA jump can pass several window ends at once.)
+                while check_at <= n {
+                    check_at = check_at * 2u;
+                }
             }
         }
     }
