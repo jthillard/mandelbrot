@@ -880,6 +880,8 @@ pub struct FractalRenderer {
     colored: Option<ColorState>,
     /// Auto colour scale's `ci` histogram + readback.
     ci_stats: CiStats,
+    /// Measured iterate / refine cost, for sizing their bands.
+    timing: PassTiming,
 }
 
 impl FractalRenderer {
@@ -1282,6 +1284,7 @@ impl FractalRenderer {
             iterated: None,
             colored: None,
             ci_stats: CiStats::new(CiHistogram::new(device), device),
+            timing: PassTiming::default(),
         }
     }
 
@@ -1593,8 +1596,8 @@ struct RaymarchExport {
 /// A self-contained render of one export image. It owns its own uniform and
 /// reference buffers (a snapshot of the view at export time), so it is unaffected
 /// by panning/zooming on the main thread, and can run on a background thread.
-/// The image is rendered in horizontal tiles so progress can be reported as the
-/// GPU works through it.
+/// The image is rendered in horizontal bands (sized by [`BandSizer`]) so
+/// progress can be reported as the GPU works through it.
 pub struct ExportRender {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
@@ -1605,8 +1608,8 @@ pub struct ExportRender {
     pub padded_bpr: u32,
     pub width: u32,
     pub height: u32,
-    /// Number of horizontal tiles the render is split into.
-    pub tiles: u32,
+    /// Height of the first band, before timings refine it.
+    first_band_rows: u32,
     pub swap_rb: bool,
     /// 3D mode or the distance field: tiles fill a data texture instead of
     /// the target.
@@ -1821,7 +1824,7 @@ impl ExportRender {
             padded_bpr,
             width,
             height,
-            tiles,
+            first_band_rows: height.div_ceil(tiles),
             swap_rb,
             raymarch,
             uniform_buffer,
@@ -1914,25 +1917,27 @@ impl ExportRender {
         range
     }
 
-    /// Pixel row range `[y0, y1)` covered by tile `t`.
-    fn tile_rows(&self, t: u32) -> (u32, u32) {
-        let band = self.height.div_ceil(self.tiles);
-        let y0 = (t * band).min(self.height);
-        let y1 = (y0 + band).min(self.height);
-        (y0, y1)
+    /// Band sizing for rendering this export, starting at the worst-case
+    /// height; feed it each band's GPU time ([`BandSizer::observe`]).
+    pub fn band_sizer(&self) -> BandSizer {
+        let rows = self.first_band_rows.max(1);
+        BandSizer {
+            rows,
+            min_rows: rows,
+        }
     }
 
-    /// Render one horizontal tile into the export texture and submit it. Tile 0
-    /// clears the whole attachment; later tiles preserve earlier ones. In 3D
-    /// mode (or with the distance field) the tiles iterate into the data
-    /// texture instead, and the last one also runs the whole-image refine,
-    /// distance-field and colourise passes.
-    pub fn render_tile(&self, device: &wgpu::Device, queue: &wgpu::Queue, t: u32) {
-        let (y0, y1) = self.tile_rows(t);
+    /// Render rows `[y0, y1)` into the export texture and submit them. The
+    /// band at row 0 clears the whole attachment; later ones preserve earlier
+    /// ones. In 3D mode (or with the distance field) the bands iterate into
+    /// the data texture instead, and the one reaching the bottom also runs the
+    /// whole-image refine, distance-field and colourise passes.
+    pub fn render_band(&self, device: &wgpu::Device, queue: &wgpu::Queue, y0: u32, y1: u32) {
+        let y1 = y1.min(self.height);
         if y1 <= y0 {
             return;
         }
-        let load = if t == 0 {
+        let load = if y0 == 0 {
             wgpu::LoadOp::Clear(wgpu::Color::BLACK)
         } else {
             wgpu::LoadOp::Load
@@ -2030,7 +2035,32 @@ impl ExportRender {
     }
 }
 
-/// Render `er` tile by tile (blocking on the GPU after each tile so progress
+/// Render every band of `er`, blocking on the GPU after each one to time it
+/// (see [`BandSizer`]) and report the fraction of rows done.
+#[cfg(not(target_arch = "wasm32"))]
+fn render_bands_blocking(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    er: &ExportRender,
+    mut on_progress: impl FnMut(f32),
+) {
+    let mut sizer = er.band_sizer();
+    let mut y0 = 0;
+    while y0 < er.height {
+        let y1 = (y0 + sizer.rows()).min(er.height);
+        let start = std::time::Instant::now();
+        er.render_band(device, queue, y0, y1);
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        sizer.observe(y1 - y0, start.elapsed().as_secs_f64());
+        y0 = y1;
+        on_progress(y0 as f32 / er.height as f32);
+    }
+}
+
+/// Render `er` band by band (blocking on the GPU after each band so progress
 /// reflects real work), read it back, and encode the result as PNG bytes.
 /// Blocks the calling thread throughout, so it's only for native targets:
 /// the UI export path runs it on a background thread, headless rendering
@@ -2045,15 +2075,9 @@ pub fn export_to_png_blocking(
     // Progress budget: rendering fills [0, RENDER_END], encoding the rest.
     const RENDER_END: f32 = 0.6;
 
-    for t in 0..er.tiles {
-        er.render_tile(device, queue, t);
-        let _ = device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        let done = (t + 1) as f32 / er.tiles as f32;
-        on_progress("Rendering", RENDER_END * done);
-    }
+    render_bands_blocking(device, queue, er, |done| {
+        on_progress("Rendering", RENDER_END * done)
+    });
     er.copy_to_readback(device, queue);
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2083,8 +2107,7 @@ pub fn export_to_png_blocking(
     png
 }
 
-/// Render every tile of `er` in one go (no per-tile GPU stall, unlike
-/// [`export_to_png_blocking`]), read it back, and return a copy of the padded
+/// Render every band of `er`, read it back, and return a copy of the padded
 /// readback bytes (`er.padded_bpr` per row) for [`encode_png`]. Used by the
 /// headless animation pipeline, which encodes on other threads.
 #[cfg(not(target_arch = "wasm32"))]
@@ -2093,9 +2116,7 @@ pub fn render_readback_blocking(
     queue: &wgpu::Queue,
     er: &ExportRender,
 ) -> Vec<u8> {
-    for t in 0..er.tiles {
-        er.render_tile(device, queue, t);
-    }
+    render_bands_blocking(device, queue, er, |_| {});
     er.copy_to_readback(device, queue);
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2366,6 +2387,105 @@ fn band_count(width: u32, height: u32, max_iter: u32, samples: u32) -> u32 {
     ((work / WORK_PER_SUBMIT).ceil() as u32).clamp(1, height.max(1))
 }
 
+/// GPU time aimed for per band once real timings replace [`band_count`]'s
+/// bound. That bound assumes every sample runs `max_iter` iterations, but BLA
+/// and periodicity detection make most pixels far cheaper: at 1e-200 (~180k
+/// iterations) it cut a 1080p AA export into 1080 one-row submissions, too
+/// few pixels each to fill the GPU, ~14× slower than needed. Well under the
+/// ~640 ms i915 reset.
+#[cfg(not(target_arch = "wasm32"))]
+const BAND_TARGET_SECS: f64 = 0.05;
+
+/// Band height for a banded render that times its bands as it goes (export).
+/// Starts at [`band_count`]'s safe height, then follows the measured cost per
+/// row, growing at most 2× per band since density varies across the image.
+/// Never below the safe height: that already bounds the worst case, and
+/// thinner bands just underfill the GPU (1-row bands made a `--no-bla`
+/// 1e-200 export ~4× slower).
+#[derive(Clone, Copy, Debug)]
+pub struct BandSizer {
+    rows: u32,
+    min_rows: u32,
+}
+
+impl BandSizer {
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    /// Feed back that the last band, of `rows` rows, took `secs` on the GPU.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn observe(&mut self, rows: u32, secs: f64) {
+        let ideal = rows as f64 * BAND_TARGET_SECS / secs.max(1e-5);
+        self.rows = (ideal as u32).clamp(
+            self.min_rows,
+            self.rows.saturating_mul(2).max(self.min_rows),
+        );
+    }
+}
+
+/// Measured GPU cost per pixel of the interactive iterate / refine passes,
+/// so their bands are sized from the previous render instead of the
+/// worst-case bound. Timed natively through `on_submitted_work_done` (an
+/// overestimate when the queue was busy, which only errs towards more
+/// bands); on the web there's no `Instant` and bands stay worst-case.
+#[derive(Default)]
+struct PassTiming {
+    /// Pipeline the costs were measured with; a different one resets them.
+    key: Option<PipelineKey>,
+    /// Seconds per pixel of the [iterate, refine] passes.
+    #[cfg(not(target_arch = "wasm32"))]
+    secs_per_px: [Option<f64>; 2],
+    /// Completion times of the last timed render, filled in by callbacks:
+    /// [start, iterate done, refine done], and its pixel count.
+    #[cfg(not(target_arch = "wasm32"))]
+    pending: Arc<std::sync::Mutex<PendingTiming>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct PendingTiming {
+    start: Option<std::time::Instant>,
+    iterate: Option<std::time::Instant>,
+    refine: Option<std::time::Instant>,
+    pixels: f64,
+    refined: bool,
+}
+
+impl PassTiming {
+    /// Take in the last render's timings, if they've all arrived.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn collect(&mut self) {
+        let Ok(mut p) = self.pending.try_lock() else {
+            return;
+        };
+        let (Some(start), Some(it)) = (p.start, p.iterate) else {
+            return;
+        };
+        if p.refined && p.refine.is_none() {
+            return;
+        }
+        let px = p.pixels.max(1.0);
+        self.secs_per_px[0] = Some((it - start).as_secs_f64() / px);
+        if let Some(r) = p.refine {
+            self.secs_per_px[1] = Some((r - it).as_secs_f64() / px);
+        }
+        *p = PendingTiming::default();
+    }
+
+    /// Bands for pass `pass` (0 iterate, 1 refine): from the measured cost
+    /// when there is one, never more than the worst-case `bound`.
+    fn bands(&self, pass: usize, width: u32, height: u32, bound: u32) -> u32 {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(c) = self.secs_per_px[pass] {
+            let secs = c * width as f64 * height as f64;
+            return ((secs / BAND_TARGET_SECS).ceil() as u32).clamp(1, bound);
+        }
+        let _ = (pass, width, height);
+        bound
+    }
+}
+
 /// [`data_pass`] split into `bands` row bands. One band is recorded into
 /// `encoder` as usual; more are each submitted on their own right away (so
 /// they run before `encoder`, which is submitted later and reads the result).
@@ -2565,7 +2685,33 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
         if let Some(cache) = &renderer.cache {
             if iter_dirty {
                 let max_iter = self.uniforms.max_iter;
+                let key = PipelineKey::from_uniforms(&self.uniforms);
+                let timing = &mut renderer.timing;
+                if timing.key != Some(key) {
+                    *timing = PassTiming {
+                        key: Some(key),
+                        ..Default::default()
+                    };
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let timed = {
+                    timing.collect();
+                    // Time this render unless the last one is still in flight.
+                    let mut p = timing.pending.lock().unwrap();
+                    let idle = p.start.is_none();
+                    if idle {
+                        p.pixels = width as f64 * height as f64;
+                        p.refined = cache.aa.is_some();
+                        p.start = Some(std::time::Instant::now());
+                    }
+                    idle
+                };
                 // Iteration pass: 1-spp perturbation iterate → data texture.
+                // Timed passes always submit their own bands, so the
+                // completion callback can follow them.
+                let bands = timing.bands(0, width, height, band_count(width, height, max_iter, 1));
+                #[cfg(not(target_arch = "wasm32"))]
+                let bands = if timed { bands.max(2) } else { bands };
                 banded_data_pass(
                     device,
                     queue,
@@ -2575,11 +2721,22 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
                     &pipelines.iterate,
                     &[&renderer.bind_group],
                     [width, height],
-                    band_count(width, height, max_iter, 1),
+                    bands,
                 );
+                #[cfg(not(target_arch = "wasm32"))]
+                if timed {
+                    let p = Arc::clone(&timing.pending);
+                    queue.on_submitted_work_done(move || {
+                        p.lock().unwrap().iterate = Some(std::time::Instant::now());
+                    });
+                }
                 if let Some((data_aa_view, _)) = &cache.aa {
                     // Adaptive AA: supersample only the non-smooth pixels.
                     let aa = self.uniforms.aa_level;
+                    let bound = band_count(width, height, max_iter, aa * aa);
+                    let bands = timing.bands(1, width, height, bound);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let bands = if timed { bands.max(2) } else { bands };
                     banded_data_pass(
                         device,
                         queue,
@@ -2589,8 +2746,15 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
                         &pipelines.refine,
                         &[&renderer.bind_group, &cache.refine_bind_group],
                         [width, height],
-                        band_count(width, height, max_iter, aa * aa),
+                        bands,
                     );
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if timed {
+                        let p = Arc::clone(&timing.pending);
+                        queue.on_submitted_work_done(move || {
+                            p.lock().unwrap().refine = Some(std::time::Instant::now());
+                        });
+                    }
                 }
                 if wants_stats {
                     let src = cache.aa.as_ref().map_or(&cache.data_view, |(v, _)| v);

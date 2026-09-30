@@ -1741,16 +1741,18 @@ impl FractalApp {
                     &device, &queue, &handles, w, h, uniforms, &reference, &bla, &lights,
                 );
 
-                // Render tile by tile, awaiting each submission so the browser
-                // executes it and the UI can repaint between tiles.
-                for t in 0..er.tiles {
-                    er.render_tile(&device, &queue, t);
+                // Render band by band, awaiting each submission so the browser
+                // executes it and the UI can repaint between bands. (No
+                // `Instant` here to time them, so bands keep the safe height.)
+                let rows = er.band_sizer().rows();
+                for y0 in (0..er.height).step_by(rows as usize) {
+                    er.render_band(&device, &queue, y0, y0 + rows);
                     let (tx, rx) = futures_channel::oneshot::channel();
                     queue.on_submitted_work_done(move || {
                         let _ = tx.send(());
                     });
                     let _ = rx.await;
-                    let done = (t + 1) as f32 / er.tiles as f32;
+                    let done = (y0 + rows).min(er.height) as f32 / er.height as f32;
                     set_progress(&shared, "Rendering", RENDER_END * done);
                 }
                 er.copy_to_readback(&device, &queue);
