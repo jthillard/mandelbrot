@@ -86,8 +86,8 @@ fn mandelbrot_shader_specializations_compile() {
             for de in [0.0, 1.0] {
                 for morph in [0.0, 1.0] {
                     for deep in [0.0, 1.0] {
-                        // BLA only exists for plain Mandelbrot (`bla::supported`).
-                        let blas: &[f64] = if kind == 0 && morph == 0.0 {
+                        // BLA: every kind but Phoenix (7), no morph (`bla::applies`).
+                        let blas: &[f64] = if kind != 7 && morph == 0.0 {
                             &[0.0, 1.0]
                         } else {
                             &[0.0]

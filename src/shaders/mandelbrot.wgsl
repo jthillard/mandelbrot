@@ -32,14 +32,16 @@
 @group(0) @binding(3) var<storage, read> ref_exp: array<i32>;
 // Bivariate linear approximation table (`fractal::bla`): node i of level l
 // maps the delta at reference step 1 + i·2^l to the one 2^l steps later as
-// e' = A·e + B·dc, valid while log2|e| < r_log2. `bla_meta` is
+// e' = M·e + N·dc, valid while log2|e| < r_log2. M = m·2^m_exp and
+// N = n·2^n_exp are real 2x2 matrices, row-major (the Jacobian of the map,
+// so the abs/conjugate kinds are covered too). `bla_meta` is
 // [min_level, level_count, off_0, ..., off_{level_count}]; only `BLA`
 // pipelines read either.
 struct Bla {
-    a: vec2<f32>,
-    b: vec2<f32>,
-    a_exp: i32,
-    b_exp: i32,
+    m: vec4<f32>,
+    n: vec4<f32>,
+    m_exp: i32,
+    n_exp: i32,
     r_log2: f32,
     _pad: u32,
 };
@@ -64,8 +66,8 @@ override MORPH: bool = false;
 // and `u.span` / `u.dc_offset` are all in units of 2^scale_exp, and each pixel
 // starts in the rescaled deep phase (see `iterate_sample`).
 override DEEP: bool = false;
-// Jump over runs of reference steps with the BLA table (plain Mandelbrot,
-// no morph; see `bla_lookup`).
+// Jump over runs of reference steps with the BLA table (every kind but
+// Phoenix, no morph; see `bla_lookup`).
 override BLA: bool = false;
 
 struct VsOut {
@@ -596,6 +598,11 @@ const DEEP_RENORM_LOG2: i32 = 16;
 // binades above the delta's scale (|w| < 2^DEEP_RENORM_LOG2).
 const DEEP_NEAR_LOG2: i32 = 24;
 
+// Row-major 2x2 matrix times vector (a BLA node's M or N).
+fn mat2v(m: vec4<f32>, v: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(dot(m.xy, v), dot(m.zw, v));
+}
+
 // log2|v|, from above (|v| <= sqrt(2)·max component). Not via dot(v, v):
 // a delta ~2^-100 (a pixel offset at 1e-30 zoom) squares below f32's range,
 // and log2(0) = -inf passed every radius test, jumping pixels far too early.
@@ -862,9 +869,9 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
                 if hit.y != 0u {
                     let nd = bla_nodes[hit.x];
                     if DE {
-                        var accv = fe_make(cmul(nd.a, v), nd.a_exp + sv);
+                        var accv = fe_make(mat2v(nd.m, v), nd.m_exp + sv);
                         if !IS_JULIA {
-                            accv = fe_add(accv, fe_make(nd.b * px, nd.b_exp + scale_e));
+                            accv = fe_add(accv, fe_make(mat2v(nd.n, vec2<f32>(px, 0.0)), nd.n_exp + scale_e));
                         }
                         v = accv.m;
                         if accv.m.x != 0.0 || accv.m.y != 0.0 {
@@ -874,9 +881,9 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
                             }
                         }
                     }
-                    var acc = fe_make(cmul(nd.a, w), nd.a_exp + sx);
+                    var acc = fe_make(mat2v(nd.m, w), nd.m_exp + sx);
                     if !IS_JULIA {
-                        acc = fe_add(acc, fe_make(cmul(nd.b, offset), nd.b_exp + scale_e));
+                        acc = fe_add(acc, fe_make(mat2v(nd.n, offset), nd.n_exp + scale_e));
                     }
                     w = acc.m;
                     if acc.m.x != 0.0 || acc.m.y != 0.0 {
@@ -1099,9 +1106,14 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         // f'(z) of this step, shared by DE and the periodicity multiplier.
         // BLA jump (see the deep phase). dc and px are taken unscaled from
         // `offset`/`px`: at depth `step_add`/`px_t` have flushed to 0, but
-        // B·dc hasn't. The skipped steps' |f'|^2 product is |A|^2. No
-        // skipped iterate can be the window's closest to the critical point:
-        // a run's radius is below ε·|X| for every X in it.
+        // N·dc hasn't. The skipped steps' |f'|^2 product is |det M| (the
+        // steps are conformal, or folds of conformal maps). No skipped
+        // iterate can be the window's closest to the critical point: a run's
+        // radius is below ε·|X| for every X in it.
+        //
+        // With DE, dzs goes through M, the map's true Jacobian, where the
+        // plain loop multiplies by `fprime` (|2Z| for the abs kinds): same
+        // magnitude, since the folds are isometries.
         let e_old = e;
         let z_old = z;
         var jumped = false;
@@ -1111,20 +1123,21 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
                 let nd = bla_nodes[hit.x];
                 let se = select(0, u.scale_exp, DEEP);
                 if periodic {
-                    let a2 = ldexp_sat(dot(nd.a, nd.a), 2 * nd.a_exp);
+                    let det = abs(nd.m.x * nd.m.w - nd.m.y * nd.m.z);
+                    let a2 = ldexp_sat(det, 2 * nd.m_exp);
                     mult2 = mult2 * a2;
                     mult2_cand = mult2_cand * a2;
                 }
                 if DE {
-                    var dn = ldexp2_sat(cmul(nd.a, dzs), nd.a_exp);
+                    var dn = ldexp2_sat(mat2v(nd.m, dzs), nd.m_exp);
                     if !IS_JULIA {
-                        dn = dn + ldexp2_sat(nd.b * px, nd.b_exp + se);
+                        dn = dn + ldexp2_sat(mat2v(nd.n, vec2<f32>(px, 0.0)), nd.n_exp + se);
                     }
                     dzs = dn;
                 }
-                var en = ldexp2_sat(cmul(nd.a, e), nd.a_exp);
+                var en = ldexp2_sat(mat2v(nd.m, e), nd.m_exp);
                 if !IS_JULIA {
-                    en = en + ldexp2_sat(cmul(nd.b, offset), nd.b_exp + se);
+                    en = en + ldexp2_sat(mat2v(nd.n, offset), nd.n_exp + se);
                 }
                 e = en;
                 m = m + hit.y;

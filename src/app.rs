@@ -56,6 +56,7 @@ const BLA_DC_SLACK: i32 = 2;
 #[derive(Clone, Copy, PartialEq)]
 struct BlaKey {
     generation: u64,
+    kind: u32,
     on: bool,
     julia: bool,
     dc_log2: i32,
@@ -1304,12 +1305,14 @@ impl FractalApp {
     fn bla_table(&mut self, u: &Uniforms) -> Arc<BlaTable> {
         let want = BlaKey {
             generation: self.generation,
+            kind: u.kind,
             on: self.use_bla && bla::applies(u),
             julia: u.is_julia != 0,
             dc_log2: bla::dc_max_log2(u),
         };
         let fresh = self.bla_key.as_ref().is_some_and(|k| {
             k.generation == want.generation
+                && k.kind == want.kind
                 && k.on == want.on
                 && k.julia == want.julia
                 && (!want.on

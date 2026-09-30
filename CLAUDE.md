@@ -246,24 +246,36 @@ pixel is a handful of `f32` complex multiplies.
   the input scale. Lambda set mode's reference sits at the origin, so it
   never reaches deep zooms anyway.
 - `src/fractal/bla.rs` — **bivariate linear approximation**: a table of
-  merged linear steps `e' = A·e + B·dc` (valid while `|e| < R`) built on
-  the CPU from the reference orbit, so the shader's `bla_lookup` jumps each
-  pixel over whole runs of steps. Plain Mandelbrot only (set + Julia, no
-  morph; `bla::applies`, the `BLA` override). This is what makes deep zoom
-  fast: every pixel follows the reference for tens of thousands of steps
-  before diverging (1e-200: 12.7 s → 0.7 s at 960×540). Level `l` node `i`
-  covers steps `1 + i·2^l ..`, and only levels ≥ 3 are uploaded (bindings 4/5,
-  `bla_meta` = `[min_level, levels, offsets…]`). Coefficients are
-  floatexp (f32 mantissa + i32 exponent), so a jump in the deep prologue
-  lands straight at its output scale. `R` depends on the view's largest
-  `|dc|` (`dc_max_log2`), so `FractalApp::bla_table` rebuilds on reference
-  change or when the dc range grows (or shrinks by `BLA_DC_SLACK` binades);
-  exports/headless build per frame via `bla::for_uniforms`. The table stops
+  merged linear steps `e' = M·e + N·dc` (real 2×2 matrices; valid while
+  `|e| < R`) built on the CPU from the reference orbit, so the shader's
+  `bla_lookup` jumps each pixel over whole runs of steps. Every kind but
+  Phoenix (two-term map), no morph (`bla::applies`, the `BLA` override).
+  `M` is the map's Jacobian at `X`: `C(f'(X))` for the holomorphic kinds, a
+  sign fold of `C(2X)` for the abs/conjugate ones. Each kind's `M` and
+  radius live in `Node::step`, which must match `advance_delta_kind`. The
+  abs kinds' radius also keeps the delta off their fold lines (where
+  `diffabs` switches branch), and Complex Multibrot's keeps it off the
+  branch cut. So Burning Ship / Perpendicular / Buffalo can't jump along the
+  real axis (their fold), where their orbits often sit. Merges use the exact
+  2×2 spectral norm (Frobenius would lose √2 of radius per level). This is
+  what makes deep zoom fast: every pixel follows the reference for tens of
+  thousands of steps before diverging (Mandelbrot 1e-200: 12.7 s → 0.7 s
+  at 960×540). Level `l` node `i` covers steps `1 + i·2^l ..`, and only
+  levels ≥ 3 are uploaded (bindings 4/5, 48 B nodes, `bla_meta` =
+  `[min_level, levels, offsets…]`). Coefficients are floatexp (f32
+  mantissas + i32 exponent), so a jump in the deep prologue lands straight
+  at its output scale. `R` depends on the view's largest `|dc|`
+  (`dc_max_log2`), so `FractalApp::bla_table` rebuilds on reference or kind
+  change or when the dc range grows (or shrinks by `BLA_DC_SLACK` binades).
+  Exports/headless build per frame via `bla::for_uniforms`. The table stops
   before the reference crosses the pixel bailout, so a jump never skips an
   escape. Measure `|e|` with `log2_mag`, never `log2(dot(e, e))`: a
   2^-100 delta squares to 0 in f32 and passed every radius test.
   `--no-bla` / the "Skip iterations (BLA)" checkbox upload an empty table
-  for A/B checks (it must render like `--no-bla` up to f32 noise).
+  for A/B checks. BLA must render like `--no-bla` up to f32 noise; on
+  chaotic views, compare against a `--no-bla` render nudged by ~0.01 px,
+  which differs by more. `escape_counts_match_all_kinds` checks every
+  kind on the CPU against the plain loop with f32 rounding.
 - `src/fractal/renderer.rs` — `FractalRenderer` (wgpu pipelines, uniform +
   storage buffers, bind groups), `Uniforms` (repr(C) layout that must match
   the WGSL `Uniforms` struct field-for-field, including padding; it includes
@@ -305,7 +317,9 @@ arms), `reference.rs` (CPU iteration formula arm, and a test comparing
 against a naive `f64` iteration), `common.wgsl` (matching `KIND_*` const),
 `mandelbrot.wgsl` (matching `advance_delta`/`fprime` arms, plus the deep
 path's `advance_delta_scaled_kind` arm, its degree in `deep_step_kind` and,
-if not z²-like, a `deep_fprime` arm), `buddhabrot.wgsl`
+if not z²-like, a `deep_fprime` arm), `bla.rs` (a `Node::step` arm: the
+step's Jacobian and linearity radius, plus a case in
+`escape_counts_match_all_kinds`; or exclude the kind in `applies`), `buddhabrot.wgsl`
 (matching arm in `advance()`, if the kind makes sense as a Buddhabrot),
 `renderer.rs` `Uniforms` (only if the kind needs a new per-kind constant,
 e.g. Phoenix's `phoenix_p`), `app.rs` (`JULIA_PRESETS`/`SET_PRESETS` slot,
