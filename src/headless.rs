@@ -78,9 +78,10 @@ pub fn run(cli: Cli) -> Result<(), String> {
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let renderer = FractalRenderer::new(&device, format);
     let uniforms = app.make_uniforms(width as f64 / height as f64, height as f64);
-    let handles = renderer.export_handles(&device, &uniforms);
+    let auto_color = app.auto_color_active();
+    let handles = renderer.export_handles(&device, &uniforms, auto_color);
 
-    let er = ExportRender::new(
+    let mut er = ExportRender::new(
         &device,
         &queue,
         &handles,
@@ -90,6 +91,12 @@ pub fn run(cli: Cli) -> Result<(), String> {
         app.reference_points(),
         app.lights(),
     );
+    if auto_color {
+        match fit_auto_color(&mut app, &mut er, &device, &queue) {
+            Some((lo, hi)) => eprintln!("auto color scale: ci {lo:.1}–{hi:.1}"),
+            None => eprintln!("auto color scale: nothing escaped, keeping the default"),
+        }
+    }
 
     eprintln!("rendering {width}×{height}…");
     let png = export_to_png_blocking(&device, &queue, &er, |phase, fraction| {
@@ -311,6 +318,10 @@ fn run_animation(
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let renderer = FractalRenderer::new(&device, format);
     let aspect = width as f64 / height as f64;
+    // Refit per frame from the same start, so each frame's colours depend only
+    // on that frame (frames render out of order, and shards must join up).
+    let auto_color = app.auto_color_active();
+    let color_fit0 = app.color_fit();
 
     // Three-stage pipeline, connected by bounded channels (which also cap
     // memory): `threads` workers compute reference orbits (CPU, the expensive
@@ -445,8 +456,8 @@ fn run_animation(
             let uniforms = app.make_uniforms(aspect, height as f64);
             let handles = pipelines
                 .entry(PipelineKey::from_uniforms(&uniforms))
-                .or_insert_with(|| renderer.export_handles(&device, &uniforms));
-            let er = ExportRender::new(
+                .or_insert_with(|| renderer.export_handles(&device, &uniforms, auto_color));
+            let mut er = ExportRender::new(
                 &device,
                 &queue,
                 handles,
@@ -456,6 +467,10 @@ fn run_animation(
                 app.reference_points(),
                 app.lights(),
             );
+            if auto_color {
+                app.set_color_fit(color_fit0);
+                fit_auto_color(&mut app, &mut er, &device, &queue);
+            }
             let padded = render_readback_blocking(&device, &queue, &er);
             if png_tx.send((i, padded, er.padded_bpr, er.swap_rb)).is_err() {
                 break;
@@ -494,6 +509,24 @@ fn run_animation(
         );
     }
     Ok(())
+}
+
+/// Auto colour scale: fit `app`'s colour scale to `er`'s image (a prepass)
+/// and upload the result. Returns the fitted `ci` range, or `None` (colours
+/// untouched) if nothing escaped.
+fn fit_auto_color(
+    app: &mut FractalApp,
+    er: &mut ExportRender,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> Option<(f32, f32)> {
+    let range = er.ci_range_blocking(device, queue)?;
+    app.apply_ci_range(range);
+    er.set_uniforms(
+        queue,
+        app.make_uniforms(er.width as f64 / er.height as f64, er.height as f64),
+    );
+    Some(range)
 }
 
 /// Parse `--to-view`/`--to-share` (at most one is used) into the end view

@@ -45,12 +45,16 @@ Native CLI flags (`src/cli.rs`, applied in `FractalApp::apply_cli`): `--kind`,
 `--palette`, `--share <fragment>`,
 `--view re,im,half_height[,iterations]`, `--rendering-kind`,
 `--yaw`/`--pitch` (3D camera, degrees), `--de`, `--antialias` (2×2),
-`--buddhabrot`,
+`--auto-color-scale`, `--buddhabrot`,
 `--buddha-palette`. `--headless` (`src/headless.rs`) skips the window
 entirely: it builds the same view from the other flags, creates its own
 offscreen wgpu device, and renders straight to a PNG (`--width`/`--height`,
 default 1920×1080, `--export-path out.png`) without needing a GPU-backed
-window/event loop. Not yet supported with `--buddhabrot`. Run
+window/event loop. Not yet supported with `--buddhabrot`. With
+`--auto-color-scale`, a downscaled 1-spp `fs_data` prepass
+(`ExportRender::ci_range_blocking`, ≤ 1024 px) is histogrammed like the
+interactive `CiStats`. The fit is then written into the export's uniforms,
+and animations refit every frame from the same start. Run
 `mandelbrot --help` for the full list.
 
 `--headless` also has an animation mode, for feeding into `ffmpeg`: give any

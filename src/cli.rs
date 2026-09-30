@@ -82,6 +82,12 @@ pub struct Cli {
     #[arg(long, value_name = "INDEX")]
     pub palette: Option<u32>,
 
+    /// Fit the colour scale to the image: one palette cycle across its
+    /// escape-time range (classic palette only). Animations refit it on
+    /// every frame.
+    #[arg(long)]
+    pub auto_color_scale: bool,
+
     /// Output path for --headless (default: fractal-<timestamp>.png). When
     /// animating (--to-view/--to-share), this is a directory of
     /// frame-00001.png, frame-00002.png, ... instead (default:

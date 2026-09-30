@@ -873,6 +873,10 @@ impl FractalApp {
             self.buddha_palette = p.min(BUDDHA_PALETTE_NAMES.len() as u32 - 1);
             self.palette = p.min(PALETTE_NAMES.len() as u32 - 1);
         }
+        // After --share, which turns it off.
+        if cli.auto_color_scale {
+            self.auto_color_scale = true;
+        }
         self.export_path = cli.export_path;
     }
 
@@ -1411,9 +1415,6 @@ impl FractalApp {
         self.last_request = Some(key);
     }
 
-    /// Whether the classic escape-time palette (and its scale / offset /
-    /// palette controls) is in use: always in classic mode, and in shadow/3D
-    /// modes under the "Classic" shading palette.
     /// The palette offset the shaders get: `color_offset`, shifted so the
     /// palette starts at the auto fit's lowest on-screen `ci`.
     fn effective_color_offset(&self) -> f32 {
@@ -1438,13 +1439,40 @@ impl FractalApp {
             ctx.request_repaint();
         }
         if self.auto_color_scale
-            && let Some((lo, hi)) = range
+            && let Some(range) = range
         {
-            self.color_scale = (1.0 / (hi - lo).max(1e-3)).clamp(1e-4, 1.0);
-            self.ci_lo = lo;
+            self.apply_ci_range(range);
         }
     }
 
+    /// Fit one palette cycle across the `ci` range `[lo, hi]` (auto colour
+    /// scale).
+    pub(crate) fn apply_ci_range(&mut self, (lo, hi): (f32, f32)) {
+        self.color_scale = (1.0 / (hi - lo).max(1e-3)).clamp(1e-4, 1.0);
+        self.ci_lo = lo;
+    }
+
+    /// The colour scale and the auto fit's `ci_lo`, to restore with
+    /// [`Self::set_color_fit`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn color_fit(&self) -> (f32, f32) {
+        (self.color_scale, self.ci_lo)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_color_fit(&mut self, (scale, ci_lo): (f32, f32)) {
+        self.color_scale = scale;
+        self.ci_lo = ci_lo;
+    }
+
+    /// Whether the auto colour scale applies to the current render.
+    pub(crate) fn auto_color_active(&self) -> bool {
+        self.auto_color_scale && self.uses_classic_palette()
+    }
+
+    /// Whether the classic escape-time palette (and its scale / offset /
+    /// palette controls) is in use: always in classic mode, and in shadow/3D
+    /// modes under the "Classic" shading palette.
     fn uses_classic_palette(&self) -> bool {
         self.rendering_mode == 0 || self.shadow_palette == SHADOW_PALETTE_CLASSIC
     }
@@ -1598,7 +1626,7 @@ impl FractalApp {
                 self.status = Some("export unavailable".into());
                 return;
             };
-            renderer.export_handles(&device, &uniforms)
+            renderer.export_handles(&device, &uniforms, false)
         };
         let reference = Arc::clone(&self.reference);
         let lights = self.lights.clone();
@@ -3035,7 +3063,7 @@ impl FractalApp {
                 reference: Arc::clone(&self.reference),
                 generation: self.generation,
                 size_px,
-                auto_color: self.auto_color_scale && self.uses_classic_palette(),
+                auto_color: self.auto_color_active(),
             },
         ));
     }

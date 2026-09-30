@@ -430,6 +430,11 @@ const CI_LOG2_MAX: f32 = 25.0;
 /// `max_iter` and would otherwise squash the rest into one palette band.
 const CI_TAIL: f64 = 0.005;
 
+/// Longest side (px) of an export's auto-colour prepass
+/// ([`ExportRender::ci_range_blocking`]).
+#[cfg(not(target_arch = "wasm32"))]
+const CI_PROBE_MAX_DIM: u32 = 1024;
+
 /// Where the `ci` histogram readback is (see [`CiStats`]).
 enum CiStatsState {
     Idle,
@@ -440,12 +445,19 @@ enum CiStatsState {
     Mapping(Arc<std::sync::atomic::AtomicBool>),
 }
 
+/// The `ci` histogram compute pass (`ci_stats.wgsl`), shared by the
+/// interactive [`CiStats`] and headless exports ([`ExportRender::ci_range_blocking`]).
+#[derive(Clone)]
+struct CiHistogram {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
 /// Auto colour scale: a compute pass bins the data texture's `ci` into a
 /// histogram (`ci_stats.wgsl`), read back asynchronously one or two frames
 /// later by [`FractalRenderer::take_ci_range`].
 struct CiStats {
-    pipeline: wgpu::ComputePipeline,
-    layout: wgpu::BindGroupLayout,
+    histogram: CiHistogram,
     hist: wgpu::Buffer,
     staging: wgpu::Buffer,
     state: CiStatsState,
@@ -453,7 +465,7 @@ struct CiStats {
     stale: bool,
 }
 
-impl CiStats {
+impl CiHistogram {
     fn new(device: &wgpu::Device) -> Self {
         let module = unsafe {
             device.create_shader_module_trusted(
@@ -504,6 +516,11 @@ impl CiStats {
             compilation_options: Default::default(),
             cache: None,
         });
+        Self { pipeline, layout }
+    }
+
+    /// The histogram buffer and its mappable readback copy.
+    fn buffers(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer) {
         let size = (CI_BINS * std::mem::size_of::<u32>()) as u64;
         let hist = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ci histogram"),
@@ -519,9 +536,55 @@ impl CiStats {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        (hist, staging)
+    }
+
+    /// Record the histogram of `data` (`width`×`height`) into `hist`, and its
+    /// copy into `staging`.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        data: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        hist: &wgpu::Buffer,
+        staging: &wgpu::Buffer,
+    ) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ci stats bind group"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(data),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: hist.as_entire_binding(),
+                },
+            ],
+        });
+        encoder.clear_buffer(hist, 0, None);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ci stats pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+        }
+        encoder.copy_buffer_to_buffer(hist, 0, staging, 0, None);
+    }
+}
+
+impl CiStats {
+    fn new(histogram: CiHistogram, device: &wgpu::Device) -> Self {
+        let (hist, staging) = CiHistogram::buffers(device);
         Self {
-            pipeline,
-            layout,
+            histogram,
             hist,
             staging,
             state: CiStatsState::Idle,
@@ -539,31 +602,15 @@ impl CiStats {
         width: u32,
         height: u32,
     ) {
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ci stats bind group"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(data),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.hist.as_entire_binding(),
-                },
-            ],
-        });
-        encoder.clear_buffer(&self.hist, 0, None);
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("ci stats pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
-        }
-        encoder.copy_buffer_to_buffer(&self.hist, 0, &self.staging, 0, None);
+        self.histogram.record(
+            device,
+            encoder,
+            data,
+            width,
+            height,
+            &self.hist,
+            &self.staging,
+        );
         self.state = CiStatsState::Copied;
         self.stale = false;
     }
@@ -1142,7 +1189,7 @@ impl FractalRenderer {
             cache: None,
             iterated: None,
             colored: None,
-            ci_stats: CiStats::new(device),
+            ci_stats: CiStats::new(CiHistogram::new(device), device),
         }
     }
 
@@ -1340,7 +1387,14 @@ impl FractalRenderer {
     /// refine → colourise chain, since the raymarcher needs a whole data
     /// texture to march over and `fs_color` has no 3D path. Likewise for
     /// the distance field ([`wants_envelope`]), which needs the whole image.
-    pub fn export_handles(&self, device: &wgpu::Device, uniforms: &Uniforms) -> ExportHandles {
+    /// With `ci_probe`, also what [`ExportRender::ci_range_blocking`] needs
+    /// (auto colour scale).
+    pub fn export_handles(
+        &self,
+        device: &wgpu::Device,
+        uniforms: &Uniforms,
+        ci_probe: bool,
+    ) -> ExportHandles {
         let constants = PipelineKey::from_uniforms(uniforms).constants();
         let pipeline = fullscreen_pipeline(
             device,
@@ -1376,11 +1430,29 @@ impl FractalRenderer {
             colorize_bind_group_layout: self.colorize_bind_group_layout.clone(),
             lipschitz: wants_envelope(uniforms).then(|| self.lipschitz.clone()),
         });
+        let probe = ci_probe.then(|| {
+            let iterate = raymarch.as_ref().map_or_else(
+                || {
+                    fullscreen_pipeline(
+                        device,
+                        "fractal export ci probe pipeline",
+                        &self.shader,
+                        &self.pipeline_layout,
+                        "fs_data",
+                        DATA_FORMAT,
+                        &constants,
+                    )
+                },
+                |rm| rm.iterate.clone(),
+            );
+            (iterate, self.ci_stats.histogram.clone())
+        });
         ExportHandles {
             pipeline,
             bind_group_layout: self.bind_group_layout.clone(),
             format: self.target_format,
             raymarch,
+            probe,
         }
     }
 }
@@ -1395,6 +1467,9 @@ pub struct ExportHandles {
     format: wgpu::TextureFormat,
     /// The two-pass chain, for 3D mode and the distance field only.
     raymarch: Option<RaymarchHandles>,
+    /// 1-spp iterate pipeline (`fs_data`) + `ci` histogram, for the auto
+    /// colour scale's prepass.
+    probe: Option<(wgpu::RenderPipeline, CiHistogram)>,
 }
 
 /// The interactive two-pass pipelines, for a 3D or distance-field export.
@@ -1444,6 +1519,13 @@ pub struct ExportRender {
     /// 3D mode or the distance field: tiles fill a data texture instead of
     /// the target.
     raymarch: Option<RaymarchExport>,
+    // Only for headless auto colour (`ci_range_blocking`, `set_uniforms`).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    uniform_buffer: wgpu::Buffer,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    uniforms: Uniforms,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    probe: Option<(wgpu::RenderPipeline, CiHistogram)>,
 }
 
 impl ExportRender {
@@ -1639,7 +1721,94 @@ impl ExportRender {
             tiles,
             swap_rb,
             raymarch,
+            uniform_buffer,
+            uniforms,
+            probe: handles.probe.clone(),
         }
+    }
+
+    /// Replace the uploaded uniforms (e.g. with a refitted colour scale).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_uniforms(&mut self, queue: &wgpu::Queue, uniforms: Uniforms) {
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        self.uniforms = uniforms;
+    }
+
+    /// Auto colour scale for an export: iterate a downscaled 1-spp prepass,
+    /// histogram its `ci` and return the range to fit (`None` if nothing
+    /// escaped). Needs handles built with `ci_probe`. Blocks on the GPU.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ci_range_blocking(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Option<(f32, f32)> {
+        let (iterate, histogram) = self
+            .probe
+            .as_ref()
+            .expect("export handles built without ci_probe");
+        // The uniforms carry no resolution, so a smaller image of the same view
+        // just samples it more coarsely; plenty for percentiles.
+        let s = (CI_PROBE_MAX_DIM as f64 / self.width.max(self.height) as f64).min(1.0);
+        let width = ((self.width as f64 * s).round() as u32).max(1);
+        let height = ((self.height as f64 * s).round() as u32).max(1);
+        let data = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("export ci probe"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DATA_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let (hist, staging) = CiHistogram::buffers(device);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("export ci probe"),
+        });
+        let samples = if self.uniforms.rendering_mode != 0 {
+            3
+        } else {
+            1
+        };
+        banded_data_pass(
+            device,
+            queue,
+            &mut encoder,
+            "export ci probe pass",
+            &data,
+            iterate,
+            &[&self.bind_group],
+            [width, height],
+            band_count(width, height, self.uniforms.max_iter, samples),
+        );
+        histogram.record(device, &mut encoder, &data, width, height, &hist, &staging);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res);
+            });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        rx.recv().ok()?.ok()?;
+        let range = ci_range(bytemuck::cast_slice(
+            &staging.slice(..).get_mapped_range().ok()?,
+        ));
+        staging.unmap();
+        range
     }
 
     /// Pixel row range `[y0, y1)` covered by tile `t`.
