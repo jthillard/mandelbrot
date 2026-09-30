@@ -52,7 +52,10 @@ const MAX_ITERATIONS: u32 = MAX_REF_POINTS as u32 - 1;
 /// each interacting frame is cheap; the linear blit upsamples it to the widget.
 /// A full-resolution render replaces it once input settles. 2 → quarter the
 /// pixels (~4× faster); raise for more speed at the cost of more blur in motion.
+/// Default of the Advanced "low resolution scale" setting (a power of 2).
 const INTERACT_DOWNSCALE: u32 = 2;
+/// Largest selectable interaction downscale, as log2 (16×).
+const MAX_INTERACT_DOWNSCALE_LOG2: u32 = 4;
 /// Seconds without pan/zoom input after which the view counts as settled and is
 /// re-rendered at full resolution.
 const INTERACT_SETTLE: f64 = 0.12;
@@ -601,6 +604,9 @@ pub struct FractalApp {
     /// egui time (seconds) of the most recent pan/zoom. While recent (within
     /// `INTERACT_SETTLE`) the fractal renders downscaled for smooth interaction.
     last_interact_time: f64,
+    /// log2 of the per-axis downscale applied while panning/zooming
+    /// (`1 << interact_downscale_log2`); higher = faster but blurrier in motion.
+    interact_downscale_log2: u32,
     /// Set when the user requests a PNG export (handled after the panels draw).
     export_requested: bool,
     /// Progress/handle for an in-flight PNG export, if any.
@@ -747,6 +753,7 @@ impl FractalApp {
             #[cfg(feature = "gui")]
             last_size_px: egui::vec2(1280.0, 720.0),
             last_interact_time: -1.0e9,
+            interact_downscale_log2: INTERACT_DOWNSCALE.trailing_zeros(),
             export_requested: false,
             export: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -2352,6 +2359,27 @@ impl FractalApp {
         ui.separator();
         ui.add_space(4.);
 
+        ui.collapsing("Advanced", |ui| {
+            ui.add(
+                egui::Slider::new(
+                    &mut self.interact_downscale_log2,
+                    0..=MAX_INTERACT_DOWNSCALE_LOG2,
+                )
+                .text("low resolution scale")
+                .custom_formatter(|v, _| format!("1/{}", 1u32 << v as u32))
+                .custom_parser(|s| {
+                    let s = s.trim();
+                    let n: u32 = s.strip_prefix("1/").unwrap_or(s).trim().parse().ok()?;
+                    n.is_power_of_two().then(|| n.trailing_zeros() as f64)
+                }),
+            )
+            .on_hover_text(
+                "Resolution divisor (per axis) while panning/zooming. Higher gives \
+                 more FPS at deep zoom but a blurrier image in motion; full \
+                 resolution returns once input settles.",
+            );
+        });
+
         ui.collapsing("Animation", |ui| {
             if self.uses_classic_palette() {
                 ui.checkbox(&mut self.anim.color, "Cycle colours")
@@ -2912,7 +2940,11 @@ impl FractalApp {
         // Cache-texture resolution: the widget size in physical pixels, divided
         // down while interacting (the linear blit upsamples it to the widget).
         let ppp = ui.ctx().pixels_per_point();
-        let downscale = if interacting { INTERACT_DOWNSCALE } else { 1 };
+        let downscale = if interacting {
+            1 << self.interact_downscale_log2
+        } else {
+            1
+        };
         let mut size_px = [
             (((rect.width() * ppp).round() as u32) / downscale).max(1),
             (((rect.height() * ppp).round() as u32) / downscale).max(1),
