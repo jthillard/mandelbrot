@@ -48,12 +48,25 @@ const EPSILON_LOG2: i32 = -28;
 /// table at 12 bytes per orbit point.
 const MIN_LEVEL: u32 = 3;
 
+/// A step whose own radius is below `2^SEG_BAD_LOG2` (`|X| < 2^-12` for
+/// Mandelbrot: a near-zero pass of the reference, or a fold line for the abs
+/// kinds) ends a segment (see [`build`]).
+const SEG_BAD_LOG2: f64 = EPSILON_LOG2 as f64 - 12.0;
+
+/// Shortest segment worth a node (the levels cover shorter runs in a
+/// lookup or two). Also bounds the segment count to `steps / SEG_MIN_STEPS`.
+const SEG_MIN_STEPS: usize = 64;
+
+/// Steps folded per parallel task when building segments.
+const SEG_CHUNK: usize = 1024;
+
 /// Upload budget (bytes): the WebGPU default storage binding size limit.
 const MAX_TABLE_BYTES: usize = 128 << 20;
 
 /// One table node, as the shader's `Bla` struct: `M = m·2^m_exp`,
 /// `N = n·2^n_exp` (row-major 2×2: `[m00, m01, m10, m11]`), valid while
-/// `log2|e| < r_log2`.
+/// `log2|e| < r_log2`. `steps` is the run length of a segment node (0 in
+/// the levels, where it follows from the level).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuBla {
@@ -62,7 +75,7 @@ pub struct GpuBla {
     pub m_exp: i32,
     pub n_exp: i32,
     pub r_log2: f32,
-    pub _pad: u32,
+    pub steps: u32,
 }
 
 /// `r_log2` of a node that's never valid (f32 `-inf` is fine in WGSL, but a
@@ -71,9 +84,11 @@ const NEVER: f32 = -3.0e38;
 
 /// A BLA table ready for upload.
 ///
-/// `meta` is `[min_level, level_count, off_0, …, off_{level_count}]`: level
-/// `min_level + k` occupies `nodes[off_k..off_{k+1}]`, and its node `i`
-/// covers reference steps `1 + i·2^l .. 1 + (i+1)·2^l`.
+/// `meta` is `[min_level, level_count, off_0, …, off_{level_count},
+/// seg_count, seg_start_0, …]`: level `min_level + k` occupies
+/// `nodes[off_k..off_{k+1}]`, and its node `i` covers reference steps
+/// `1 + i·2^l .. 1 + (i+1)·2^l`. Segment `i` is `nodes[off_{level_count} + i]`
+/// and covers `steps` steps from `seg_start_i` (ascending); see [`build`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlaTable {
     pub nodes: Vec<GpuBla>,
@@ -85,7 +100,7 @@ impl BlaTable {
     pub fn empty() -> Self {
         Self {
             nodes: vec![GpuBla::default()],
-            meta: vec![MIN_LEVEL, 0, 0],
+            meta: vec![MIN_LEVEL, 0, 0, 0],
         }
     }
 
@@ -532,7 +547,7 @@ impl Node {
             } else {
                 NEVER
             },
-            _pad: 0,
+            steps: 0,
         }
     }
 }
@@ -567,7 +582,8 @@ pub fn build(
     };
     let mut min_level = MIN_LEVEL;
     // Level l has steps >> l nodes, so levels >= min hold < 2·(steps >> min).
-    while (steps >> min_level) * 2 * size_of::<GpuBla>() > MAX_TABLE_BYTES {
+    while ((steps >> min_level) * 2 + steps / SEG_MIN_STEPS) * size_of::<GpuBla>() > MAX_TABLE_BYTES
+    {
         min_level += 1;
     }
     if steps >> min_level == 0 {
@@ -583,34 +599,117 @@ pub fn build(
         Fx::new(re as f64, im as f64, orbit.exps[m])
     };
 
-    // First stored level, folded straight from single steps.
+    // First stored level, folded straight from single steps. The same pass
+    // notes the "bad" steps (tiny radius) that end segments (below).
     let run = 1usize << min_level;
-    let mut level: Vec<Node> = par_map(steps >> min_level, |i| {
+    let is_bad = |nd: &Node| nd.r.log2() < SEG_BAD_LOG2;
+    let first: Vec<(Node, Vec<usize>)> = par_map(steps >> min_level, 4096, |i| {
         let start = 1 + i * run;
-        (1..run).fold(Node::step(map, point(start)), |acc, k| {
-            acc.then(Node::step(map, point(start + k)), dc_max)
-        })
+        let mut bad = Vec::new();
+        let mut acc = Node::step(map, point(start));
+        if is_bad(&acc) {
+            bad.push(start);
+        }
+        for m in start + 1..start + run {
+            let nd = Node::step(map, point(m));
+            if is_bad(&nd) {
+                bad.push(m);
+            }
+            acc = acc.then(nd, dc_max);
+        }
+        (acc, bad)
     });
+    let base: Vec<Node> = first.iter().map(|f| f.0).collect();
+    let tail = 1 + base.len() * run..steps + 1; // past the last whole run
+    let bad: Vec<usize> = first
+        .into_iter()
+        .flat_map(|f| f.1)
+        .chain(tail.filter(|&m| is_bad(&Node::step(map, point(m)))))
+        .collect();
 
     let mut nodes = Vec::new();
     let mut meta = vec![min_level, 0];
+    let mut level = base.clone();
     while !level.is_empty() {
         meta.push(nodes.len() as u32);
         nodes.extend(level.iter().map(|n| n.gpu()));
-        level = par_map(level.len() / 2, |i| {
+        level = par_map(level.len() / 2, 4096, |i| {
             level[2 * i].then(level[2 * i + 1], dc_max)
         });
     }
     meta[1] = (meta.len() - 2) as u32;
     meta.push(nodes.len() as u32);
+
+    // Segments: one node per run between bad steps, from step 1 and from
+    // just after each bad step, where a pixel lands after stepping over it
+    // or rebasing. Deep minibrot views pass near 0 once per period, so the
+    // aligned levels cut every period into ~10 jumps plus up to 2^min_level
+    // single steps; a segment crosses it in one.
+    let mut segs = Vec::new();
+    let mut start = 1;
+    for b in bad.into_iter().chain([steps + 1]) {
+        if b >= start + SEG_MIN_STEPS {
+            segs.push((start, b));
+        }
+        start = b + 1;
+    }
+    // Folded in parallel pieces cut at multiples of `chunk` (aligned to the
+    // first level), each from first-level nodes plus single steps at its
+    // ragged ends, then merged in order.
+    let chunk = SEG_CHUNK.max(run);
+    let pieces: Vec<(usize, usize)> = segs
+        .iter()
+        .flat_map(|&(a, b)| {
+            let cuts = (a - 1) / chunk + 1..(b - 2) / chunk + 1;
+            std::iter::once(a)
+                .chain(cuts.map(move |k| 1 + k * chunk))
+                .chain([b])
+                .collect::<Vec<_>>()
+                .windows(2)
+                .map(|w| (w[0], w[1]))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let folded = par_map(pieces.len(), 4, |i| {
+        let (a, b) = pieces[i];
+        let mut acc: Option<Node> = None;
+        let mut m = a;
+        while m < b {
+            let aligned = (m - 1) % run == 0 && m + run <= b && (m - 1) / run < base.len();
+            let (nd, k) = if aligned {
+                (base[(m - 1) / run], run)
+            } else {
+                (Node::step(map, point(m)), 1)
+            };
+            acc = Some(acc.map_or(nd, |x| x.then(nd, dc_max)));
+            m += k;
+        }
+        acc.unwrap()
+    });
+    let mut k = 0;
+    for &(a, b) in &segs {
+        let mut seg = folded[k];
+        k += 1;
+        while k < pieces.len() && pieces[k].0 < b && pieces[k].0 > a {
+            seg = seg.then(folded[k], dc_max);
+            k += 1;
+        }
+        nodes.push(GpuBla {
+            steps: (b - a) as u32,
+            ..seg.gpu()
+        });
+    }
+    meta.push(segs.len() as u32);
+    meta.extend(segs.iter().map(|&(a, _)| a as u32));
     BlaTable { nodes, meta }
 }
 
-/// `(0..n).map(f).collect()`, split across cores when `n` is large enough to
-/// pay for the threads (a 900k-step table took ~60 ms on one core).
-fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+/// `(0..n).map(f).collect()`, split across cores when there are at least
+/// `min` items, enough work to pay for the threads (a 900k-step table took
+/// ~60 ms on one core).
+fn par_map<T: Send>(n: usize, min: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     #[cfg(not(target_arch = "wasm32"))]
-    if n >= 4096 {
+    if n >= min {
         let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
         let chunk = n.div_ceil(threads);
         let f = &f;
@@ -792,12 +891,22 @@ mod tests {
         }
     }
 
-    /// Replay the shader's lookup: the longest valid aligned node at `m`,
-    /// of at most `budget` steps.
+    /// Replay the shader's lookup: the segment starting at `m` if it's
+    /// valid, else the longest valid aligned node at `m`, of at most
+    /// `budget` steps.
     fn lookup(t: &BlaTable, m: usize, e_log2: f64, budget: usize) -> Option<(usize, usize)> {
         let (lmin, levels) = (t.meta[0], t.meta[1]);
         if m == 0 || levels == 0 {
             return None;
+        }
+        let sc = 3 + levels as usize; // seg_count
+        let starts = &t.meta[sc + 1..sc + 1 + t.meta[sc] as usize];
+        if let Ok(i) = starts.binary_search(&(m as u32)) {
+            let idx = t.meta[sc - 1] as usize + i;
+            let nd = &t.nodes[idx];
+            if e_log2 < nd.r_log2 as f64 && nd.steps as usize <= budget {
+                return Some((idx, nd.steps as usize));
+            }
         }
         let j = m - 1;
         let tz = if j == 0 { 32 } else { j.trailing_zeros() };
@@ -1097,7 +1206,16 @@ mod tests {
             let count = t.meta[3 + k] - t.meta[2 + k];
             assert_eq!(count as usize, steps >> (MIN_LEVEL as usize + k));
         }
-        assert_eq!(*t.meta.last().unwrap() as usize, t.nodes.len());
+        let (levels, sc) = (t.levels() as usize, 3 + t.levels() as usize);
+        let seg_count = t.meta[sc] as usize;
+        assert_eq!(t.meta.len(), sc + 1 + seg_count);
+        assert_eq!(t.meta[2 + levels] as usize + seg_count, t.nodes.len());
+        // No bad step in the cardioid: one segment over every step.
+        assert_eq!(seg_count, 1);
+        assert_eq!(
+            (t.meta[sc + 1], t.nodes.last().unwrap().steps),
+            (1, steps as u32)
+        );
         let tiny = mandel_orbit(-3.0, 0.0, 1000); // escapes at once
         assert_eq!(build(&tiny, tiny.len(), -30, 1e6, &m).levels(), 0);
     }

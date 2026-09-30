@@ -254,11 +254,16 @@ pixel is a handful of `f32` complex multiplies.
   `DEEP_PIXEL_SIZE`, raise `DEEP_EXIT_LOG2` to about -8) must reproduce the
   plain f32 renders on non-chaotic views. That's the check to rerun after
   changing it. At minibrot depths (seahorse 1e-200) this prologue is most
-  of the render: about 130 loop turns per pixel, one per BLA jump or plain
-  step around each near-zero reference point. It's ALU-bound, so
-  `ldexp_sat` adds to the exponent bits for normal inputs (−25% time).
-  Measured no help: reading `frexp`'s exponent from the bits, a branchless
-  `ldexp_sat`, uploading BLA levels 1–2. Known gaps: Lambda's critical point is 1/2, so its step keeps
+  of the render. The reference passes near 0 once per period, which the
+  aligned BLA levels cut into ~10 jumps plus up to 8 plain steps; BLA
+  segments (below) make that one jump and a plain step. It's ALU-bound,
+  so `ldexp_sat` adds to the exponent bits for normal inputs. Measured no
+  help: reading `frexp`'s exponent from the bits, a branchless
+  `ldexp_sat`, uploading BLA levels 1–2. Shallower deep frames (seahorse
+  1e-100) are instead ~500 genuinely nonlinear f32 steps per pixel (the
+  valley's slow spiral), where only per-step instructions matter: that
+  loop tests the level alignment before `log2_mag` and the lookup, and
+  doesn't track segments (tracking them there cost 11%). Known gaps: Lambda's critical point is 1/2, so its step keeps
   the input scale. Lambda set mode's reference sits at the origin, so it
   never reaches deep zooms anyway.
 - `src/fractal/bla.rs` — **bivariate linear approximation**: a table of
@@ -278,7 +283,13 @@ pixel is a handful of `f32` complex multiplies.
   thousands of steps before diverging (Mandelbrot 1e-200: 12.7 s → 0.7 s
   at 960×540). Level `l` node `i` covers steps `1 + i·2^l ..`, and only
   levels ≥ 3 are uploaded (built across cores, `par_map`; bindings 4/5, 48 B nodes, `bla_meta` =
-  `[min_level, levels, offsets…]`). Coefficients are floatexp (f32
+  `[min_level, levels, offsets…, seg_count, seg_starts…]`). **Segments**
+  add one node per run between "bad" steps (own radius < 2^-40, i.e.
+  `|X| < 2^-12` for Mandelbrot: near-zero passes, fold lines), from step 1
+  and from just after each bad step, where pixels land after stepping over
+  one or rebasing. Only the deep prologue uses them (`bla_jump`, with a
+  per-pixel cursor `seg_i`/`seg_at` reset on rebase), falling back to the
+  levels. Coefficients are floatexp (f32
   mantissas + i32 exponent), so a jump in the deep prologue lands straight
   at its output scale. `R` depends on the view's largest `|dc|`
   (`dc_max_log2`), so `FractalApp::bla_table` rebuilds on reference or kind

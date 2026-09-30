@@ -35,15 +35,17 @@
 // e' = M·e + N·dc, valid while log2|e| < r_log2. M = m·2^m_exp and
 // N = n·2^n_exp are real 2x2 matrices, row-major (the Jacobian of the map,
 // so the abs/conjugate kinds are covered too). `bla_meta` is
-// [min_level, level_count, off_0, ..., off_{level_count}]; only `BLA`
-// pipelines read either.
+// [min_level, level_count, off_0, ..., off_{level_count}, seg_count,
+// seg_start_0, ...]: segment i is node off_{level_count} + i and covers its
+// `steps` steps from seg_start_i (see `bla_seg_find`). Only `BLA` pipelines
+// read either.
 struct Bla {
     m: vec4<f32>,
     n: vec4<f32>,
     m_exp: i32,
     n_exp: i32,
     r_log2: f32,
-    _pad: u32,
+    steps: u32,
 };
 @group(0) @binding(4) var<storage, read> bla_nodes: array<Bla>;
 @group(0) @binding(5) var<storage, read> bla_meta: array<u32>;
@@ -668,6 +670,51 @@ fn bla_lookup(m: u32, e_log2: f32, budget: u32) -> vec2<u32> {
     return best;
 }
 
+// Segment jumps (`bla::build`): one node per run of the reference between
+// two steps where it passes near 0 (or a fold line), starting right after
+// one. Each pixel tracks the first segment starting at or after its `m`
+// (`seg_i`, starting at `seg_at`); m only grows between rebases, so that
+// only moves forward.
+fn bla_seg_count() -> u32 {
+    return bla_meta[bla_meta[1] + 3u];
+}
+
+fn bla_seg_start(i: u32) -> u32 {
+    if i >= bla_seg_count() {
+        return 0xffffffffu;
+    }
+    return bla_meta[bla_meta[1] + 4u + i];
+}
+
+// First segment from `lo` on that starts at or after `m` (binary search: a
+// long level jump can pass many segments).
+fn bla_seg_find(lo: u32, m: u32) -> u32 {
+    var a = lo;
+    var b = bla_seg_count();
+    while a < b {
+        let mid = (a + b) / 2u;
+        if bla_meta[bla_meta[1] + 4u + mid] < m {
+            a = mid + 1u;
+        } else {
+            b = mid;
+        }
+    }
+    return a;
+}
+
+// The segment jump at `m` if segment `seg_i` starts there and is valid,
+// else `bla_lookup`'s: (node index, steps), steps = 0 when there's none.
+fn bla_jump(m: u32, seg_i: u32, seg_at: u32, e_log2: f32, budget: u32) -> vec2<u32> {
+    if seg_at == m {
+        let idx = bla_meta[bla_meta[1] + 2u] + seg_i;
+        let steps = bla_nodes[idx].steps;
+        if e_log2 < bla_nodes[idx].r_log2 && steps <= budget {
+            return vec2<u32>(idx, steps);
+        }
+    }
+    return bla_lookup(m, e_log2, budget);
+}
+
 // Weight of the Phoenix kind's p*z_{n-1} term in the current map: 1 for plain
 // Phoenix, its morph share while switching to/from Phoenix, else 0.
 fn phoenix_weight() -> f32 {
@@ -867,6 +914,14 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         var w_old = w;
         var rebase_exit = false;
         var cut_exit = false;
+        // Next BLA segment (see `bla_jump`; the f32 loop below only uses
+        // the levels: its steps are too cheap to pay for tracking this).
+        var seg_first = 0xffffffffu;
+        if BLA {
+            seg_first = bla_seg_start(0u);
+        }
+        var seg_i = 0u;
+        var seg_at = seg_first;
         loop {
             // Full value y = X + e as f32 (e flushes to 0 when negligible).
             let yt = xt + ldexp2_sat(w, sx);
@@ -887,7 +942,11 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
             var jumped = false;
             if BLA {
                 let e_log2 = f32(sx) + log2_mag(w);
-                let hit = bla_lookup(m, e_log2, min(max_iter - n, ref_len - 1u - m));
+                if seg_at < m {
+                    seg_i = bla_seg_find(seg_i + 1u, m);
+                    seg_at = bla_seg_start(seg_i);
+                }
+                let hit = bla_jump(m, seg_i, seg_at, e_log2, min(max_iter - n, ref_len - 1u - m));
                 if hit.y != 0u {
                     let nd = bla_nodes[hit.x];
                     if DE {
@@ -1037,6 +1096,8 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
                     xf = z0f;
                     xt = z0;
                     m = 0u;
+                    seg_i = 0u;
+                    seg_at = seg_first;
                 }
             }
 
@@ -1112,6 +1173,12 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         }
     }
 
+    // Level nodes start at 1 + i·2^min_level, so only those steps can jump
+    // (tested before `log2_mag` and the lookup: most steps here are plain).
+    var bla_align = 0xffffffffu;
+    if BLA && bla_meta[1] != 0u {
+        bla_align = (1u << bla_meta[0]) - 1u;
+    }
     loop {
         // (`escaped` may already be set by the deep phase.)
         if escaped || z2 > bailout_sq {
@@ -1139,7 +1206,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         let e_old = e;
         let z_old = z;
         var jumped = false;
-        if BLA && m != 0u {
+        if BLA && m != 0u && ((m - 1u) & bla_align) == 0u {
             let hit = bla_lookup(m, log2_mag(e), min(max_iter - n, ref_len - 1u - m));
             if hit.y != 0u {
                 let nd = bla_nodes[hit.x];
