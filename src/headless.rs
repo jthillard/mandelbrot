@@ -669,7 +669,7 @@ impl<'a> Exporter<'a> {
                 self.height,
                 uniforms,
                 app.reference_points(),
-                // Needs this frame's uniforms; ~15 ms per 100k points.
+                // Needs this frame's uniforms; ~15 ms per 100k points on one core.
                 &bla::for_uniforms(app.reference_points(), &uniforms, app.use_bla()),
                 app.lights(),
             );

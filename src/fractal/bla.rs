@@ -585,30 +585,44 @@ pub fn build(
 
     // First stored level, folded straight from single steps.
     let run = 1usize << min_level;
-    let mut level: Vec<Node> = (0..steps >> min_level)
-        .map(|i| {
-            let start = 1 + i * run;
-            (1..run).fold(Node::step(map, point(start)), |acc, k| {
-                acc.then(Node::step(map, point(start + k)), dc_max)
-            })
+    let mut level: Vec<Node> = par_map(steps >> min_level, |i| {
+        let start = 1 + i * run;
+        (1..run).fold(Node::step(map, point(start)), |acc, k| {
+            acc.then(Node::step(map, point(start + k)), dc_max)
         })
-        .collect();
+    });
 
     let mut nodes = Vec::new();
     let mut meta = vec![min_level, 0];
     while !level.is_empty() {
         meta.push(nodes.len() as u32);
         nodes.extend(level.iter().map(|n| n.gpu()));
-        level = level
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|[x, y]| x.then(*y, dc_max))
-            .collect();
+        level = par_map(level.len() / 2, |i| {
+            level[2 * i].then(level[2 * i + 1], dc_max)
+        });
     }
     meta[1] = (meta.len() - 2) as u32;
     meta.push(nodes.len() as u32);
     BlaTable { nodes, meta }
+}
+
+/// `(0..n).map(f).collect()`, split across cores when `n` is large enough to
+/// pay for the threads (a 900k-step table took ~60 ms on one core).
+fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if n >= 4096 {
+        let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+        let chunk = n.div_ceil(threads);
+        let f = &f;
+        return std::thread::scope(|scope| {
+            let parts: Vec<_> = (0..n)
+                .step_by(chunk)
+                .map(|a| scope.spawn(move || (a..(a + chunk).min(n)).map(f).collect::<Vec<T>>()))
+                .collect();
+            parts.into_iter().flat_map(|p| p.join().unwrap()).collect()
+        });
+    }
+    (0..n).map(f).collect()
 }
 
 #[cfg(test)]

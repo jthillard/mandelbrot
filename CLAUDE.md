@@ -272,7 +272,7 @@ pixel is a handful of `f32` complex multiplies.
   what makes deep zoom fast: every pixel follows the reference for tens of
   thousands of steps before diverging (Mandelbrot 1e-200: 12.7 s → 0.7 s
   at 960×540). Level `l` node `i` covers steps `1 + i·2^l ..`, and only
-  levels ≥ 3 are uploaded (bindings 4/5, 48 B nodes, `bla_meta` =
+  levels ≥ 3 are uploaded (built across cores, `par_map`; bindings 4/5, 48 B nodes, `bla_meta` =
   `[min_level, levels, offsets…]`). Coefficients are floatexp (f32
   mantissas + i32 exponent), so a jump in the deep prologue lands straight
   at its output scale. `R` depends on the view's largest `|dc|`

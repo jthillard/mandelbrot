@@ -1915,17 +1915,37 @@ impl ExportRender {
         } else {
             1
         };
-        banded_data_pass(
-            device,
-            queue,
-            &mut encoder,
-            "export ci probe pass",
-            &data,
-            iterate,
-            &[&self.bind_group],
-            [width, height],
-            band_count(width, height, self.uniforms.max_iter, samples),
-        );
+        // Timed bands, as the export's: the worst-case bound alone cut deep
+        // probes (~1M `max_iter`) into one-row submissions, costlier than the
+        // full-size render.
+        let mut sizer = BandSizer::new(height.div_ceil(band_count(
+            width,
+            height,
+            self.uniforms.max_iter,
+            samples,
+        )));
+        let mut y0 = 0;
+        while y0 < height {
+            let y1 = (y0 + sizer.rows()).min(height);
+            let start = std::time::Instant::now();
+            let mut band_encoder = device.create_command_encoder(&Default::default());
+            band_pass(
+                &mut band_encoder,
+                "export ci probe pass",
+                &data,
+                iterate,
+                &[&self.bind_group],
+                Some((width, y0, y1)),
+                y0 == 0,
+            );
+            queue.submit([band_encoder.finish()]);
+            let _ = device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            sizer.observe(y1 - y0, start.elapsed().as_secs_f64());
+            y0 = y1;
+        }
         histogram.record(device, &mut encoder, &data, width, height, &hist, &staging);
         queue.submit(std::iter::once(encoder.finish()));
 
@@ -1948,11 +1968,7 @@ impl ExportRender {
     /// Band sizing for rendering this export, starting at the worst-case
     /// height; feed it each band's GPU time ([`BandSizer::observe`]).
     pub fn band_sizer(&self) -> BandSizer {
-        let rows = self.first_band_rows.max(1);
-        BandSizer {
-            rows,
-            min_rows: rows,
-        }
+        BandSizer::new(self.first_band_rows)
     }
 
     /// Render rows `[y0, y1)` into the export texture and submit them. The
@@ -2447,6 +2463,15 @@ pub struct BandSizer {
 }
 
 impl BandSizer {
+    /// Starting (and minimum) band height: the worst-case safe one.
+    fn new(rows: u32) -> Self {
+        let rows = rows.max(1);
+        Self {
+            rows,
+            min_rows: rows,
+        }
+    }
+
     pub fn rows(&self) -> u32 {
         self.rows
     }
