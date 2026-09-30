@@ -298,6 +298,22 @@ fn ldexp_sat(x: f32, k: i32) -> f32 {
     if x == 0.0 {
         return 0.0;
     }
+    // Normal x (the usual case): the same result by adding k to the
+    // exponent field, much cheaper than frexp + ldexp in this hot path.
+    // frexp's exponent is the biased field - 126; the checks keep the
+    // result's field in [1, 226], so the add can't carry into the sign.
+    let bits = bitcast<u32>(x);
+    let biased = i32((bits >> 23u) & 0xffu);
+    if biased != 0 && biased != 255 {
+        let ex = biased - 126 + k;
+        if ex > 100 {
+            return select(-LDEXP_SAT, LDEXP_SAT, x > 0.0);
+        }
+        if ex < -125 {
+            return 0.0;
+        }
+        return bitcast<f32>(bitcast<i32>(bits) + (k << 23u));
+    }
     let f = frexp(x);
     let ex = f.exp + k;
     if ex > 100 {
@@ -629,12 +645,16 @@ fn bla_lookup(m: u32, e_log2: f32, budget: u32) -> vec2<u32> {
         return best;
     }
     let top = min(tz - lmin, levels - 1u);
+    // Level offsets without loading them from `bla_meta` per level (one more
+    // dependent load each): level 0 starts at 0 and each level has half the
+    // previous one's nodes, rounded down (`bla::build`).
+    var base = 0u;
+    var count = bla_meta[3];
     for (var k: u32 = 0u; k <= top; k = k + 1u) {
         let l = lmin + k;
         let steps = 1u << l;
-        let base = bla_meta[2u + k];
         let local = j >> l;
-        if steps > budget || local >= bla_meta[3u + k] - base {
+        if steps > budget || local >= count {
             break;
         }
         let idx = base + local;
@@ -642,6 +662,8 @@ fn bla_lookup(m: u32, e_log2: f32, budget: u32) -> vec2<u32> {
             break;
         }
         best = vec2<u32>(idx, steps);
+        base = base + count;
+        count = count >> 1u;
     }
     return best;
 }

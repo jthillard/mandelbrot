@@ -253,7 +253,12 @@ pixel is a handful of `f32` complex multiplies.
   The deep path is exact at any depth: forcing it everywhere (raise
   `DEEP_PIXEL_SIZE`, raise `DEEP_EXIT_LOG2` to about -8) must reproduce the
   plain f32 renders on non-chaotic views. That's the check to rerun after
-  changing it. Known gaps: Lambda's critical point is 1/2, so its step keeps
+  changing it. At minibrot depths (seahorse 1e-200) this prologue is most
+  of the render: about 130 loop turns per pixel, one per BLA jump or plain
+  step around each near-zero reference point. It's ALU-bound, so
+  `ldexp_sat` adds to the exponent bits for normal inputs (−25% time).
+  Measured no help: reading `frexp`'s exponent from the bits, a branchless
+  `ldexp_sat`, uploading BLA levels 1–2. Known gaps: Lambda's critical point is 1/2, so its step keeps
   the input scale. Lambda set mode's reference sits at the origin, so it
   never reaches deep zooms anyway.
 - `src/fractal/bla.rs` — **bivariate linear approximation**: a table of
