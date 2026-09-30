@@ -517,6 +517,13 @@ pub struct FractalApp {
     auto_iterations: bool,
     color_scale: f32,
     color_offset: f32,
+    /// When set, `color_scale` stretches one palette cycle across the `ci`
+    /// range on screen (read back from the GPU, `FractalRenderer::take_ci_range`)
+    /// and the palette starts at its low end, `ci_lo`.
+    auto_color_scale: bool,
+    /// Lowest on-screen `ci` from the last auto fit; 0 while auto is off.
+    /// `color_offset` is relative to it (see `effective_color_offset`).
+    ci_lo: f32,
     palette: u32,
     shadow_palette: u32,
     /// Supersample each pixel 2×2 for smoother edges (costs ~4× fragment work).
@@ -716,6 +723,8 @@ impl FractalApp {
             auto_iterations: true,
             color_scale: 0.15,
             color_offset: 0.0,
+            auto_color_scale: false,
+            ci_lo: 0.0,
             palette: 0,
             shadow_palette: 0,
             antialias: false,
@@ -1052,7 +1061,7 @@ impl FractalApp {
             lambda_l: self.lambda_l,
             complex_power: self.complex_power,
             color_scale: self.color_scale,
-            color_offset: self.color_offset,
+            color_offset: self.effective_color_offset(),
             palette: self.palette,
             shadow_palette: self.shadow_palette,
         }
@@ -1074,6 +1083,9 @@ impl FractalApp {
         self.complex_power = s.complex_power;
         self.color_scale = s.color_scale;
         self.color_offset = s.color_offset;
+        // Like the iteration count: the link's explicit scale wins.
+        self.auto_color_scale = false;
+        self.ci_lo = 0.0;
         self.palette = (s.palette as usize).min(PALETTE_NAMES.len() - 1) as u32;
         self.shadow_palette =
             (s.shadow_palette as usize).min(SHADOW_PALETTE_NAMES.len() - 1) as u32;
@@ -1402,6 +1414,37 @@ impl FractalApp {
     /// Whether the classic escape-time palette (and its scale / offset /
     /// palette controls) is in use: always in classic mode, and in shadow/3D
     /// modes under the "Classic" shading palette.
+    /// The palette offset the shaders get: `color_offset`, shifted so the
+    /// palette starts at the auto fit's lowest on-screen `ci`.
+    fn effective_color_offset(&self) -> f32 {
+        (self.color_offset - self.ci_lo * self.color_scale).rem_euclid(1.0)
+    }
+
+    /// Pick up the GPU's latest on-screen `ci` range and refit the colour
+    /// scale to it (auto colour scale).
+    #[cfg(feature = "gui")]
+    fn poll_ci_stats(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(rs) = frame.wgpu_render_state() else {
+            return;
+        };
+        let mut guard = rs.renderer.write();
+        let Some(renderer) = guard.callback_resources.get_mut::<FractalRenderer>() else {
+            return;
+        };
+        let range = renderer.take_ci_range(&rs.device);
+        // Also one frame after a readback lands: the view may have changed
+        // while it was in flight, and that frame histograms it again.
+        if renderer.ci_stats_pending() || range.is_some() {
+            ctx.request_repaint();
+        }
+        if self.auto_color_scale
+            && let Some((lo, hi)) = range
+        {
+            self.color_scale = (1.0 / (hi - lo).max(1e-3)).clamp(1e-4, 1.0);
+            self.ci_lo = lo;
+        }
+    }
+
     fn uses_classic_palette(&self) -> bool {
         self.rendering_mode == 0 || self.shadow_palette == SHADOW_PALETTE_CLASSIC
     }
@@ -1458,7 +1501,7 @@ impl FractalApp {
             ],
             max_iter: self.max_iterations.min(MAX_REF_POINTS as u32 - 1),
             ref_len: self.reference.len() as u32,
-            color_offset: self.color_offset,
+            color_offset: self.effective_color_offset(),
             color_scale: self.color_scale,
             bailout_sq: bailout_sq(self.ref_kind.unwrap_or(self.kind), self.power),
             is_julia: matches!(self.mode, FractalMode::Julia) as u32,
@@ -2323,11 +2366,25 @@ impl FractalApp {
                 });
         }
         if self.uses_classic_palette() {
-            ui.add(
-                egui::Slider::new(&mut self.color_scale, 0.01..=1.0)
-                    .text("color scale")
-                    .logarithmic(true),
-            );
+            let was_auto = self.auto_color_scale;
+            ui.checkbox(&mut self.auto_color_scale, "Auto color scale")
+                .on_hover_text(
+                    "Stretch one palette cycle across the escape-time range visible on screen.",
+                );
+            if was_auto && !self.auto_color_scale {
+                // Fold the fit's start into the offset so nothing jumps.
+                self.color_offset = self.effective_color_offset();
+                self.ci_lo = 0.0;
+            }
+            if self.auto_color_scale {
+                ui.label(format!("color scale: {:.4} (auto)", self.color_scale));
+            } else {
+                ui.add(
+                    egui::Slider::new(&mut self.color_scale, 0.0001..=1.0)
+                        .text("color scale")
+                        .logarithmic(true),
+                );
+            }
             ui.add(egui::Slider::new(&mut self.color_offset, 0.0..=1.0).text("color offset"));
             egui::ComboBox::from_label("palette")
                 .selected_text(PALETTE_NAMES[self.palette as usize])
@@ -2978,6 +3035,7 @@ impl FractalApp {
                 reference: Arc::clone(&self.reference),
                 generation: self.generation,
                 size_px,
+                auto_color: self.auto_color_scale && self.uses_classic_palette(),
             },
         ));
     }
@@ -2987,6 +3045,7 @@ impl FractalApp {
 impl eframe::App for FractalApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll_export(ui.ctx());
+        self.poll_ci_stats(ui.ctx(), frame);
         self.update_fps(ui);
         // Track the real fullscreen state (e.g. the user pressing Esc/F11 or the
         // browser leaving fullscreen) so the toggle button label stays correct.

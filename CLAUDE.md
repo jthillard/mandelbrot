@@ -328,6 +328,14 @@ mip pyramid (quadtree height-field tracing) was tried and measured about 3×
 slower, because it needs about 12 costlier steps per ray. Don't reintroduce it.
 Orbiting the camera only re-runs the colourise pass, never iteration.
 
+**Auto color scale** (`CiStats` in `renderer.rs`, `ci_stats.wgsl`): after
+each iteration, a compute pass bins the data texture's `ci` into a log-scale
+histogram. It's read back asynchronously: copied in frame N, mapped in N+1
+(the copy has to be submitted first), and picked up by
+`FractalApp::poll_ci_stats`. The app then fits one palette cycle across the
+0.5–99.5th percentile. `ci_lo` shifts the offset (`effective_color_offset`),
+which is what exports and share links get.
+
 While the user is actively panning/zooming, the app renders downscaled with
 AA off (`INTERACT_DOWNSCALE`) and snaps back to full resolution once input
 settles (`INTERACT_SETTLE`).

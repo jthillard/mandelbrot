@@ -169,3 +169,11 @@ fn buddhabrot_shader_specializations_compile() {
         );
     }
 }
+
+#[test]
+fn ci_stats_shader_is_valid() {
+    validate(
+        "ci_stats.wgsl",
+        include_str!("../src/shaders/ci_stats.wgsl"),
+    );
+}

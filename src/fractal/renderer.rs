@@ -421,6 +421,198 @@ fn lipschitz_slots(width: u32, height: u32) -> Vec<u32> {
     (0..=top).rev().chain(std::iter::once(0)).collect()
 }
 
+/// Histogram bins of `ci_stats.wgsl` (must match its `CI_BINS`).
+const CI_BINS: usize = 1024;
+/// Upper end of the histogram's log2(1 + ci) range (`CI_LOG2_MAX` in WGSL).
+const CI_LOG2_MAX: f32 = 25.0;
+/// Fraction of escaped pixels ignored at each end of the `ci` range the auto
+/// colour scale fits: the few pixels hugging the boundary have `ci` near
+/// `max_iter` and would otherwise squash the rest into one palette band.
+const CI_TAIL: f64 = 0.005;
+
+/// Where the `ci` histogram readback is (see [`CiStats`]).
+enum CiStatsState {
+    Idle,
+    /// Histogram copied into `staging` by an encoder egui hasn't submitted
+    /// yet: mapping must wait for the next frame.
+    Copied,
+    /// `map_async` issued; the flag is set once the mapping completes.
+    Mapping(Arc<std::sync::atomic::AtomicBool>),
+}
+
+/// Auto colour scale: a compute pass bins the data texture's `ci` into a
+/// histogram (`ci_stats.wgsl`), read back asynchronously one or two frames
+/// later by [`FractalRenderer::take_ci_range`].
+struct CiStats {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    hist: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    state: CiStatsState,
+    /// The data texture changed since the last histogram was recorded.
+    stale: bool,
+}
+
+impl CiStats {
+    fn new(device: &wgpu::Device) -> Self {
+        let module = unsafe {
+            device.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("ci stats"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shaders/ci_stats.wgsl").into(),
+                    ),
+                },
+                wgpu::ShaderRuntimeChecks::unchecked(),
+            )
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ci stats bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ci stats pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("ci stats pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let size = (CI_BINS * std::mem::size_of::<u32>()) as u64;
+        let hist = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ci histogram"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ci histogram readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            pipeline,
+            layout,
+            hist,
+            staging,
+            state: CiStatsState::Idle,
+            stale: true,
+        }
+    }
+
+    /// Record the histogram of `data` (`width`×`height`) and its copy into
+    /// `staging`. The caller checks the state is `Idle`.
+    fn record(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        data: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ci stats bind group"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(data),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.hist.as_entire_binding(),
+                },
+            ],
+        });
+        encoder.clear_buffer(&self.hist, 0, None);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ci stats pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.hist, 0, &self.staging, 0, None);
+        self.state = CiStatsState::Copied;
+        self.stale = false;
+    }
+
+    /// Start mapping a histogram copied on an earlier (now submitted) frame.
+    fn start_map(&mut self) {
+        if let CiStatsState::Copied = self.state {
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&done);
+            self.staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |res| {
+                    if res.is_ok() {
+                        flag.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                });
+            self.state = CiStatsState::Mapping(done);
+        }
+    }
+}
+
+/// The `ci` range `[lo, hi]` between the [`CI_TAIL`] percentiles of a
+/// `ci_stats.wgsl` histogram, or `None` if no pixel escaped.
+fn ci_range(hist: &[u32]) -> Option<(f32, f32)> {
+    let total: u64 = hist.iter().map(|&n| n as u64).sum();
+    if total == 0 {
+        return None;
+    }
+    let bin_ci = |i: usize| {
+        let x = (i as f32 + 0.5) * (CI_LOG2_MAX / CI_BINS as f32);
+        x.exp2() - 1.0
+    };
+    let percentile = |p: f64| {
+        let target = (p * total as f64).ceil().max(1.0) as u64;
+        let mut acc = 0;
+        for (i, &n) in hist.iter().enumerate() {
+            acc += n as u64;
+            if acc >= target {
+                return i;
+            }
+        }
+        hist.len() - 1
+    };
+    Some((
+        bin_ci(percentile(CI_TAIL)),
+        bin_ci(percentile(1.0 - CI_TAIL)),
+    ))
+}
+
 /// The interactive iteration pipelines for one [`PipelineKey`].
 struct IteratePipelines {
     /// 1-spp perturbation iterate → data texture (`fs_data`).
@@ -587,6 +779,8 @@ pub struct FractalRenderer {
     iterated: Option<IterState>,
     /// What the colour texture holds; `None` forces a recolour.
     colored: Option<ColorState>,
+    /// Auto colour scale's `ci` histogram + readback.
+    ci_stats: CiStats,
 }
 
 impl FractalRenderer {
@@ -948,7 +1142,33 @@ impl FractalRenderer {
             cache: None,
             iterated: None,
             colored: None,
+            ci_stats: CiStats::new(device),
         }
+    }
+
+    /// The on-screen `ci` range from the latest auto-colour histogram, once
+    /// its readback has landed (`None` before that, or if nothing escaped).
+    pub fn take_ci_range(&mut self, device: &wgpu::Device) -> Option<(f32, f32)> {
+        let CiStatsState::Mapping(done) = &self.ci_stats.state else {
+            return None;
+        };
+        let _ = device.poll(wgpu::PollType::Poll);
+        if !done.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let staging = &self.ci_stats.staging;
+        let range = {
+            let data = staging.slice(..).get_mapped_range().ok()?;
+            ci_range(bytemuck::cast_slice(&data))
+        };
+        staging.unmap();
+        self.ci_stats.state = CiStatsState::Idle;
+        range
+    }
+
+    /// A histogram is on its way back: keep repainting to pick it up.
+    pub fn ci_stats_pending(&self) -> bool {
+        !matches!(self.ci_stats.state, CiStatsState::Idle)
     }
 
     /// Ensure the cache textures exist at `width`×`height` (plus the AA refine
@@ -1917,6 +2137,9 @@ pub struct FractalCallback {
     pub generation: u64,
     /// Widget size in physical pixels — the cache texture resolution.
     pub size_px: [u32; 2],
+    /// Histogram each new iteration for the auto colour scale
+    /// ([`FractalRenderer::take_ci_range`]).
+    pub auto_color: bool,
 }
 
 #[cfg(feature = "gui")]
@@ -1965,6 +2188,28 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
                     || c.lights != self.lights
                     || color_differs(&c.uniforms, &self.uniforms)
             });
+
+        // Last frame's histogram copy has been submitted by now: map it.
+        renderer.ci_stats.start_map();
+        if iter_dirty {
+            renderer.ci_stats.stale = true;
+        }
+        // Histogram the data texture when auto colour needs one: after this
+        // frame's iteration (recorded below), or now if the texture is
+        // already current (auto just turned on, or a readback was in flight
+        // when it last changed).
+        let wants_stats = self.auto_color
+            && renderer.ci_stats.stale
+            && matches!(renderer.ci_stats.state, CiStatsState::Idle);
+        if wants_stats
+            && !iter_dirty
+            && let Some(cache) = &renderer.cache
+        {
+            let src = cache.aa.as_ref().map_or(&cache.data_view, |(v, _)| v);
+            renderer
+                .ci_stats
+                .record(device, egui_encoder, src, cache.width, cache.height);
+        }
 
         if !color_dirty {
             return Vec::new(); // cache still valid; paint() just blits it
@@ -2056,6 +2301,12 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
                         [width, height],
                         band_count(width, height, max_iter, aa * aa),
                     );
+                }
+                if wants_stats {
+                    let src = cache.aa.as_ref().map_or(&cache.data_view, |(v, _)| v);
+                    renderer
+                        .ci_stats
+                        .record(device, egui_encoder, src, width, height);
                 }
             }
 
