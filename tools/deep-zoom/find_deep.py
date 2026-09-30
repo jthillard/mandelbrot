@@ -11,7 +11,9 @@ minibrot of size ~r^2, found by:
   3. the standard size estimate (Heiland-Allen) for its scale.
 
 Zooming at the nucleus shows spirals, then an embedded Julia set (around
-size^0.75), then the minibrot (half-height ~3x size).
+size^0.75), then the minibrot (half-height ~3x size). The spirals take
+the first half of the zoom: for zooms that keep changing shape, use
+morph.py / search.py instead.
 
 Usage:
   find_deep.py REGION DEPTH [OFFSET_RE,OFFSET_IM]
