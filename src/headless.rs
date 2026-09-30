@@ -9,14 +9,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 
 use crate::app::{FractalApp, RefJob, parse_complex_pair, unix_timestamp};
 use crate::cli::Cli;
 use crate::fractal::bla;
+use crate::fractal::renderer::ExportHandles;
 use crate::fractal::{
-    ExportRender, FractalKind, FractalRenderer, PipelineKey, ShareState, encode_png,
+    ExportRender, FractalKind, FractalRenderer, PipelineKey, RefOrbit, ShareState, encode_png,
     export_to_png_blocking, render_readback_blocking, unpad_rgba,
 };
 use crate::view::{
@@ -30,15 +31,25 @@ const MAX_DIM: u32 = 8192 * 16;
 /// `--export-path` value meaning "write to stdout".
 const STDOUT_PATH: &str = "-";
 
-/// First orbit length tried for a still with auto-iterations (see
-/// [`run`]); grown 4× per probe until no pixel gets near its end.
+/// First orbit length tried with auto-iterations (see [`Exporter::build`]);
+/// grown 4× per probe until no pixel gets near its end.
 const PROBE_FIRST_LEN: u32 = 8192;
+
+/// How many frames past the last rendered one an animation computes probed
+/// (prefix) orbits, so they get a recent length hint.
+const PROBE_LAG: usize = 2;
 
 /// Probe only when the whole orbit (+ its BLA table) would take longer than
 /// this: each probe is a GPU pass plus a BLA rebuild, and minibrot dives
 /// climb all the way to the full length anyway (seahorse 1e-200: 80 ms of
 /// orbit, +0.4 s of probes).
 const PROBE_MIN_SECS: f64 = 0.25;
+
+/// Whether to compute only a prefix of `full`'s orbit and probe it (see
+/// [`Exporter::build`]): with auto-iterations, when the whole orbit is costly.
+fn probes(app: &FractalApp, full: &RefJob) -> bool {
+    app.auto_iterations() && orbit_secs(full.steps(), full.precision()) > PROBE_MIN_SECS
+}
 
 /// Rough CPU time of `steps` reference steps at `precision` bits plus their
 /// BLA nodes, fitted on a Ryzen with GMP: ~0.4 µs/step (allocation, f32
@@ -91,64 +102,23 @@ pub fn run(cli: Cli) -> Result<(), String> {
 
     let export_path = export_path.unwrap_or_else(|| format!("fractal-{}.png", unix_timestamp()));
 
-    // Auto-iterations ask for 400 + 900·decades steps, all computed when the
-    // reference never escapes (e.g. c = -1.5 at 1e-1000: 900k steps of
-    // 3000-bit arithmetic, plus the BLA table over them), even when every
-    // pixel has escaped by step 10k. So compute a prefix of the orbit and
-    // probe (downscaled prepass) how far pixels follow it: the shader treats
-    // an exhausted reference as an escape, so while no pixel gets near the
-    // end, the image is the same as with the whole orbit. Otherwise grow 4×.
-    let probe = app.auto_iterations() && {
-        let (steps, precision) = app.reference_work();
-        orbit_secs(steps, precision) > PROBE_MIN_SECS
+    // A costly orbit starts as a prefix, probed and grown by `Exporter::build`.
+    let full = app.reference_job();
+    let job = if probes(&app, &full) {
+        full.prefix(PROBE_FIRST_LEN)
+    } else {
+        full.clone()
     };
-    let mut len = PROBE_FIRST_LEN;
     let device_thread = std::thread::spawn(|| pollster::block_on(request_device()));
     eprintln!("computing reference orbit…");
-    let mut complete = if probe {
-        app.compute_reference_prefix_blocking(len)
-    } else {
-        app.compute_reference_blocking();
-        true
-    };
+    let points = job.compute();
 
     let (device, queue) = device_thread
         .join()
         .map_err(|_| "GPU setup panicked".to_string())??;
-    let format = wgpu::TextureFormat::Bgra8Unorm;
-    let renderer = FractalRenderer::new(&device, format);
     let auto_color = app.auto_color_active();
-    let mut handles: Option<(PipelineKey, _)> = None;
-    let mut er = loop {
-        let uniforms = app.make_uniforms(width as f64 / height as f64, height as f64);
-        let key = PipelineKey::from_uniforms(&uniforms);
-        if handles.as_ref().is_none_or(|(k, _)| *k != key) {
-            let h = renderer.export_handles(&device, &uniforms, auto_color || !complete);
-            handles = Some((key, h));
-        }
-        let er = ExportRender::new(
-            &device,
-            &queue,
-            &handles.as_ref().unwrap().1,
-            width,
-            height,
-            uniforms,
-            app.reference_points(),
-            &bla::for_uniforms(app.reference_points(), &uniforms, app.use_bla()),
-            app.lights(),
-        );
-        if complete {
-            break er;
-        }
-        match er.max_escape_blocking(&device, &queue) {
-            // 2× margin: the full image samples finer than the probe.
-            Some(n) if n < len as f64 / 2.0 => break er,
-            _ => {
-                len = len.saturating_mul(4);
-                complete = app.compute_reference_prefix_blocking(len);
-            }
-        }
-    };
+    let mut exporter = Exporter::new(&device, &queue, width, height, auto_color);
+    let (mut er, _) = exporter.build(&mut app, &full, job, points);
     if auto_color {
         match fit_auto_color(&mut app, &mut er, &device, &queue) {
             Some((lo, hi)) => eprintln!("auto color scale: ci {lo:.1}–{hi:.1}"),
@@ -422,13 +392,19 @@ fn run_animation(
         .collect();
 
     let (device, queue) = pollster::block_on(request_device())?;
-    let format = wgpu::TextureFormat::Bgra8Unorm;
-    let renderer = FractalRenderer::new(&device, format);
-    let aspect = width as f64 / height as f64;
     // Refit per frame from the same start, so each frame's colours depend only
     // on that frame (frames render out of order, and shards must join up).
     let auto_color = app.auto_color_active();
     let color_fit0 = app.color_fit();
+    // Frames whose whole orbit is costly get a prefix (see `Exporter::build`)
+    // this long: 4× the latest escape the last probed frame saw, so frames
+    // zooming a little deeper than it mostly pass their first probe. Those
+    // prefixes take milliseconds, so they're computed just in time (at most
+    // `PROBE_LAG` frames past the last rendered one) to see a recent hint; a
+    // failed probe recomputes on the GPU thread.
+    let probe: Vec<bool> = jobs.iter().map(|job| probes(&app, job)).collect();
+    let len_hint = AtomicU32::new(PROBE_FIRST_LEN);
+    let rendered = AtomicUsize::new(0);
 
     // Three-stage pipeline, connected by bounded channels (which also cap
     // memory): `threads` workers compute reference orbits (CPU, the expensive
@@ -465,10 +441,12 @@ fn run_animation(
     let png_rx = Mutex::new(png_rx);
     let (raw_tx, raw_rx) = mpsc::sync_channel::<(usize, Vec<u8>)>(threads * 2);
     std::thread::scope(|scope| {
-        let (ref_tx, ref_rx) = mpsc::sync_channel::<(usize, crate::fractal::RefOrbit)>(threads * 2);
+        let (ref_tx, ref_rx) = mpsc::sync_channel::<(usize, RefJob, RefOrbit)>(threads * 2);
         for _ in 0..threads {
             let ref_tx = ref_tx.clone();
-            let (jobs, next_job, saved, failed) = (&jobs, &next_job, &saved, &failed);
+            let (jobs, probe, len_hint, rendered, next_job, saved, failed) = (
+                &jobs, &probe, &len_hint, &rendered, &next_job, &saved, &failed,
+            );
             scope.spawn(move || {
                 loop {
                     let i = next_job.fetch_add(1, Ordering::Relaxed);
@@ -481,7 +459,20 @@ fn run_animation(
                     {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
-                    if ref_tx.send((i, jobs[i].compute())).is_err() {
+                    let job = if probe[i] {
+                        // Can't deadlock: every frame before `i` was claimed
+                        // earlier, and the lowest unrendered one never waits.
+                        while i > rendered.load(Ordering::Relaxed) + PROBE_LAG
+                            && !failed.load(Ordering::Relaxed)
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        jobs[i].prefix(len_hint.load(Ordering::Relaxed))
+                    } else {
+                        jobs[i].clone()
+                    };
+                    let points = job.compute();
+                    if ref_tx.send((i, job, points)).is_err() {
                         break;
                     }
                 }
@@ -550,32 +541,19 @@ fn run_animation(
 
         // GPU stage, on this thread (it owns the app and the device). The
         // shader specialization (kind, Julia, DE, morph) can change between
-        // frames during a kind morph; build each pipeline once.
-        let mut pipelines = HashMap::new();
-        for (i, points) in ref_rx.iter() {
+        // frames during a kind morph; `exporter` builds each pipeline once.
+        let mut exporter = Exporter::new(&device, &queue, width, height, auto_color);
+        for (i, job, points) in ref_rx.iter() {
             if failed.load(Ordering::Relaxed) {
                 break;
             }
             apply_frame(&mut app, first + i as u32);
-            app.finish_reference(jobs[i].clone(), points);
-
-            let uniforms = app.make_uniforms(aspect, height as f64);
-            let handles = pipelines
-                .entry(PipelineKey::from_uniforms(&uniforms))
-                .or_insert_with(|| renderer.export_handles(&device, &uniforms, auto_color));
-            let mut er = ExportRender::new(
-                &device,
-                &queue,
-                handles,
-                width,
-                height,
-                uniforms,
-                app.reference_points(),
-                // Built here rather than in the orbit pool: it needs this
-                // frame's uniforms, and costs ~1 ms per 100k points.
-                &bla::for_uniforms(app.reference_points(), &uniforms, app.use_bla()),
-                app.lights(),
-            );
+            let (mut er, escape) = exporter.build(&mut app, &jobs[i], job, points);
+            if let Some(n) = escape {
+                // `as` saturates.
+                len_hint.store(((4.0 * n) as u32).max(PROBE_FIRST_LEN), Ordering::Relaxed);
+            }
+            rendered.fetch_add(1, Ordering::Relaxed);
             if auto_color {
                 app.set_color_fit(color_fit0);
                 fit_auto_color(&mut app, &mut er, &device, &queue);
@@ -618,6 +596,96 @@ fn run_animation(
         );
     }
     Ok(())
+}
+
+/// Builds each frame's [`ExportRender`] on one device, caching the export
+/// pipelines per shader specialization.
+struct Exporter<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    renderer: FractalRenderer,
+    /// Keyed by specialization and whether the `ci` probe pass is built.
+    handles: HashMap<(PipelineKey, bool), ExportHandles>,
+    width: u32,
+    height: u32,
+    auto_color: bool,
+}
+
+impl<'a> Exporter<'a> {
+    fn new(
+        device: &'a wgpu::Device,
+        queue: &'a wgpu::Queue,
+        width: u32,
+        height: u32,
+        auto_color: bool,
+    ) -> Self {
+        Self {
+            device,
+            queue,
+            renderer: FractalRenderer::new(device, wgpu::TextureFormat::Bgra8Unorm),
+            handles: HashMap::new(),
+            width,
+            height,
+            auto_color,
+        }
+    }
+
+    /// Install `points`, the orbit computed for `job` (`full` or a
+    /// [`prefix`](RefJob::prefix) of it), and build the frame's render.
+    ///
+    /// Auto-iterations ask for 400 + 900·decades steps, all computed when the
+    /// reference never escapes (e.g. c = -1.5 at 1e-1000: 900k steps of
+    /// 3000-bit arithmetic, plus the BLA table over them), even when every
+    /// pixel has escaped by step 10k. So callers may compute a prefix, which
+    /// is probed here (downscaled prepass) for how far pixels follow it: the
+    /// shader treats an exhausted reference as an escape, so while no pixel
+    /// gets near the end, the image is the same as with the whole orbit.
+    /// Otherwise the prefix grows 4× and is probed again.
+    ///
+    /// Also returns the latest escape the accepted probe saw, if it probed.
+    fn build(
+        &mut self,
+        app: &mut FractalApp,
+        full: &RefJob,
+        mut job: RefJob,
+        mut points: RefOrbit,
+    ) -> (ExportRender, Option<f64>) {
+        loop {
+            let len = job.steps();
+            let whole = job.is_whole(full.steps(), &points);
+            app.finish_reference(job, points);
+            let uniforms =
+                app.make_uniforms(self.width as f64 / self.height as f64, self.height as f64);
+            let probe = self.auto_color || !whole;
+            let handles = self
+                .handles
+                .entry((PipelineKey::from_uniforms(&uniforms), probe))
+                .or_insert_with(|| self.renderer.export_handles(self.device, &uniforms, probe));
+            let er = ExportRender::new(
+                self.device,
+                self.queue,
+                handles,
+                self.width,
+                self.height,
+                uniforms,
+                app.reference_points(),
+                // Needs this frame's uniforms; ~15 ms per 100k points.
+                &bla::for_uniforms(app.reference_points(), &uniforms, app.use_bla()),
+                app.lights(),
+            );
+            if whole {
+                return (er, None);
+            }
+            match er.max_escape_blocking(self.device, self.queue) {
+                // 2× margin: the full image samples finer than the probe.
+                Some(n) if n < len as f64 / 2.0 => return (er, Some(n)),
+                _ => {
+                    job = full.prefix(len.saturating_mul(4));
+                    points = job.compute();
+                }
+            }
+        }
+    }
 }
 
 /// Auto colour scale: fit `app`'s colour scale to `er`'s image (a prepass)

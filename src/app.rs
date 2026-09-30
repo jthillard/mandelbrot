@@ -197,6 +197,32 @@ pub(crate) struct RefJob {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl RefJob {
+    /// Orbit steps this job computes.
+    pub(crate) fn steps(&self) -> u32 {
+        self.key.iter
+    }
+
+    /// Working precision, in bits.
+    pub(crate) fn precision(&self) -> usize {
+        self.precision
+    }
+
+    /// This job with the orbit cut after `len` steps. `max_iterations` is
+    /// unchanged: the shader treats the exhausted reference as an escape, so
+    /// the render only differs if some pixel gets that far (headless probes
+    /// for that before paying for the whole orbit).
+    pub(crate) fn prefix(&self, len: u32) -> RefJob {
+        let mut job = self.clone();
+        job.key.iter = job.key.iter.min(len);
+        job
+    }
+
+    /// Whether `points`, computed for this job, is the whole orbit `full`
+    /// steps would give: not cut, or the reference escaped before the cut.
+    pub(crate) fn is_whole(&self, full: u32, points: &RefOrbit) -> bool {
+        self.key.iter >= full || points.len() <= self.key.iter as usize
+    }
+
     /// Iterate the reference orbit at full precision (the expensive part).
     pub(crate) fn compute(&self) -> RefOrbit {
         let key = &self.key;
@@ -964,7 +990,7 @@ impl FractalApp {
     }
 
     /// Force `max_iterations` to auto-scale with zoom depth on every
-    /// subsequent `compute_reference_blocking` call. Used by headless
+    /// subsequent `reference_job` call. Used by headless
     /// animation so iteration count keeps pace with the camera zooming in,
     /// the same way it does while dragging/zooming interactively.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1427,41 +1453,6 @@ impl FractalApp {
         }
     }
 
-    /// Compute the reference orbit for the current view synchronously, on the
-    /// calling thread — unlike `ensure_reference`, which dispatches to the
-    /// native worker (or, on wasm, computes inline but still runs once per
-    /// frame poll). Used by headless rendering, which has no frame loop to
-    /// poll a background result on and only ever needs one reference.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn compute_reference_blocking(&mut self) {
-        let job = self.reference_job();
-        let points = job.compute();
-        self.finish_reference(job, points);
-    }
-
-    /// [`compute_reference_blocking`](Self::compute_reference_blocking), but
-    /// with the orbit cut after `len` steps; `max_iterations` is unchanged.
-    /// Returns whether the orbit is the whole one the view asks for (not
-    /// cut, or it escaped before `len`). Headless probes how far pixels
-    /// really follow the reference before paying for the rest.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn compute_reference_prefix_blocking(&mut self, len: u32) -> bool {
-        let mut job = self.reference_job();
-        let full = job.key.iter;
-        job.key.iter = full.min(len);
-        let points = job.compute();
-        let complete = job.key.iter == full || points.len() <= job.key.iter as usize;
-        self.finish_reference(job, points);
-        complete
-    }
-
-    /// Orbit length and precision (bits) the current view's reference needs.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn reference_work(&mut self) -> (u32, usize) {
-        let job = self.reference_job();
-        (job.key.iter, job.precision)
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn auto_iterations(&self) -> bool {
         self.auto_iterations
@@ -1470,7 +1461,7 @@ impl FractalApp {
     /// Snapshot everything the reference orbit for the current view depends
     /// on, as a self-contained job that can be computed on another thread
     /// (headless animation computes many frames' orbits in parallel). Also
-    /// applies auto-iterations, like `compute_reference_blocking`.
+    /// applies auto-iterations.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn reference_job(&mut self) -> RefJob {
         if self.auto_iterations {

@@ -60,7 +60,10 @@ computes only a prefix (8192 steps, then ×4) and probes it with the same
 prepass (`max_escape_blocking`): the shader treats an exhausted reference
 as an escape, so once the last probe escape is under half the prefix the
 image is unchanged (c = -1.5 at 1e-1000 needs ~10k of the 900k auto steps).
-Device setup runs on a thread meanwhile. Run
+Device setup runs on a thread meanwhile. Stills and animation frames share
+this loop (`Exporter::build`). In animations, probed frames' prefixes start
+at 4× the last probe's escape (`len_hint`) and are computed just in time,
+at most `PROBE_LAG` frames ahead of the GPU, so the hint is recent. Run
 `mandelbrot --help` for the full list.
 
 `--headless` also has an animation mode, for feeding into `ffmpeg`: give any
