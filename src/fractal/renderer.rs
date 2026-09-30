@@ -2070,6 +2070,7 @@ pub fn export_to_png_blocking(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     er: &ExportRender,
+    compression: png::Compression,
     mut on_progress: impl FnMut(&'static str, f32),
 ) -> Vec<u8> {
     // Progress budget: rendering fills [0, RENDER_END], encoding the rest.
@@ -2099,9 +2100,15 @@ pub fn export_to_png_blocking(
             .slice(..)
             .get_mapped_range()
             .expect("map readback buffer");
-        encode_png_with_progress(&data, er.width, er.height, er.padded_bpr, er.swap_rb, |f| {
-            on_progress("Encoding", RENDER_END + (0.97 - RENDER_END) * f)
-        })
+        encode_png_with_progress(
+            &data,
+            er.width,
+            er.height,
+            er.padded_bpr,
+            er.swap_rb,
+            compression,
+            |f| on_progress("Encoding", RENDER_END + (0.97 - RENDER_END) * f),
+        )
     };
     er.readback().unmap();
     png
@@ -2205,6 +2212,7 @@ pub fn encode_png_with_progress(
     height: u32,
     padded_bpr: u32,
     swap_rb: bool,
+    compression: png::Compression,
     mut on_progress: impl FnMut(f32),
 ) -> Vec<u8> {
     use std::io::Write as _;
@@ -2215,6 +2223,7 @@ pub fn encode_png_with_progress(
         let mut encoder = png::Encoder::new(&mut out, width, height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(compression);
         let mut writer = encoder.write_header().expect("png header");
         let mut stream = writer.stream_writer().expect("png stream");
         let mut line = vec![0u8; row];
@@ -2405,6 +2414,7 @@ const BAND_TARGET_SECS: f64 = 0.05;
 #[derive(Clone, Copy, Debug)]
 pub struct BandSizer {
     rows: u32,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     min_rows: u32,
 }
 

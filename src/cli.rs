@@ -107,6 +107,12 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub export_path: Option<String>,
 
+    /// PNG compression for --headless output. "fast" encodes several times
+    /// quicker (at 1080p it otherwise takes longer than a deep render
+    /// itself) for somewhat larger files; "balanced"/"high" for smaller ones.
+    #[arg(long, value_enum, default_value_t = PngCompressionArg::Fast)]
+    pub png_compression: PngCompressionArg,
+
     /// End view for an animation: "re,im,half_height[,iterations]", the same
     /// syntax as --view. Combine with --view (or --share, --kind, --julia...)
     /// for the start view; headless then renders a sequence of frames
@@ -242,6 +248,24 @@ pub enum KindArg {
     Lambda,
     #[value(alias = "cmulti")]
     ComplexMultibrot,
+}
+
+#[derive(Copy, Clone, Debug, Default, ValueEnum)]
+pub enum PngCompressionArg {
+    #[default]
+    Fast,
+    Balanced,
+    High,
+}
+
+impl From<PngCompressionArg> for png::Compression {
+    fn from(c: PngCompressionArg) -> Self {
+        match c {
+            PngCompressionArg::Fast => png::Compression::Fast,
+            PngCompressionArg::Balanced => png::Compression::Balanced,
+            PngCompressionArg::High => png::Compression::High,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

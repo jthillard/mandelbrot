@@ -95,7 +95,9 @@ state is a pure function of `t` (`apply_frame`), so all frames'
 `FractalApp::reference_job`s are snapshotted up front and `RefJob::compute`d
 by a worker pool. The main thread renders them on the GPU as they arrive
 (out of order), and another pool PNG-encodes and writes them
-(`encode_png`, `Compression::Fast`). Channels are bounded. Once orbits and
+(`encode_png`). PNGs (stills too) default to `Compression::Fast`
+(`--png-compression`): the default zlib level took longer than a deep
+render itself, for ~7% smaller files. Channels are bounded. Once orbits and
 encoding are off the main thread, the GPU is usually the bottleneck.
 
 There's no GPU in most sandboxes: `cargo check`/`cargo test --test shader_valid`

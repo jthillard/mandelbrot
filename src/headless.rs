@@ -54,6 +54,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
     // consumes `cli` to build the start state.
     let targets = AnimTargets::from_cli(&cli)?;
     let export_path = cli.export_path.clone();
+    let compression = png::Compression::from(cli.png_compression);
     if export_path.as_deref() == Some(STDOUT_PATH) {
         check_stdout_piped()?;
     }
@@ -67,7 +68,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
     app.set_output_size(width, height);
 
     if targets.any() {
-        return run_animation(app, targets, width, height, export_path);
+        return run_animation(app, targets, width, height, export_path, compression);
     }
 
     let export_path = export_path.unwrap_or_else(|| format!("fractal-{}.png", unix_timestamp()));
@@ -101,7 +102,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
     }
 
     eprintln!("rendering {width}×{height}…");
-    let png = export_to_png_blocking(&device, &queue, &er, |phase, fraction| {
+    let png = export_to_png_blocking(&device, &queue, &er, compression, |phase, fraction| {
         eprint!("\r{phase} {:>3.0}%", fraction * 100.0);
     });
     eprintln!();
@@ -240,6 +241,7 @@ fn run_animation(
     width: u32,
     height: u32,
     export_path: Option<String>,
+    compression: png::Compression,
 ) -> Result<(), String> {
     let fps = targets.fps;
     let frames = match targets.frames {
@@ -479,8 +481,7 @@ fn run_animation(
                         let _ = raw_tx.send((i, raw));
                         continue;
                     }
-                    let png =
-                        encode_png(&padded, width, height, bpr, swap_rb, png::Compression::Fast);
+                    let png = encode_png(&padded, width, height, bpr, swap_rb, compression);
                     let path = format!("{out_dir}/frame-{:05}.png", first as usize + i + 1);
                     if let Err(e) = std::fs::write(&path, &png) {
                         fail(format!("save failed: {e}"));

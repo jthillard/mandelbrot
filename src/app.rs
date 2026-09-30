@@ -1719,10 +1719,13 @@ impl FractalApp {
                     &device, &queue, &handles, w, h, uniforms, &reference, &bla, &lights,
                 );
                 let sh = Arc::clone(&shared);
-                let png =
-                    crate::fractal::export_to_png_blocking(&device, &queue, &er, |phase, f| {
-                        set_progress(&sh, phase, f)
-                    });
+                let png = crate::fractal::export_to_png_blocking(
+                    &device,
+                    &queue,
+                    &er,
+                    png::Compression::Fast,
+                    |phase, f| set_progress(&sh, phase, f),
+                );
 
                 set_progress(&shared, "Saving", 0.98);
                 let result = std::fs::write(&name, &png)
@@ -1779,6 +1782,7 @@ impl FractalApp {
                         er.height,
                         er.padded_bpr,
                         er.swap_rb,
+                        png::Compression::Fast,
                         |f| set_progress(&sh, "Encoding", RENDER_END + (0.97 - RENDER_END) * f),
                     )
                 };
