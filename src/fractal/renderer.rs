@@ -1849,6 +1849,36 @@ impl ExportRender {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Option<(f32, f32)> {
+        ci_range(&self.probe_histogram_blocking(device, queue)?)
+    }
+
+    /// Upper bound on the step at which the last pixel escaped, from the same
+    /// downscaled prepass as [`ci_range_blocking`](Self::ci_range_blocking)
+    /// (`ci` = sqrt of the smooth count; `Some(0)` if nothing escaped). A
+    /// pixel that ran off the end of a cut reference counts as escaping
+    /// there (or reads as a huge `ci`), so this also says whether a longer
+    /// orbit could change the image. `None` if the readback failed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn max_escape_blocking(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<f64> {
+        let hist = self.probe_histogram_blocking(device, queue)?;
+        let Some(top) = hist.iter().rposition(|&n| n != 0) else {
+            return Some(0.0);
+        };
+        if top + 1 >= CI_BINS {
+            return Some(f64::INFINITY); // clamped: off the histogram's range
+        }
+        let ci = ((top + 1) as f64 * (CI_LOG2_MAX as f64 / CI_BINS as f64)).exp2() - 1.0;
+        Some(ci * ci + 1.0)
+    }
+
+    /// Iterate the downscaled 1-spp prepass and read back its `ci`
+    /// histogram (`ci_stats.wgsl`).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn probe_histogram_blocking(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Option<Vec<u32>> {
         let (iterate, histogram) = self
             .probe
             .as_ref()
@@ -1910,11 +1940,9 @@ impl ExportRender {
             timeout: None,
         });
         rx.recv().ok()?.ok()?;
-        let range = ci_range(bytemuck::cast_slice(
-            &staging.slice(..).get_mapped_range().ok()?,
-        ));
+        let hist = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().ok()?).to_vec();
         staging.unmap();
-        range
+        Some(hist)
     }
 
     /// Band sizing for rendering this export, starting at the worst-case

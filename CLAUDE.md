@@ -54,7 +54,13 @@ window/event loop. Not yet supported with `--buddhabrot`. With
 `--auto-color-scale`, a downscaled 1-spp `fs_data` prepass
 (`ExportRender::ci_range_blocking`, ≤ 1024 px) is histogrammed like the
 interactive `CiStats`. The fit is then written into the export's uniforms,
-and animations refit every frame from the same start. Run
+and animations refit every frame from the same start. With auto-iterations,
+a still whose full orbit would be costly (`orbit_secs` > `PROBE_MIN_SECS`)
+computes only a prefix (8192 steps, then ×4) and probes it with the same
+prepass (`max_escape_blocking`): the shader treats an exhausted reference
+as an escape, so once the last probe escape is under half the prefix the
+image is unchanged (c = -1.5 at 1e-1000 needs ~10k of the 900k auto steps).
+Device setup runs on a thread meanwhile. Run
 `mandelbrot --help` for the full list.
 
 `--headless` also has an animation mode, for feeding into `ffmpeg`: give any

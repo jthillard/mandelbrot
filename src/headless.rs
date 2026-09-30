@@ -30,6 +30,24 @@ const MAX_DIM: u32 = 8192 * 16;
 /// `--export-path` value meaning "write to stdout".
 const STDOUT_PATH: &str = "-";
 
+/// First orbit length tried for a still with auto-iterations (see
+/// [`run`]); grown 4× per probe until no pixel gets near its end.
+const PROBE_FIRST_LEN: u32 = 8192;
+
+/// Probe only when the whole orbit (+ its BLA table) would take longer than
+/// this: each probe is a GPU pass plus a BLA rebuild, and minibrot dives
+/// climb all the way to the full length anyway (seahorse 1e-200: 80 ms of
+/// orbit, +0.4 s of probes).
+const PROBE_MIN_SECS: f64 = 0.25;
+
+/// Rough CPU time of `steps` reference steps at `precision` bits plus their
+/// BLA nodes, fitted on a Ryzen with GMP: ~0.4 µs/step (allocation, f32
+/// conversion, BLA) + 3e-4 µs × limbs² for the multiplies.
+fn orbit_secs(steps: u32, precision: usize) -> f64 {
+    let limbs = precision.div_ceil(64) as f64;
+    steps as f64 * (0.4 + 3e-4 * limbs * limbs) * 1e-6
+}
+
 /// Refuse to dump binary image data onto a terminal.
 fn check_stdout_piped() -> Result<(), String> {
     if std::io::stdout().is_terminal() {
@@ -73,27 +91,64 @@ pub fn run(cli: Cli) -> Result<(), String> {
 
     let export_path = export_path.unwrap_or_else(|| format!("fractal-{}.png", unix_timestamp()));
 
+    // Auto-iterations ask for 400 + 900·decades steps, all computed when the
+    // reference never escapes (e.g. c = -1.5 at 1e-1000: 900k steps of
+    // 3000-bit arithmetic, plus the BLA table over them), even when every
+    // pixel has escaped by step 10k. So compute a prefix of the orbit and
+    // probe (downscaled prepass) how far pixels follow it: the shader treats
+    // an exhausted reference as an escape, so while no pixel gets near the
+    // end, the image is the same as with the whole orbit. Otherwise grow 4×.
+    let probe = app.auto_iterations() && {
+        let (steps, precision) = app.reference_work();
+        orbit_secs(steps, precision) > PROBE_MIN_SECS
+    };
+    let mut len = PROBE_FIRST_LEN;
+    let device_thread = std::thread::spawn(|| pollster::block_on(request_device()));
     eprintln!("computing reference orbit…");
-    app.compute_reference_blocking();
+    let mut complete = if probe {
+        app.compute_reference_prefix_blocking(len)
+    } else {
+        app.compute_reference_blocking();
+        true
+    };
 
-    let (device, queue) = pollster::block_on(request_device())?;
+    let (device, queue) = device_thread
+        .join()
+        .map_err(|_| "GPU setup panicked".to_string())??;
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let renderer = FractalRenderer::new(&device, format);
-    let uniforms = app.make_uniforms(width as f64 / height as f64, height as f64);
     let auto_color = app.auto_color_active();
-    let handles = renderer.export_handles(&device, &uniforms, auto_color);
-
-    let mut er = ExportRender::new(
-        &device,
-        &queue,
-        &handles,
-        width,
-        height,
-        uniforms,
-        app.reference_points(),
-        &bla::for_uniforms(app.reference_points(), &uniforms, app.use_bla()),
-        app.lights(),
-    );
+    let mut handles: Option<(PipelineKey, _)> = None;
+    let mut er = loop {
+        let uniforms = app.make_uniforms(width as f64 / height as f64, height as f64);
+        let key = PipelineKey::from_uniforms(&uniforms);
+        if handles.as_ref().is_none_or(|(k, _)| *k != key) {
+            let h = renderer.export_handles(&device, &uniforms, auto_color || !complete);
+            handles = Some((key, h));
+        }
+        let er = ExportRender::new(
+            &device,
+            &queue,
+            &handles.as_ref().unwrap().1,
+            width,
+            height,
+            uniforms,
+            app.reference_points(),
+            &bla::for_uniforms(app.reference_points(), &uniforms, app.use_bla()),
+            app.lights(),
+        );
+        if complete {
+            break er;
+        }
+        match er.max_escape_blocking(&device, &queue) {
+            // 2× margin: the full image samples finer than the probe.
+            Some(n) if n < len as f64 / 2.0 => break er,
+            _ => {
+                len = len.saturating_mul(4);
+                complete = app.compute_reference_prefix_blocking(len);
+            }
+        }
+    };
     if auto_color {
         match fit_auto_color(&mut app, &mut er, &device, &queue) {
             Some((lo, hi)) => eprintln!("auto color scale: ci {lo:.1}–{hi:.1}"),
