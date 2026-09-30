@@ -19,7 +19,7 @@ use crate::fractal::{
     export_to_png_blocking, render_readback_blocking, unpad_rgba,
 };
 use crate::view::{
-    ViewState, big_from_decimal_str, interpolate_f64, interpolate_view, parse_view_spec,
+    Scale, ViewState, big_from_decimal_str, interpolate_f64, interpolate_view, parse_view_spec,
     precision_for,
 };
 
@@ -133,6 +133,9 @@ struct AnimTargets {
     /// 3D camera, degrees.
     to_yaw: Option<f32>,
     to_pitch: Option<f32>,
+    to_color_scale: Option<f32>,
+    /// Zoom depth where `to_color_scale` is reached (else: at the end).
+    to_color_scale_at: Option<Scale>,
     frames: Option<u32>,
     fps: f64,
     duration: Option<f64>,
@@ -159,6 +162,29 @@ impl AnimTargets {
             }
             _ => return Err("--shard and --shards must be given together".into()),
         };
+        if let Some(s) = cli.to_color_scale {
+            if !(s.is_finite() && s > 0.0) {
+                return Err(format!("invalid --to-color-scale: {s}"));
+            }
+            if cli.auto_color_scale {
+                return Err(
+                    "--to-color-scale can't be combined with --auto-color-scale \
+                     (the auto fit sets the scale on every frame)"
+                        .into(),
+                );
+            }
+        }
+        let to_color_scale_at = cli
+            .to_color_scale_at
+            .as_deref()
+            .map(|s| {
+                s.parse::<Scale>()
+                    .map_err(|_| format!("invalid --to-color-scale-at: {s}"))
+            })
+            .transpose()?;
+        if to_color_scale_at.is_some() && cli.to_color_scale.is_none() {
+            return Err("--to-color-scale-at needs --to-color-scale".into());
+        }
         Ok(Self {
             to_view: cli.to_view.clone(),
             to_share: cli.to_share.clone(),
@@ -171,6 +197,8 @@ impl AnimTargets {
             to_kind: cli.to_kind.map(Into::into),
             to_yaw: cli.to_yaw,
             to_pitch: cli.to_pitch,
+            to_color_scale: cli.to_color_scale,
+            to_color_scale_at,
             frames: cli.frames,
             fps: cli.fps,
             duration: cli.duration,
@@ -192,15 +220,17 @@ impl AnimTargets {
             || self.to_kind.is_some()
             || self.to_yaw.is_some()
             || self.to_pitch.is_some()
+            || self.to_color_scale.is_some()
     }
 }
 
 /// Render a sequence of frames interpolating from the app's current (start)
 /// state to `targets`, for feeding into ffmpeg: the camera, iteration count,
 /// per-kind constants (c, p, λ, complex power) and, through a kind morph,
-/// the iteration formula, and the 3D camera angles. Everything else (colors, ...) stays fixed at
-/// whatever `apply_cli` set up for the start. With `--export-path -`, frames
-/// are streamed in order to stdout as raw RGBA8 (for ffmpeg's `rawvideo`
+/// the iteration formula, the 3D camera angles and the colour scale.
+/// Everything else (palette, offset, ...) stays fixed at whatever
+/// `apply_cli` set up for the start. With `--export-path -`, frames are
+/// streamed in order to stdout as raw RGBA8 (for ffmpeg's `rawvideo`
 /// demuxer) instead of being written as PNGs.
 fn run_animation(
     mut app: FractalApp,
@@ -261,6 +291,15 @@ fn run_animation(
     let (yaw0, pitch0) = app.camera_angles();
     let yaw1 = targets.to_yaw.map_or(yaw0, f32::to_radians);
     let pitch1 = targets.to_pitch.map_or(pitch0, f32::to_radians);
+    let (scale0, ci_lo0) = app.color_fit();
+    let scale1 = targets.to_color_scale.map(|s| s.clamp(1e-4, 1.0) as f64);
+    // With `--to-color-scale-at`, the scale follows the zoom depth (log2 of
+    // the half-height) from the start view's to that one, instead of `t`.
+    let depth0 = from.half_height.log2();
+    let depth_at = targets.to_color_scale_at.map(Scale::log2);
+    if depth_at == Some(depth0) {
+        return Err("--to-color-scale-at is the start view's depth".into());
+    }
 
     let stream = export_path.as_deref() == Some(STDOUT_PATH);
     let out_dir = export_path.unwrap_or_else(|| format!("frames-{}", unix_timestamp()));
@@ -288,7 +327,9 @@ fn run_animation(
                 interpolate_f64(from_iterations as f64, to as f64, t).round() as u32,
             );
         }
-        app.set_view(interpolate_view(&from, &to, t));
+        let view = interpolate_view(&from, &to, t);
+        let depth = view.half_height.log2();
+        app.set_view(view);
         app.set_constants(std::array::from_fn(|k| {
             (
                 interpolate_f64(from_consts[k].0, to_consts[k].0, t),
@@ -300,6 +341,13 @@ fn run_animation(
             interpolate_f64(yaw0 as f64, yaw1 as f64, t) as f32,
             interpolate_f64(pitch0 as f64, pitch1 as f64, t) as f32,
         );
+        // Geometrically: the useful range spans decades.
+        if let Some(scale1) = scale1 {
+            // The zoom is already eased; don't ease its depth again.
+            let u = depth_at.map_or(t, |at| ((depth - depth0) / (at - depth0)).clamp(0.0, 1.0));
+            let scale = interpolate_f64((scale0 as f64).ln(), scale1.ln(), u).exp();
+            app.set_color_fit((scale as f32, ci_lo0));
+        }
     };
 
     // Snapshot every frame's reference-orbit job up front (cheap: just the

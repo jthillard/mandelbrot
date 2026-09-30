@@ -877,6 +877,9 @@ impl FractalApp {
         if cli.auto_color_scale {
             self.auto_color_scale = true;
         }
+        if let Some(scale) = cli.color_scale {
+            self.color_scale = scale.clamp(1e-4, 1.0);
+        }
         self.export_path = cli.export_path;
     }
 

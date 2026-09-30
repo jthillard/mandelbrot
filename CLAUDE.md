@@ -45,7 +45,7 @@ Native CLI flags (`src/cli.rs`, applied in `FractalApp::apply_cli`): `--kind`,
 `--palette`, `--share <fragment>`,
 `--view re,im,half_height[,iterations]`, `--rendering-kind`,
 `--yaw`/`--pitch` (3D camera, degrees), `--de`, `--antialias` (2×2),
-`--auto-color-scale`, `--buddhabrot`,
+`--auto-color-scale`, `--color-scale`, `--buddhabrot`,
 `--buddha-palette`. `--headless` (`src/headless.rs`) skips the window
 entirely: it builds the same view from the other flags, creates its own
 offscreen wgpu device, and renders straight to a PNG (`--width`/`--height`,
@@ -64,8 +64,11 @@ end-state flag alongside the start flags (`--view`/`--share`/`--kind`/
 position/zoom/iterations are pulled out of the link), `--to-iterations`,
 `--to-julia`, `--to-phoenix-p`, `--to-lambda-l`, `--to-complex-power`
 (or `--to-complex-power-re`/`--to-complex-power-im` to move one component),
-and `--to-kind` (per-step formula blend via `KindMorph`, camera untouched).
-Anything without a target stays at its start value; colors stay fixed.
+`--to-kind` (per-step formula blend via `KindMorph`, camera untouched), and
+`--to-color-scale` (log-linear from `--color-scale`; refused with
+`--auto-color-scale`; `--to-color-scale-at HALF_HEIGHT` pins its completion
+to a zoom depth instead of the end). Anything without a target stays at its start value;
+other colors (palette, offset) stay fixed.
 `--export-path` then names an output *directory* of `frame-00001.png`,
 `frame-00002.png`, ... instead of a single file. `--export-path -` writes
 to stdout instead (refused on a terminal): the PNG for a still, or for an

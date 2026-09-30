@@ -88,6 +88,11 @@ pub struct Cli {
     #[arg(long)]
     pub auto_color_scale: bool,
 
+    /// Colour scale: palette cycles per escape-time unit, clamped to
+    /// [0.0001, 1] (overrides a --share link's value).
+    #[arg(long, value_name = "SCALE")]
+    pub color_scale: Option<f32>,
+
     /// Output path for --headless (default: fractal-<timestamp>.png). When
     /// animating (--to-view/--to-share), this is a directory of
     /// frame-00001.png, frame-00002.png, ... instead (default:
@@ -113,6 +118,17 @@ pub struct Cli {
     /// Set a maximum iterations count at animation end.
     #[arg(long)]
     pub to_iterations: Option<u32>,
+
+    /// End colour scale for an animation (from --color-scale), interpolated
+    /// geometrically. Can't be combined with --auto-color-scale.
+    #[arg(long, value_name = "SCALE")]
+    pub to_color_scale: Option<f32>,
+
+    /// Zoom depth (half-height, e.g. 1e-60) at which --to-color-scale is
+    /// reached: the scale then follows the zoom depth from the start view to
+    /// there, and holds. Requires --to-color-scale.
+    #[arg(long, value_name = "HALF_HEIGHT")]
+    pub to_color_scale_at: Option<String>,
 
     /// End Julia constant for an animation: c is interpolated from --julia
     /// to this over the frames.
