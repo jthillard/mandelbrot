@@ -2291,7 +2291,9 @@ impl FractalApp {
                 }
             });
         if self.kind == FractalKind::Multibrot {
-            ui.add(egui::Slider::new(&mut self.power, 2..=20).text("power"));
+            deferred_slider(ui, &mut self.power, "power", |v| {
+                egui::Slider::new(v, 2..=20).text("power")
+            });
         }
         if self.kind == FractalKind::Phoenix {
             ui.horizontal(|ui| {
@@ -2430,11 +2432,13 @@ impl FractalApp {
         });
         if self.rendering_mode == 2 {
             let old_scale = self.render_scale_3d;
-            ui.add(egui::Slider::new(&mut self.render_scale_3d, 1.0..=4.0).text("3D render scale"))
-                .on_hover_text(
-                    "Resolution multiplier of the 3D height field. Higher shows more \
+            deferred_slider(ui, &mut self.render_scale_3d, "render_scale_3d", |v| {
+                egui::Slider::new(v, 1.0..=4.0).text("3D render scale")
+            })
+            .on_hover_text(
+                "Resolution multiplier of the 3D height field. Higher shows more \
                  distant detail but costs GPU time and memory.",
-                );
+            );
             // The 3D camera zooms in by the render scale (`Camera::orthographic`):
             // zoom the view out by the same ratio so the fractal keeps its
             // on-screen size and the extra texels become surrounding terrain.
@@ -2455,12 +2459,12 @@ impl FractalApp {
         } else {
             // Dragging stays within the slider's range, but a typed value
             // isn't clamped to it: only to what the reference buffer can hold.
-            ui.add(
-                egui::Slider::new(&mut self.max_iterations, 32..=100_000)
+            deferred_slider(ui, &mut self.max_iterations, "max_iterations", |v| {
+                egui::Slider::new(v, 32..=100_000)
                     .text("iterations")
                     .logarithmic(true)
-                    .clamping(egui::SliderClamping::Never),
-            );
+                    .clamping(egui::SliderClamping::Never)
+            });
             self.max_iterations = self.max_iterations.clamp(32, MAX_ITERATIONS);
         }
         ui.checkbox(&mut self.antialias, "Antialiasing (2×2)")
@@ -3217,6 +3221,32 @@ impl eframe::App for FractalApp {
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(&mut *self)
     }
+}
+
+/// A slider whose value is expensive to apply (a new reference orbit, a full
+/// re-iteration or a resized 3D height field): while it's dragged, it moves a
+/// preview copy kept in egui's temp memory, and `value` only takes it on
+/// release (or on a click / typed value, which aren't drags). Applying it live
+/// froze the UI for the whole render each step, and the mouse moves and
+/// release queued meanwhile all landed in one later frame: the slider then
+/// jumped to wherever the pointer had gone since, so a second render ran.
+#[cfg(feature = "gui")]
+fn deferred_slider<N: egui::emath::Numeric + Send + Sync>(
+    ui: &mut egui::Ui,
+    value: &mut N,
+    id_salt: &str,
+    slider: impl for<'a> FnOnce(&'a mut N) -> egui::Slider<'a>,
+) -> egui::Response {
+    let id = ui.make_persistent_id(id_salt);
+    let mut shown = ui.data(|d| d.get_temp::<N>(id)).unwrap_or(*value);
+    let response = ui.add(slider(&mut shown));
+    if response.dragged() && !response.drag_stopped() {
+        ui.data_mut(|d| d.insert_temp(id, shown));
+    } else {
+        ui.data_mut(|d| d.remove::<N>(id));
+        *value = shown;
+    }
+    response
 }
 
 /// Reference-orbit length to request for `max_iterations`: 1.5× headroom
