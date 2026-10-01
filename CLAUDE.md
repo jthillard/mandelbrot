@@ -124,7 +124,12 @@ For a pixel at parameter `c = C_ref + dc`, its orbit is written as
 and `e_n` is a small `f32` delta. Whenever `|y_n| < |e_n|` (or the reference
 runs out), rebase: `e ← y_n − X_0`, restart the reference index at 0. This is
 what makes deep zoom cheap — one expensive high-precision orbit, then every
-pixel is a handful of `f32` complex multiplies.
+pixel is a handful of `f32` complex multiplies. A rebase whose real part cancels to
+exactly 0 keeps a rounding-sized one instead (`ROUNDING_X`). On a real
+reference orbit (views centered on the real axis) the pixel's imaginary part
+lives only in `e.y`, and the next step scales it by 2·Re z. At exactly 0 the
+pixel was stuck on the bounded real line, drawn black after `max_iter` steps.
+That was a few pixels per frame and ~40% of a −1.5 zoom's time.
 
 - `src/bignum/` — `Big`, the arbitrary-precision binary float, with one
   backend per library behind the same inherent API + operators: `rug`
@@ -208,7 +213,11 @@ pixel is a handful of `f32` complex multiplies.
   window saves its iterate closest to the critical point, not the one at the
   checkpoint. At an arbitrary phase the relative tolerance is far coarser
   than a deep minibrot's scale, and a black disk surrounded the minibrot
-  (seen at ~1e-13 zoom). Phoenix is excluded (two-term map).
+  (seen at ~1e-13 zoom). Phoenix is excluded (two-term map). Both
+  tests only run on steps where |z|² is at most the saved iterate's (with
+  slack) or below the window's closest so far. Anything else can't pass
+  them, so the result is unchanged. Before that gate, the per-step checks
+  took ~18% of a seahorse zoom.
   `advance_delta(z, e)` is the per-kind delta step (`z` = reference point,
   `e` = current delta); the caller adds `step_add` (= `dc`) afterward — this
   relies on `c` being additive in every current kind's formula (a kind where

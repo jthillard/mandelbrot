@@ -615,6 +615,9 @@ const DEEP_RENORM_LOG2: i32 = 16;
 // A reference point can only matter for rebasing when it's within this many
 // binades above the delta's scale (|w| < 2^DEEP_RENORM_LOG2).
 const DEEP_NEAR_LOG2: i32 = 24;
+// A rebase's full value when its real part cancels to exactly 0, relative
+// to the addends (see the f32 loop's rebase).
+const ROUNDING_X: f32 = 5.9604645e-8; // 2^-24
 
 // Row-major 2x2 matrix times vector (a BLA node's M or N).
 fn mat2v(m: vec4<f32>, v: vec2<f32>) -> vec2<f32> {
@@ -768,6 +771,9 @@ const PERIOD_FIRST_CHECK: u32 = 16u;
 const PERIOD_EPS2: f32 = 1e-12;
 const PERIOD_MAX_MULT2: f32 = 0.25;
 const PERIOD_CONFIRMATIONS: u32 = 2u;
+// A return within PERIOD_EPS2 has |z|^2 <= |z_saved|^2 / (1 - 1e-6)^2; the
+// rest is room for f32 rounding.
+const PERIOD_SAVE_SLACK: f32 = 1.001;
 
 // Whether `iterate_sample` runs periodicity detection for this kind (folds to
 // a constant per pipeline).
@@ -868,6 +874,8 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     // Plus whether this window already had a contracting return, and how many
     // consecutive windows have.
     var z_saved = z;
+    // |z_saved|^2 with slack for rounding: returns can't be farther out.
+    var save_d2 = z2 * PERIOD_SAVE_SLACK;
     var mult2 = 1.0;
     var check_at = PERIOD_FIRST_CHECK;
     var period_hit = false;
@@ -1077,8 +1085,10 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
             // Rebase test |X + e| < |e|, in units of 2^sx. Only possible when
             // |X| is within a few binades of |e| (|w| < 2^DEEP_RENORM_LOG2).
             if xf.e - sx < DEEP_NEAR_LOG2 {
-                let q = ldexp2_sat(xf.m, xf.e - sx) + w;
+                var q = ldexp2_sat(xf.m, xf.e - sx) + w;
                 if dot(q, q) < dot(w, w) {
+                    // (Exact cancellation: see the f32 loop's rebase.)
+                    q.x = select(q.x, abs(w.x) * ROUNDING_X, q.x == 0.0);
                     // The new delta y - X[0] stays tiny only if X[0] is
                     // (always, for the set plane), and for Phoenix only if the
                     // previous full value y_{n-1} (its new previous delta) is.
@@ -1167,6 +1177,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         // pixels as interior (see PERIOD_FIRST_CHECK). The sentinel is far
         // outside the bailout radius, so no return can match it.
         z_saved = vec2<f32>(1e18, 1e18);
+        save_d2 = -1.0;
         z_cand = z;
         while check_at <= n {
             check_at = check_at * 2u;
@@ -1288,27 +1299,45 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
             if phoenix_w > 0.0 {
                 e_prev = z_old;
             }
+            // X + e can cancel to exactly 0 in x though the true value is
+            // only below f32 rounding; keep a rounding-sized one. On a real
+            // reference orbit (a view centered on the real axis) the pixel's
+            // imaginary part lives only in e.y, and the next step scales it
+            // by 2·z.x: at 0 it's lost for good, and the pixel is stuck on
+            // the real line, which is bounded (z² - 1.5 maps [-1.82, 1.82]
+            // into itself). It was drawn black after max_iter steps.
+            z.x = select(z.x, abs(e.x) * ROUNDING_X, z.x == 0.0);
             e = z - z0;
             xm = z0;
             m = 0u;
         }
 
         if periodic {
-            // Closed an attracting cycle in enough consecutive windows:
-            // interior (see PERIOD_FIRST_CHECK).
-            let d = z - z_saved;
-            if !period_hit && mult2 < PERIOD_MAX_MULT2 && dot(d, d) <= PERIOD_EPS2 * z2 {
-                period_hit = true;
-                period_streak = period_streak + 1u;
-                if period_streak >= PERIOD_CONFIRMATIONS {
-                    break;
+            // A return (below) and a new save candidate both need z next to
+            // the critical point: |z|^2 at most the saved iterate's (a return
+            // within PERIOD_EPS2 can't be farther out), or below this
+            // window's closest so far. Most steps are neither and skip both
+            // tests (Lambda's critical point isn't 0, so it always tests).
+            if KIND == KIND_LAMBDA || z2 <= max(save_d2, cand_d2) {
+                // Closed an attracting cycle in enough consecutive windows:
+                // interior (see PERIOD_FIRST_CHECK).
+                let d = z - z_saved;
+                if !period_hit && mult2 < PERIOD_MAX_MULT2 && dot(d, d) <= PERIOD_EPS2 * z2 {
+                    period_hit = true;
+                    period_streak = period_streak + 1u;
+                    if period_streak >= PERIOD_CONFIRMATIONS {
+                        break;
+                    }
                 }
-            }
-            let dc2 = dot(z - crit, z - crit);
-            if dc2 < cand_d2 {
-                cand_d2 = dc2;
-                z_cand = z;
-                mult2_cand = 1.0;
+                var dc2 = z2;
+                if KIND == KIND_LAMBDA {
+                    dc2 = dot(z - crit, z - crit);
+                }
+                if dc2 < cand_d2 {
+                    cand_d2 = dc2;
+                    z_cand = z;
+                    mult2_cand = 1.0;
+                }
             }
             if n >= check_at {
                 if !period_hit {
@@ -1316,6 +1345,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
                 }
                 period_hit = false;
                 z_saved = z_cand;
+                save_d2 = cand_d2 * PERIOD_SAVE_SLACK;
                 mult2 = mult2_cand;
                 cand_d2 = 3.0e38;
                 // (A BLA jump can pass several window ends at once.)
