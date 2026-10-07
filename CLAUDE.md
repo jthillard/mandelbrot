@@ -15,14 +15,14 @@ once a pixel is ~2^-124 wide (~10³⁴× at 1080p), so from 2^-122 per pixel
 rescaled deltas (f32 mantissa × 2^i32). There's no practical depth limit:
 `half_height` is a `view::Scale` (f64 mantissa × 2^i32), floored only at
 `Scale::MIN` = 2^-(2^20) to keep shader exponent sums in i32. Runs
-natively (Vulkan/Metal/DX12) and in the browser (WebGPU only — WebGL2 can't do
-storage buffers, which the fragment shader needs for the reference orbit).
+natively (Vulkan/Metal/DX12) and in the browser: WebGPU, plus a WebGL2
+fallback with the `webgl` feature (see "WebGL2 fallback" below).
 
 ## Commands
 
 ```sh
 cargo run --release          # native, run (release matters: fractal math is hot)
-cargo test                   # reference-orbit math, share-link round-trip, WGSL validation
+cargo test                   # reference-orbit math, share-link round-trip, WGSL validation (+ GLSL ES 3.00 via glslangValidator if installed)
 cargo test --features wasm   # same, on the web build's malachite big-float backend
 cargo test --test shader_valid   # just the WGSL parse/validate tests (naga, no GPU needed)
 cargo clippy
@@ -31,12 +31,12 @@ cargo build --release --no-default-features   # headless-only binary: no eframe/
 tools/bench/bench.sh --rev HEAD   # perf of uncommitted edits vs HEAD (hyperfine; see tools/bench/README.md)
 ```
 
-Web build (WebGPU):
+Web build (WebGPU, with WebGL2 fallback):
 
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.128   # must match the wasm-bindgen crate version
-./build-web.sh                                     # -> ./dist (builds with --features wasm)
+./build-web.sh                                     # -> ./dist (builds with --features wasm,webgl)
 python3 -m http.server -d dist 8080
 ```
 
@@ -192,6 +192,8 @@ That was a few pixels per frame and ~40% of a −1.5 zoom's time.
   constants) is prepended to every shader. `iterate_uniforms.wgsl` (the
   perturbation-pipeline `Uniforms` struct + `palette()`) is additionally
   prepended to `mandelbrot.wgsl` and `colorize.wgsl`, which share that layout.
+  `mandelbrot.wgsl` is followed by a data fragment, picked at runtime
+  (`GpuPath::mandelbrot_source`): `data_storage.wgsl` or `data_texture.wgsl`.
   Because there's no namespacing, a definition must live in exactly one file
   among those concatenated together for a given shader — don't redefine a
   `common.wgsl`/`iterate_uniforms.wgsl` symbol locally.
@@ -376,6 +378,40 @@ from the live view (no deep zoom) via a compute pass that accumulates into a
 histogram buffer, tone-mapped by a fragment pass every frame. Its own
 `KIND_*` iteration formulas in `advance()` must be kept in sync with
 `reference.rs` by hand (there's no shared code path).
+
+### WebGL2 fallback (`GpuPath` in `renderer.rs`)
+
+WebGL2 has no storage buffers and no compute shaders, and naga's GLSL ES 3.00
+output can't use `ldexp`/`findLSB` (ES 3.10) or a correct `frexp` (its
+polyfill goes through log2). So `mandelbrot.wgsl` never touches bindings
+1/3/4/5 or those builtins directly. It calls accessors (`ref_point`,
+`ref_exp_at`, `bla_node`, `bla_r_log2`, `bla_steps`, `bla_meta_at`) and
+`frexp_f32`/`ldexp_f32`/`ctz_u32`, defined by one of two data fragments,
+which must stay in sync:
+- `data_storage.wgsl` (`GpuPath::Storage`): the storage buffers and native
+  builtins. Every device with ≥ 4 fragment storage buffers uses it. The
+  benchmarks showed no change from before the split.
+- `data_texture.wgsl` (`GpuPath::Texture`): each array as a
+  `DATA_TEX_WIDTH` (2048)-wide texture, BLA nodes as 3 `Rgba32Uint` texels
+  with floats as raw bits, plus bit-exact builtin replacements. It is about
+  6–16% slower on a GTX 1650, so it's only used when the device has no
+  storage buffers. `RefData`/`DataArray` own either form. Orbit length is
+  capped at 2048 × the max texture height (`ref_len` is clamped on upload),
+  and a BLA table that doesn't fit is replaced by the empty one.
+- Natively, `MANDELBROT_GPU_PATH=texture|storage` forces a path. Renders
+  must be pixel-identical between the two (headless, any view,
+  `WGPU_BACKEND=gl` too). That's the check to rerun after touching either
+  fragment.
+
+The texture path also replaces the compute `ci` histogram with
+`CiHistogram::Readback`: `ci_sample.wgsl` point-samples a 256² grid, which
+is read back and binned on the CPU. Buddhabrot (compute + atomics) is
+disabled on such devices (`FractalApp::buddhabrot_supported`). The `webgl`
+cargo feature only adds `Backends::GL` on wasm32. egui-wgpu still tries
+WebGPU first, and eframe's defaults already compile wgpu's WebGL backend.
+`tests/shader_valid.rs` translates every texture-path specialization to
+GLSL ES 3.00 and compiles it with `glslangValidator` when that's on the
+PATH.
 
 ### Two-pass render + caching (`renderer.rs`)
 

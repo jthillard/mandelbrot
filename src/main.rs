@@ -36,12 +36,14 @@ type MainResult = eframe::Result;
 type MainResult = Result<(), String>;
 
 /// wgpu configuration for eframe. The fractal fragment shader reads the
-/// reference orbit from a **storage buffer**, so the device must allow storage
-/// buffers in the fragment stage. eframe's default requests WebGL2-downlevel
-/// limits when a GL adapter is picked (storage buffers = 0), so we:
+/// reference orbit from **storage buffers** where the device allows them in
+/// the fragment stage (`GpuPath` in renderer.rs). eframe's default requests
+/// WebGL2-downlevel limits when a GL adapter is picked (storage buffers = 0),
+/// so we:
 ///   * request the adapter's real limits (which include storage buffers), and
-///   * force the WebGPU backend on the web (WebGL2 can't do storage buffers at
-///     all) — failing cleanly on browsers without WebGPU, per the design.
+///   * on the web, use WebGPU only, failing cleanly on browsers without it,
+///     unless the `webgl` feature adds WebGL2 as a fallback (egui-wgpu
+///     tries WebGPU first).
 #[cfg(feature = "gui")]
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     use eframe::egui_wgpu::{WgpuSetup, wgpu};
@@ -55,9 +57,24 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
                 required_limits: adapter.limits(),
                 ..Default::default()
             });
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "webgl")))]
         {
             setup.instance_descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "webgl"))]
+        {
+            // `?backend=webgl` forces the fallback, to test it in a browser
+            // that has WebGPU.
+            let force_gl = web_sys::window()
+                .and_then(|w| w.location().search().ok())
+                .and_then(|q| web_sys::UrlSearchParams::new_with_str(&q).ok())
+                .and_then(|p| p.get("backend"))
+                .is_some_and(|b| b == "webgl");
+            setup.instance_descriptor.backends = if force_gl {
+                wgpu::Backends::GL
+            } else {
+                wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL
+            };
         }
     }
     options

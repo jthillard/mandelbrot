@@ -597,6 +597,8 @@ pub struct FractalApp {
     /// Keep dispatching new sample batches every frame (progressive
     /// accumulation). Turning it off freezes the current histogram.
     buddha_accumulate: bool,
+    /// The device can run Buddhabrot mode's compute pass (not on WebGL2).
+    buddhabrot_supported: bool,
     /// Whether the controls side panel is expanded. Collapsible so the fractal
     /// can take (nearly) the whole screen — important on a phone.
     controls_open: bool,
@@ -717,16 +719,53 @@ impl FractalApp {
             .as_ref()
             .expect("eframe must run with the wgpu backend");
 
+        let adapter_info = render_state.adapter.get_info();
+        // The iteration data textures are `Rgba32Float` render targets
+        // (`EXT_color_buffer_float` on WebGL2, which nearly every browser has).
+        if !render_state
+            .adapter
+            .get_texture_format_features(wgpu::TextureFormat::Rgba32Float)
+            .allowed_usages
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        {
+            panic!(
+                "this GPU / browser can't render to 32-bit float textures \
+                 ({:?} on {})",
+                adapter_info.backend, adapter_info.name
+            );
+        }
         let renderer = FractalRenderer::new(&render_state.device, render_state.target_format);
-        let buddhabrot_renderer =
-            BuddhabrotRenderer::new(&render_state.device, render_state.target_format);
+        log::info!(
+            "GPU: {} ({:?}), data path {:?}",
+            adapter_info.name,
+            adapter_info.backend,
+            renderer.gpu_path()
+        );
+        // Buddhabrot accumulates with a compute pass and reads its histogram
+        // from a storage buffer in the fragment stage.
+        let buddhabrot_supported = render_state
+            .adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+            && render_state
+                .device
+                .limits()
+                .max_storage_buffers_per_shader_stage
+                >= 1;
         {
             let mut guard = render_state.renderer.write();
             guard.callback_resources.insert(renderer);
-            guard.callback_resources.insert(buddhabrot_renderer);
+            if buddhabrot_supported {
+                guard.callback_resources.insert(BuddhabrotRenderer::new(
+                    &render_state.device,
+                    render_state.target_format,
+                ));
+            }
         }
 
         let mut app = Self::default_state();
+        app.buddhabrot_supported = buddhabrot_supported;
 
         // On the web, restore a shared view from the URL fragment (#...).
         #[cfg(target_arch = "wasm32")]
@@ -786,6 +825,7 @@ impl FractalApp {
             buddha_exposure: 1.0,
             buddha_palette: 0,
             buddha_accumulate: true,
+            buddhabrot_supported: true,
             controls_open: true,
             fullscreen: false,
             info_open: false,
@@ -2351,12 +2391,18 @@ impl FractalApp {
         ui.horizontal(|ui| {
             ui.radio_value(&mut self.mode, FractalMode::Mandelbrot, "Set");
             ui.radio_value(&mut self.mode, FractalMode::Julia, "Julia");
-            ui.radio_value(&mut self.mode, FractalMode::Buddhabrot, "Buddhabrot")
-                .on_hover_text(
-                    "Monte-Carlo density of escaping orbits instead of the ordinary \
+            ui.add_enabled(
+                self.buddhabrot_supported,
+                egui::RadioButton::new(self.mode == FractalMode::Buddhabrot, "Buddhabrot"),
+            )
+            .on_hover_text(
+                "Monte-Carlo density of escaping orbits instead of the ordinary \
                  escape-time set. Plain f32 view (no deep zoom); the image \
                  progressively sharpens while the view stays still.",
-                );
+            )
+            .on_disabled_hover_text("Needs compute shaders (WebGPU); not available on WebGL2.")
+            .clicked()
+            .then(|| self.mode = FractalMode::Buddhabrot);
         });
         if self.mode != prev_mode {
             self.morph = None;
@@ -3179,6 +3225,11 @@ impl FractalApp {
 #[cfg(feature = "gui")]
 impl eframe::App for FractalApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // A CLI flag can ask for Buddhabrot on a device that can't run it.
+        if !self.buddhabrot_supported && self.mode == FractalMode::Buddhabrot {
+            self.mode = FractalMode::Mandelbrot;
+            self.status = Some("Buddhabrot mode needs WebGPU compute shaders".into());
+        }
         self.poll_export(ui.ctx());
         self.poll_ci_stats(ui.ctx(), frame);
         self.update_fps(ui);

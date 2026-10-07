@@ -46,8 +46,9 @@
             const msg = (err && err.message) || String(err);
             if (!msg.includes("Using exceptions for control flow")) {
                 document.getElementById("loading_text").innerHTML =
-                    "<p>Failed to start. This app needs a WebGPU-capable browser " +
-                    "(recent Chrome/Edge, Firefox, or Safari 26+).</p>";
+                    "<p>Failed to start. This app needs WebGPU (recent Chrome/Edge, " +
+                    "Firefox, or Safari 26+) or, in builds with the <code>webgl</code> " +
+                    "feature, WebGL2 with float render targets.</p>";
                 console.error(err);
             }
         });

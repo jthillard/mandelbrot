@@ -10,6 +10,12 @@ gui = ["dep:eframe", "dep:egui"]
 # Pure-Rust big floats for the web build (`rug` needs GMP/MPFR, which can't
 # target wasm32). Required for wasm32, optional natively (to test that backend).
 wasm = ["dep:malachite-float", "dep:malachite-base"]
+# Web build: fall back to WebGL2 when the browser has no WebGPU (WebGPU is
+# still preferred). WebGL2 has no storage buffers or compute shaders, so the
+# fractal shader then reads its data from textures (`GpuPath::Texture`, a bit
+# slower) and Buddhabrot mode is unavailable. No effect natively, where the
+# path is picked from the device's limits anyway.
+webgl = []
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
@@ -53,4 +59,4 @@ opt-level = 1
 opt-level = 3
 
 [dev-dependencies]
-naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+naga = { version = "30", features = ["wgsl-in", "spv-out", "glsl-out"] }

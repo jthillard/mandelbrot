@@ -7,7 +7,7 @@
 //! texture onto egui's surface with a cheap textured fullscreen triangle — so
 //! incidental repaints (mouse-move, hover, the worker-pending poll) cost a blit,
 //! not a full fractal recompute. The fragment shader iterates each pixel as an
-//! f32 perturbation delta from the reference orbit stored in `ref_buffer`.
+//! f32 perturbation delta from the reference orbit stored in `RefData`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -451,28 +451,100 @@ enum CiStatsState {
     Mapping(Arc<std::sync::atomic::AtomicBool>),
 }
 
-/// The `ci` histogram compute pass (`ci_stats.wgsl`), shared by the
-/// interactive [`CiStats`] and headless exports ([`ExportRender::ci_range_blocking`]).
-#[derive(Clone)]
-struct CiHistogram {
-    pipeline: wgpu::ComputePipeline,
-    layout: wgpu::BindGroupLayout,
-}
+/// Side (texels) of [`CiHistogram::Readback`]'s sample grid. Must match
+/// `CI_SAMPLE_DIM` in `ci_sample.wgsl`.
+const CI_SAMPLE_DIM: u32 = 256;
+/// Format of the sample grid: (ci, interior fraction, 0, 0). Rgba rather
+/// than Rg because WebGL2 only guarantees float readback of RGBA.
+const CI_SAMPLE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
-/// Auto colour scale: a compute pass bins the data texture's `ci` into a
-/// histogram (`ci_stats.wgsl`), read back asynchronously one or two frames
-/// later by [`FractalRenderer::take_ci_range`].
-struct CiStats {
-    histogram: CiHistogram,
-    hist: wgpu::Buffer,
-    staging: wgpu::Buffer,
-    state: CiStatsState,
-    /// The data texture changed since the last histogram was recorded.
-    stale: bool,
+/// The `ci` histogram of a data texture, shared by the interactive
+/// [`CiStats`] and headless exports ([`ExportRender::ci_range_blocking`]).
+#[derive(Clone)]
+enum CiHistogram {
+    /// A compute pass bins every pixel with atomics (`ci_stats.wgsl`).
+    Compute {
+        pipeline: wgpu::ComputePipeline,
+        layout: wgpu::BindGroupLayout,
+    },
+    /// No compute shaders (WebGL2, [`GpuPath::Texture`]): a render pass
+    /// point-samples the data onto a `CI_SAMPLE_DIM`² grid
+    /// (`ci_sample.wgsl`), which is read back and binned on the CPU.
+    Readback {
+        pipeline: wgpu::RenderPipeline,
+        layout: wgpu::BindGroupLayout,
+        /// The sample grid, shared by every user (passes are ordered on the
+        /// queue, so they don't overlap).
+        target: wgpu::Texture,
+    },
 }
 
 impl CiHistogram {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(device: &wgpu::Device, path: GpuPath) -> Self {
+        let data_entry = |visibility| wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        if path == GpuPath::Texture {
+            let module = unsafe {
+                device.create_shader_module_trusted(
+                    wgpu::ShaderModuleDescriptor {
+                        label: Some("ci sample"),
+                        source: wgpu::ShaderSource::Wgsl(
+                            concat!(
+                                include_str!("../shaders/common.wgsl"),
+                                include_str!("../shaders/ci_sample.wgsl"),
+                            )
+                            .into(),
+                        ),
+                    },
+                    wgpu::ShaderRuntimeChecks::unchecked(),
+                )
+            };
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ci sample bind group layout"),
+                entries: &[data_entry(wgpu::ShaderStages::FRAGMENT)],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ci sample pipeline layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let pipeline = fullscreen_pipeline(
+                device,
+                "ci sample pipeline",
+                &module,
+                &pipeline_layout,
+                "fs_main",
+                CI_SAMPLE_FORMAT,
+                &[],
+            );
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("ci sample grid"),
+                size: wgpu::Extent3d {
+                    width: CI_SAMPLE_DIM,
+                    height: CI_SAMPLE_DIM,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: CI_SAMPLE_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            return Self::Readback {
+                pipeline,
+                layout,
+                target,
+            };
+        }
         let module = unsafe {
             device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
@@ -487,16 +559,7 @@ impl CiHistogram {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ci stats bind group layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
+                data_entry(wgpu::ShaderStages::COMPUTE),
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -522,31 +585,41 @@ impl CiHistogram {
             compilation_options: Default::default(),
             cache: None,
         });
-        Self { pipeline, layout }
+        Self::Compute { pipeline, layout }
     }
 
-    /// The histogram buffer and its mappable readback copy.
-    fn buffers(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer) {
-        let size = (CI_BINS * std::mem::size_of::<u32>()) as u64;
-        let hist = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ci histogram"),
-            size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+    /// Bytes per row of the `Readback` grid's copy (already a multiple of
+    /// `COPY_BYTES_PER_ROW_ALIGNMENT`).
+    const SAMPLE_BPR: u32 = CI_SAMPLE_DIM * 16;
+
+    /// The histogram buffer (`Compute` only) and the mappable readback copy.
+    fn buffers(&self, device: &wgpu::Device) -> (Option<wgpu::Buffer>, wgpu::Buffer) {
+        let hist_size = (CI_BINS * std::mem::size_of::<u32>()) as u64;
+        let (hist, staging_size) = match self {
+            Self::Compute { .. } => {
+                let hist = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("ci histogram"),
+                    size: hist_size,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                (Some(hist), hist_size)
+            }
+            Self::Readback { .. } => (None, (Self::SAMPLE_BPR * CI_SAMPLE_DIM) as u64),
+        };
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ci histogram readback"),
-            size,
+            size: staging_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         (hist, staging)
     }
 
-    /// Record the histogram of `data` (`width`×`height`) into `hist`, and its
-    /// copy into `staging`.
+    /// Record the histogram of `data` (`width`×`height`) into `hist` (or the
+    /// sample grid), and its copy into `staging`.
     #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
@@ -555,40 +628,126 @@ impl CiHistogram {
         data: &wgpu::TextureView,
         width: u32,
         height: u32,
-        hist: &wgpu::Buffer,
+        hist: Option<&wgpu::Buffer>,
         staging: &wgpu::Buffer,
     ) {
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ci stats bind group"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(data),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: hist.as_entire_binding(),
-                },
-            ],
-        });
-        encoder.clear_buffer(hist, 0, None);
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("ci stats pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+        match self {
+            Self::Compute { pipeline, layout } => {
+                let hist = hist.expect("compute histogram without its buffer");
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ci stats bind group"),
+                    layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(data),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: hist.as_entire_binding(),
+                        },
+                    ],
+                });
+                encoder.clear_buffer(hist, 0, None);
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("ci stats pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+                }
+                encoder.copy_buffer_to_buffer(hist, 0, staging, 0, None);
+            }
+            Self::Readback {
+                pipeline,
+                layout,
+                target,
+            } => {
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ci sample bind group"),
+                    layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(data),
+                    }],
+                });
+                let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("ci sample pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                encoder.copy_texture_to_buffer(
+                    target.as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: staging,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(Self::SAMPLE_BPR),
+                            rows_per_image: None,
+                        },
+                    },
+                    target.size(),
+                );
+            }
         }
-        encoder.copy_buffer_to_buffer(hist, 0, staging, 0, None);
     }
+
+    /// The histogram from `staging`'s mapped contents.
+    fn read(&self, bytes: &[u8]) -> Vec<u32> {
+        match self {
+            Self::Compute { .. } => bytemuck::cast_slice(bytes).to_vec(),
+            Self::Readback { .. } => {
+                // Same binning as `ci_stats.wgsl`.
+                let mut hist = vec![0u32; CI_BINS];
+                for px in bytemuck::cast_slice::<u8, [f32; 4]>(bytes) {
+                    let [ci, interior, ..] = *px;
+                    if interior >= 1.0 {
+                        continue;
+                    }
+                    let x = (1.0 + ci.max(0.0)).log2() * (CI_BINS as f32 / CI_LOG2_MAX);
+                    hist[(x.max(0.0) as usize).min(CI_BINS - 1)] += 1;
+                }
+                hist
+            }
+        }
+    }
+}
+
+/// Auto colour scale: the data texture's `ci` histogram ([`CiHistogram`]),
+/// read back asynchronously one or two frames later by
+/// [`FractalRenderer::take_ci_range`].
+struct CiStats {
+    histogram: CiHistogram,
+    /// The compute pass's histogram buffer (`None` for `Readback`).
+    hist: Option<wgpu::Buffer>,
+    staging: wgpu::Buffer,
+    state: CiStatsState,
+    /// The data texture changed since the last histogram was recorded.
+    stale: bool,
 }
 
 impl CiStats {
     fn new(histogram: CiHistogram, device: &wgpu::Device) -> Self {
-        let (hist, staging) = CiHistogram::buffers(device);
+        let (hist, staging) = histogram.buffers(device);
         Self {
             histogram,
             hist,
@@ -614,7 +773,7 @@ impl CiStats {
             data,
             width,
             height,
-            &self.hist,
+            self.hist.as_ref(),
             &self.staging,
         );
         self.state = CiStatsState::Copied;
@@ -789,45 +948,404 @@ struct ColorState {
     height: u32,
 }
 
-/// GPU copy of a [`BlaTable`] (bindings 4 and 5 of the iterate group).
-struct BlaBuffers {
-    nodes: wgpu::Buffer,
-    meta: wgpu::Buffer,
+/// How the iteration shader reads the reference orbit and the BLA table
+/// (bindings 1 and 3-5 of the iterate group).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum GpuPath {
+    /// Storage buffers (`data_storage.wgsl`): WebGPU and every native backend.
+    Storage,
+    /// Textures (`data_texture.wgsl`), for devices without fragment-stage
+    /// storage buffers (WebGL2). Slower: each read is a texel fetch plus
+    /// index math, and frexp/ldexp/ctz are emulated with bit tricks.
+    Texture,
 }
 
-impl BlaBuffers {
-    /// Buffers holding exactly `table` (plus room to grow into, `min_*`).
-    fn new(device: &wgpu::Device, table: &BlaTable, min_nodes: usize, min_meta: usize) -> Self {
-        // Padded with zeros up to the requested capacity.
-        let init = |label, data: &[u8], size: usize| {
-            let mut bytes = data.to_vec();
-            bytes.resize(size.max(data.len()), 0);
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: &bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            })
-        };
-        let node_size = std::mem::size_of::<super::bla::GpuBla>();
-        Self {
-            nodes: init(
-                "bla nodes",
-                bytemuck::cast_slice(&table.nodes),
-                min_nodes * node_size,
-            ),
-            meta: init("bla meta", bytemuck::cast_slice(&table.meta), min_meta * 4),
+impl GpuPath {
+    /// The fastest path `device` supports. Natively, `MANDELBROT_GPU_PATH`
+    /// (`storage` / `texture`) overrides it, to check the WebGL2 path
+    /// against the default one on the same GPU.
+    pub fn for_device(device: &wgpu::Device) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        match std::env::var("MANDELBROT_GPU_PATH").as_deref() {
+            Ok("texture") => return Self::Texture,
+            Ok("storage") => return Self::Storage,
+            Ok(other) => log::warn!("ignoring unknown MANDELBROT_GPU_PATH={other}"),
+            Err(_) => {}
+        }
+        if device.limits().max_storage_buffers_per_shader_stage >= 4 {
+            Self::Storage
+        } else {
+            Self::Texture
         }
     }
 
-    fn write(&self, queue: &wgpu::Queue, table: &BlaTable) {
-        queue.write_buffer(&self.nodes, 0, bytemuck::cast_slice(&table.nodes));
-        queue.write_buffer(&self.meta, 0, bytemuck::cast_slice(&table.meta));
+    /// `mandelbrot.wgsl` with its shared prefix and this path's data fragment.
+    fn mandelbrot_source(self) -> String {
+        let data = match self {
+            Self::Storage => include_str!("../shaders/data_storage.wgsl"),
+            Self::Texture => include_str!("../shaders/data_texture.wgsl"),
+        };
+        [
+            include_str!("../shaders/common.wgsl"),
+            include_str!("../shaders/iterate_uniforms.wgsl"),
+            include_str!("../shaders/mandelbrot.wgsl"),
+            data,
+        ]
+        .concat()
+    }
+}
+
+/// Width (texels) of the [`GpuPath::Texture`] data textures: WebGL2's
+/// guaranteed minimum texture size. Must match `DATA_TEX_LOG2_W` in
+/// `data_texture.wgsl`.
+const DATA_TEX_WIDTH: u32 = 2048;
+
+/// One of the arrays the iteration shader reads.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum DataKind {
+    /// Reference orbit points (`[f32; 2]`), binding 1.
+    Orbit,
+    /// Their exponents (`RefOrbit::exps`, `i32`), binding 3.
+    Exps,
+    /// BLA nodes (`GpuBla`, 48 bytes), binding 4.
+    BlaNodes,
+    /// BLA metadata (`u32`), binding 5.
+    BlaMeta,
+}
+
+impl DataKind {
+    fn binding(self) -> u32 {
+        match self {
+            Self::Orbit => 1,
+            Self::Exps => 3,
+            Self::BlaNodes => 4,
+            Self::BlaMeta => 5,
+        }
     }
 
-    fn fits(&self, table: &BlaTable) -> bool {
-        let node_size = std::mem::size_of::<super::bla::GpuBla>() as u64;
-        table.nodes.len() as u64 * node_size <= self.nodes.size()
-            && table.meta.len() as u64 * 4 <= self.meta.size()
+    fn label(self) -> &'static str {
+        match self {
+            Self::Orbit => "reference orbit",
+            Self::Exps => "reference orbit exponents",
+            Self::BlaNodes => "bla nodes",
+            Self::BlaMeta => "bla meta",
+        }
+    }
+
+    fn elem_bytes(self) -> usize {
+        match self {
+            Self::Orbit => std::mem::size_of::<[f32; 2]>(),
+            Self::Exps => std::mem::size_of::<i32>(),
+            Self::BlaNodes => std::mem::size_of::<super::bla::GpuBla>(),
+            Self::BlaMeta => std::mem::size_of::<u32>(),
+        }
+    }
+
+    /// Texels per element on the texture path (a node is three `Rgba32Uint`).
+    fn texels_per_elem(self) -> u32 {
+        match self {
+            Self::BlaNodes => 3,
+            _ => 1,
+        }
+    }
+
+    fn texture_format(self) -> wgpu::TextureFormat {
+        match self {
+            Self::Orbit => wgpu::TextureFormat::Rg32Float,
+            Self::Exps => wgpu::TextureFormat::R32Sint,
+            Self::BlaNodes => wgpu::TextureFormat::Rgba32Uint,
+            Self::BlaMeta => wgpu::TextureFormat::R32Uint,
+        }
+    }
+
+    fn layout_entry(self, path: GpuPath) -> wgpu::BindGroupLayoutEntry {
+        let ty = match path {
+            GpuPath::Storage => wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            GpuPath::Texture => wgpu::BindingType::Texture {
+                sample_type: match self {
+                    Self::Orbit => wgpu::TextureSampleType::Float { filterable: false },
+                    Self::Exps => wgpu::TextureSampleType::Sint,
+                    Self::BlaNodes | Self::BlaMeta => wgpu::TextureSampleType::Uint,
+                },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+        };
+        wgpu::BindGroupLayoutEntry {
+            binding: self.binding(),
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty,
+            count: None,
+        }
+    }
+
+    /// Most elements `device` can hold on `path`: a texture is
+    /// `DATA_TEX_WIDTH` wide and at most the device's 2D limit tall.
+    fn max_elems(self, device: &wgpu::Device, path: GpuPath) -> usize {
+        match path {
+            GpuPath::Storage => usize::MAX,
+            GpuPath::Texture => {
+                let rows = device.limits().max_texture_dimension_2d as usize;
+                DATA_TEX_WIDTH as usize * rows / self.texels_per_elem() as usize
+            }
+        }
+    }
+}
+
+/// GPU copy of one [`DataKind`] array: a storage buffer or a texture.
+struct DataArray {
+    kind: DataKind,
+    store: DataStore,
+    /// Elements it holds.
+    capacity: usize,
+}
+
+enum DataStore {
+    Buffer(wgpu::Buffer),
+    Texture(wgpu::Texture, wgpu::TextureView),
+}
+
+impl DataArray {
+    /// Room for at least `capacity` elements (at least one), zeroed. The
+    /// caller keeps `capacity` within [`DataKind::max_elems`].
+    fn new(device: &wgpu::Device, path: GpuPath, kind: DataKind, capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        match path {
+            GpuPath::Storage => {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(kind.label()),
+                    size: (capacity * kind.elem_bytes()) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                Self {
+                    kind,
+                    store: DataStore::Buffer(buffer),
+                    capacity,
+                }
+            }
+            GpuPath::Texture => {
+                let tpe = kind.texels_per_elem() as usize;
+                let rows = (capacity * tpe).div_ceil(DATA_TEX_WIDTH as usize);
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(kind.label()),
+                    size: wgpu::Extent3d {
+                        width: DATA_TEX_WIDTH,
+                        height: rows as u32,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: kind.texture_format(),
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                Self {
+                    kind,
+                    store: DataStore::Texture(texture, view),
+                    capacity: rows * DATA_TEX_WIDTH as usize / tpe,
+                }
+            }
+        }
+    }
+
+    /// Upload `bytes` (whole elements, at most `capacity`) from element 0.
+    fn write(&self, queue: &wgpu::Queue, bytes: &[u8]) {
+        debug_assert!(bytes.len() <= self.capacity * self.kind.elem_bytes());
+        match &self.store {
+            DataStore::Buffer(buffer) => queue.write_buffer(buffer, 0, bytes),
+            DataStore::Texture(texture, _) => {
+                let texel = self.kind.elem_bytes() / self.kind.texels_per_elem() as usize;
+                let row_bytes = DATA_TEX_WIDTH as usize * texel;
+                let full_rows = bytes.len() / row_bytes;
+                let rest = (bytes.len() % row_bytes) / texel;
+                // Full rows, then the partial last one.
+                let put = |data: &[u8], y: usize, width: usize, rows: usize| {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: 0,
+                                y: y as u32,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        data,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some((width * texel) as u32),
+                            rows_per_image: None,
+                        },
+                        wgpu::Extent3d {
+                            width: width as u32,
+                            height: rows as u32,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                };
+                if full_rows > 0 {
+                    put(
+                        &bytes[..full_rows * row_bytes],
+                        0,
+                        DATA_TEX_WIDTH as usize,
+                        full_rows,
+                    );
+                }
+                if rest > 0 {
+                    put(&bytes[full_rows * row_bytes..], full_rows, rest, 1);
+                }
+            }
+        }
+    }
+
+    fn bind_entry(&self) -> wgpu::BindGroupEntry<'_> {
+        wgpu::BindGroupEntry {
+            binding: self.kind.binding(),
+            resource: match &self.store {
+                DataStore::Buffer(buffer) => buffer.as_entire_binding(),
+                DataStore::Texture(_, view) => wgpu::BindingResource::TextureView(view),
+            },
+        }
+    }
+}
+
+/// The reference orbit, its exponents and the BLA table, as the iteration
+/// shader reads them on `path`.
+struct RefData {
+    path: GpuPath,
+    orbit: DataArray,
+    exps: DataArray,
+    bla_nodes: DataArray,
+    bla_meta: DataArray,
+    /// Most orbit points / BLA nodes / meta entries the device can hold.
+    max_points: usize,
+    max_nodes: usize,
+    max_meta: usize,
+}
+
+impl RefData {
+    /// Arrays with room for `points` orbit points and `nodes` / `meta` BLA
+    /// entries, zeroed (the empty BLA table is valid as all zeros: no levels,
+    /// no segments).
+    fn new(device: &wgpu::Device, path: GpuPath, points: usize, nodes: usize, meta: usize) -> Self {
+        let max_points = DataKind::Orbit.max_elems(device, path).min(MAX_REF_POINTS);
+        let max_nodes = DataKind::BlaNodes.max_elems(device, path);
+        let max_meta = DataKind::BlaMeta.max_elems(device, path);
+        let points = points.min(max_points);
+        Self {
+            path,
+            orbit: DataArray::new(device, path, DataKind::Orbit, points),
+            exps: DataArray::new(device, path, DataKind::Exps, points),
+            bla_nodes: DataArray::new(device, path, DataKind::BlaNodes, nodes.min(max_nodes)),
+            bla_meta: DataArray::new(device, path, DataKind::BlaMeta, meta.min(max_meta)),
+            max_points,
+            max_nodes,
+            max_meta,
+        }
+    }
+
+    /// Exactly `reference` and `bla` (an export's snapshot).
+    fn with_contents(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        path: GpuPath,
+        reference: &RefOrbit,
+        bla: &BlaTable,
+    ) -> Self {
+        let mut data = Self::new(device, path, reference.len(), 0, 0);
+        data.write_orbit(queue, reference);
+        data.upload_bla(device, queue, bla);
+        data
+    }
+
+    /// The bind group layout entries of bindings 1 and 3-5.
+    fn layout_entries(path: GpuPath) -> [wgpu::BindGroupLayoutEntry; 4] {
+        [
+            DataKind::Orbit,
+            DataKind::Exps,
+            DataKind::BlaNodes,
+            DataKind::BlaMeta,
+        ]
+        .map(|k| k.layout_entry(path))
+    }
+
+    fn bind_entries(&self) -> [wgpu::BindGroupEntry<'_>; 4] {
+        [
+            self.orbit.bind_entry(),
+            self.exps.bind_entry(),
+            self.bla_nodes.bind_entry(),
+            self.bla_meta.bind_entry(),
+        ]
+    }
+
+    /// Orbit points that fit on the device: the shader must never be told
+    /// about more (`Uniforms::ref_len`).
+    fn points_limit(&self) -> usize {
+        self.max_points
+    }
+
+    /// Grow the orbit arrays (by powers of two) to hold `needed` points,
+    /// without keeping their contents. True if they were reallocated, so
+    /// bind groups pointing at them need rebuilding.
+    fn ensure_points(&mut self, device: &wgpu::Device, needed: usize) -> bool {
+        let needed = needed.min(self.max_points);
+        if needed <= self.orbit.capacity {
+            return false;
+        }
+        let capacity = needed.next_power_of_two().min(self.max_points);
+        self.orbit = DataArray::new(device, self.path, DataKind::Orbit, capacity);
+        self.exps = DataArray::new(device, self.path, DataKind::Exps, capacity);
+        true
+    }
+
+    /// Upload the orbit's first points (as many as fit; the caller grew the
+    /// arrays with `ensure_points`).
+    fn write_orbit(&self, queue: &wgpu::Queue, reference: &RefOrbit) {
+        let count = reference.len().min(self.orbit.capacity);
+        if count > 0 {
+            self.orbit
+                .write(queue, bytemuck::cast_slice(&reference[..count]));
+            self.exps
+                .write(queue, bytemuck::cast_slice(&reference.exps[..count]));
+        }
+    }
+
+    /// Upload `table`, growing the BLA arrays (by powers of two) if needed.
+    /// A table too large for the device is replaced by the empty one (no
+    /// jumps). True if the arrays were reallocated.
+    fn upload_bla(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, table: &BlaTable) -> bool {
+        let empty;
+        let table = if table.nodes.len() <= self.max_nodes && table.meta.len() <= self.max_meta {
+            table
+        } else {
+            log::warn!(
+                "BLA table ({} nodes) too large for this device; skipping BLA",
+                table.nodes.len()
+            );
+            empty = BlaTable::empty();
+            &empty
+        };
+        let grow = table.nodes.len() > self.bla_nodes.capacity
+            || table.meta.len() > self.bla_meta.capacity;
+        if grow {
+            let nodes = table.nodes.len().next_power_of_two().min(self.max_nodes);
+            let meta = table.meta.len().max(64).min(self.max_meta);
+            self.bla_nodes = DataArray::new(device, self.path, DataKind::BlaNodes, nodes);
+            self.bla_meta = DataArray::new(device, self.path, DataKind::BlaMeta, meta);
+        }
+        self.bla_nodes
+            .write(queue, bytemuck::cast_slice(&table.nodes));
+        self.bla_meta
+            .write(queue, bytemuck::cast_slice(&table.meta));
+        grow
     }
 }
 
@@ -843,17 +1361,14 @@ pub struct FractalRenderer {
     pipelines: HashMap<PipelineKey, IteratePipelines>,
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
-    ref_buffer: wgpu::Buffer,
-    ref_exp_buffer: wgpu::Buffer,
-    /// Points `ref_buffer` / `ref_exp_buffer` can hold (see `ensure_ref_capacity`).
-    ref_capacity: usize,
-    bla: BlaBuffers,
+    /// Reference orbit + BLA table (bindings 1, 3-5), as `GpuPath` reads them.
+    data: RefData,
     /// Generation of the BLA table currently in `bla`.
     uploaded_bla_generation: u64,
     lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     target_format: wgpu::TextureFormat,
-    /// Generation of the reference orbit currently uploaded to `ref_buffer`.
+    /// Generation of the reference orbit currently uploaded to `data`.
     uploaded_generation: u64,
     /// Contents of `lights_buffer`, so it's only re-uploaded on change.
     uploaded_lights: Option<[GpuLight; MAX_LIGHT_COUNT]>,
@@ -885,65 +1400,29 @@ pub struct FractalRenderer {
 }
 
 impl FractalRenderer {
-    /// Grow the reference buffers (and rebuild the bind group pointing at
-    /// them) so they hold at least `needed` points. The caller re-uploads the
-    /// orbit right after, so the old contents aren't copied over.
-    fn ensure_ref_capacity(&mut self, device: &wgpu::Device, needed: usize) {
-        if needed <= self.ref_capacity {
-            return;
-        }
-        let capacity = needed.next_power_of_two().min(MAX_REF_POINTS);
-        self.ref_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("reference orbit"),
-            size: (capacity * std::mem::size_of::<[f32; 2]>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.ref_exp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("reference orbit exponents"),
-            size: (capacity * std::mem::size_of::<i32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.rebuild_bind_group(device);
-        self.ref_capacity = capacity;
-    }
-
     fn rebuild_bind_group(&mut self, device: &wgpu::Device) {
         self.bind_group = iterate_bind_group(
             device,
             &self.bind_group_layout,
             &self.uniform_buffer,
-            &self.ref_buffer,
             &self.lights_buffer,
-            &self.ref_exp_buffer,
-            &self.bla,
+            &self.data,
         );
     }
 
-    /// Upload `table`, growing the BLA buffers (by powers of two) if needed.
-    fn upload_bla(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, table: &BlaTable) {
-        if self.bla.fits(table) {
-            self.bla.write(queue, table);
-            return;
-        }
-        self.bla = BlaBuffers::new(device, table, table.nodes.len().next_power_of_two(), 64);
-        self.rebuild_bind_group(device);
+    /// How this renderer's iteration shader reads its data.
+    pub fn gpu_path(&self) -> GpuPath {
+        self.data.path
     }
 
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let path = GpuPath::for_device(device);
+        log::debug!("iteration data path: {path:?}");
         let shader = unsafe {
             device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
                     label: Some("mandelbrot"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        concat!(
-                            include_str!("../shaders/common.wgsl"),
-                            include_str!("../shaders/iterate_uniforms.wgsl"),
-                            include_str!("../shaders/mandelbrot.wgsl"),
-                        )
-                        .into(),
-                    ),
+                    source: wgpu::ShaderSource::Wgsl(path.mandelbrot_source().into()),
                 },
                 wgpu::ShaderRuntimeChecks::unchecked(),
             )
@@ -956,21 +1435,7 @@ impl FractalRenderer {
             mapped_at_creation: false,
         });
 
-        let ref_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("reference orbit"),
-            size: (INITIAL_REF_POINTS * std::mem::size_of::<[f32; 2]>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Per-point exponents of the reference orbit (`RefOrbit::exps`), only
-        // read by deep pipelines.
-        let ref_exp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("reference orbit exponents"),
-            size: (INITIAL_REF_POINTS * std::mem::size_of::<i32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let data = RefData::new(device, path, INITIAL_REF_POINTS, 1 << 14, 64);
 
         let lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lights parameters"),
@@ -979,85 +1444,13 @@ impl FractalRenderer {
             mapped_at_creation: false,
         });
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("fractal bind group layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Only read by the export pipeline's shadow branch (`fs_color`
-                // with the custom-lights palette); the iterate pipeline
-                // (`fs_data`) ignores it, but both pipelines share this layout.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // BLA table nodes / meta (`fractal::bla`).
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let bla = BlaBuffers::new(device, &BlaTable::empty(), 1 << 14, 64);
+        let bind_group_layout = iterate_bind_group_layout(device, path);
         let bind_group = iterate_bind_group(
             device,
             &bind_group_layout,
             &uniform_buffer,
-            &ref_buffer,
             &lights_buffer,
-            &ref_exp_buffer,
-            &bla,
+            &data,
         );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1263,10 +1656,7 @@ impl FractalRenderer {
             pipelines: HashMap::new(),
             bind_group_layout,
             uniform_buffer,
-            ref_buffer,
-            ref_exp_buffer,
-            ref_capacity: INITIAL_REF_POINTS,
-            bla,
+            data,
             uploaded_bla_generation: u64::MAX,
             lights_buffer,
             bind_group,
@@ -1283,7 +1673,7 @@ impl FractalRenderer {
             cache: None,
             iterated: None,
             colored: None,
-            ci_stats: CiStats::new(CiHistogram::new(device), device),
+            ci_stats: CiStats::new(CiHistogram::new(device, path), device),
             timing: PassTiming::default(),
         }
     }
@@ -1301,7 +1691,7 @@ impl FractalRenderer {
         let staging = &self.ci_stats.staging;
         let range = {
             let data = staging.slice(..).get_mapped_range().ok()?;
-            ci_range(bytemuck::cast_slice(&data))
+            ci_range(&self.ci_stats.histogram.read(&data))
         };
         staging.unmap();
         self.ci_stats.state = CiStatsState::Idle;
@@ -1545,6 +1935,7 @@ impl FractalRenderer {
         ExportHandles {
             pipeline,
             bind_group_layout: self.bind_group_layout.clone(),
+            path: self.data.path,
             format: self.target_format,
             raymarch,
             probe,
@@ -1559,6 +1950,8 @@ pub struct ExportHandles {
     /// Combined iterate + colour pipeline (`fs_color`), for 2D modes.
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// How the pipelines read the reference orbit and BLA table.
+    path: GpuPath,
     format: wgpu::TextureFormat,
     /// The two-pass chain, for 3D mode and the distance field only.
     raymarch: Option<RaymarchHandles>,
@@ -1643,29 +2036,10 @@ impl ExportRender {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let data = RefData::with_contents(device, queue, handles.path, reference, bla);
+        let mut uniforms = uniforms;
+        uniforms.ref_len = uniforms.ref_len.min(data.points_limit() as u32);
         queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-
-        let count = reference.len().min(MAX_REF_POINTS);
-        let ref_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("export reference orbit"),
-            size: (count.max(1) * std::mem::size_of::<[f32; 2]>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let ref_exp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("export reference orbit exponents"),
-            size: (count.max(1) * std::mem::size_of::<i32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        if count > 0 {
-            queue.write_buffer(&ref_buffer, 0, bytemuck::cast_slice(&reference[..count]));
-            queue.write_buffer(
-                &ref_exp_buffer,
-                0,
-                bytemuck::cast_slice(&reference.exps[..count]),
-            );
-        }
 
         // Only read by the shadow branch's custom-lights palette; harmless
         // (zeroed) for every other coloring mode.
@@ -1678,39 +2052,14 @@ impl ExportRender {
         let (gpu_lights, _) = gpu_lights(lights);
         queue.write_buffer(&lights_buffer, 0, bytemuck::cast_slice(&gpu_lights));
 
-        let bla_buffers = BlaBuffers::new(device, bla, 0, 0);
-
         let target_format = handles.format;
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("export bind group"),
-            layout: &handles.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: ref_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: lights_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: ref_exp_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: bla_buffers.nodes.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: bla_buffers.meta.as_entire_binding(),
-                },
-            ],
-        });
+        let bind_group = iterate_bind_group(
+            device,
+            &handles.bind_group_layout,
+            &uniform_buffer,
+            &lights_buffer,
+            &data,
+        );
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("export target"),
@@ -1905,7 +2254,7 @@ impl ExportRender {
                 view_formats: &[],
             })
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let (hist, staging) = CiHistogram::buffers(device);
+        let (hist, staging) = histogram.buffers(device);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("export ci probe"),
@@ -1946,7 +2295,15 @@ impl ExportRender {
             sizer.observe(y1 - y0, start.elapsed().as_secs_f64());
             y0 = y1;
         }
-        histogram.record(device, &mut encoder, &data, width, height, &hist, &staging);
+        histogram.record(
+            device,
+            &mut encoder,
+            &data,
+            width,
+            height,
+            hist.as_ref(),
+            &staging,
+        );
         queue.submit(std::iter::once(encoder.finish()));
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1960,7 +2317,7 @@ impl ExportRender {
             timeout: None,
         });
         rx.recv().ok()?.ok()?;
-        let hist = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().ok()?).to_vec();
+        let hist = histogram.read(&staging.slice(..).get_mapped_range().ok()?);
         staging.unmap();
         Some(hist)
     }
@@ -2295,51 +2652,62 @@ pub fn encode_png_with_progress(
     out
 }
 
-/// Colourise pass input: the uniforms, the data texture `data` to colour and
-/// the lights.
-/// Group 0 of the iterate/refine pipelines: uniforms, reference orbit,
-/// lights, reference exponents.
+/// Layout of group 0 of the iterate/refine/export pipelines: uniforms,
+/// lights and the [`RefData`] arrays as `path` binds them.
+fn iterate_bind_group_layout(device: &wgpu::Device, path: GpuPath) -> wgpu::BindGroupLayout {
+    let uniform = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let mut entries = vec![
+        uniform(0),
+        // Only read by the export pipeline's shadow branch (`fs_color` with
+        // the custom-lights palette); the iterate pipeline (`fs_data`)
+        // ignores it, but both pipelines share this layout.
+        uniform(2),
+    ];
+    entries.extend(RefData::layout_entries(path));
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("fractal bind group layout"),
+        entries: &entries,
+    })
+}
+
+/// Group 0 of the iterate/refine pipelines: uniforms, lights and the
+/// reference orbit / BLA arrays.
 fn iterate_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     uniform_buffer: &wgpu::Buffer,
-    ref_buffer: &wgpu::Buffer,
     lights_buffer: &wgpu::Buffer,
-    ref_exp_buffer: &wgpu::Buffer,
-    bla: &BlaBuffers,
+    data: &RefData,
 ) -> wgpu::BindGroup {
+    let mut entries = vec![
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: lights_buffer.as_entire_binding(),
+        },
+    ];
+    entries.extend(data.bind_entries());
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("fractal bind group"),
         layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: ref_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: lights_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: ref_exp_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: bla.nodes.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: bla.meta.as_entire_binding(),
-            },
-        ],
+        entries: &entries,
     })
 }
 
+/// Colourise pass input: the uniforms, the data texture `data` to colour and
+/// the lights.
 fn colorize_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -2688,31 +3056,25 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
             && renderer.uploaded_generation != self.generation
             && !self.reference.is_empty()
         {
-            let count = self.reference.len().min(MAX_REF_POINTS);
-            renderer.ensure_ref_capacity(device, count);
-            queue.write_buffer(
-                &renderer.ref_buffer,
-                0,
-                bytemuck::cast_slice(&self.reference[..count]),
-            );
-            queue.write_buffer(
-                &renderer.ref_exp_buffer,
-                0,
-                bytemuck::cast_slice(&self.reference.exps[..count]),
-            );
+            if renderer.data.ensure_points(device, self.reference.len()) {
+                renderer.rebuild_bind_group(device);
+            }
+            renderer.data.write_orbit(queue, &self.reference);
             renderer.uploaded_generation = self.generation;
         }
         if iter_dirty && renderer.uploaded_bla_generation != self.bla_generation {
-            renderer.upload_bla(device, queue, &self.bla);
+            if renderer.data.upload_bla(device, queue, &self.bla) {
+                renderer.rebuild_bind_group(device);
+            }
             renderer.uploaded_bla_generation = self.bla_generation;
         }
 
-        // Every pass reads the uniform buffer; refresh it once.
-        queue.write_buffer(
-            &renderer.uniform_buffer,
-            0,
-            bytemuck::bytes_of(&self.uniforms),
-        );
+        // Every pass reads the uniform buffer; refresh it once. The shader
+        // must not read past the orbit the device could hold (only ever
+        // shorter than the reference on small WebGL2 devices).
+        let mut uniforms = self.uniforms;
+        uniforms.ref_len = uniforms.ref_len.min(renderer.data.points_limit() as u32);
+        queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
         if renderer.uploaded_lights.as_ref() != Some(&self.lights) {
             queue.write_buffer(
                 &renderer.lights_buffer,

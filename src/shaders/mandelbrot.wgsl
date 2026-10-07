@@ -18,23 +18,27 @@
 // to the plain f32 loop once the delta is big enough (see `iterate_sample`).
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> ref_orbit: array<vec2<f32>>;
+// Bindings 1 and 3-5 (reference orbit, its exponents, the BLA table) are
+// declared by the data fragment concatenated after this file: storage
+// buffers (`data_storage.wgsl`) or, where the device has none (WebGL2),
+// textures (`data_texture.wgsl`). Both provide `ref_point`, `ref_exp_at`,
+// `bla_node`, `bla_r_log2`, `bla_steps`, `bla_meta_at`, plus `frexp_f32`,
+// `ldexp_f32` and `ctz_u32` (GLSL ES 3.00 lacks the builtins).
 // Only read by `fs_color`'s shadow branch (custom-lights palette); the
 // iteration pass (`fs_data`) never touches it.
 @group(0) @binding(2) var<uniform> lights: array<Light, 16>;
 // Only read by the adaptive-AA refine pass (`fs_refine`): the 1-sample-per-
 // pixel data texture written by `fs_data`, which decides where to supersample.
 @group(1) @binding(0) var coarse_tex: texture_2d<f32>;
-// Per-point binary exponents of the reference orbit (`RefOrbit::exps`): the
-// true X[m] is ref_orbit[m] * 2^ref_exp[m]. Non-zero only for points below
-// f32's range, which only deep references contain; only `DEEP` pipelines read
-// it (see `ref_at`).
-@group(0) @binding(3) var<storage, read> ref_exp: array<i32>;
+// Reference orbit: point m is `ref_point(m)`, and the true X[m] is
+// ref_point(m) * 2^ref_exp_at(m). The exponent is non-zero only for points
+// below f32's range, which only deep references contain; only `DEEP`
+// pipelines read it (see `ref_at`).
 // Bivariate linear approximation table (`fractal::bla`): node i of level l
 // maps the delta at reference step 1 + i·2^l to the one 2^l steps later as
 // e' = M·e + N·dc, valid while log2|e| < r_log2. M = m·2^m_exp and
 // N = n·2^n_exp are real 2x2 matrices, row-major (the Jacobian of the map,
-// so the abs/conjugate kinds are covered too). `bla_meta` is
+// so the abs/conjugate kinds are covered too). `bla_meta_at` reads
 // [min_level, level_count, off_0, ..., off_{level_count}, seg_count,
 // seg_start_0, ...]: segment i is node off_{level_count} + i and covers its
 // `steps` steps from seg_start_i (see `bla_seg_find`). Only `BLA` pipelines
@@ -47,8 +51,12 @@ struct Bla {
     r_log2: f32,
     steps: u32,
 };
-@group(0) @binding(4) var<storage, read> bla_nodes: array<Bla>;
-@group(0) @binding(5) var<storage, read> bla_meta: array<u32>;
+
+// `frexp` result (see `frexp_f32`).
+struct Frexp {
+    fract: f32,
+    exp: i32,
+};
 
 // Pipeline-overridable specialization constants, set per pipeline from the
 // uniforms' `kind` / `is_julia` / `de_coloring` (see `PipelineKey` in
@@ -316,7 +324,7 @@ fn ldexp_sat(x: f32, k: i32) -> f32 {
         }
         return bitcast<f32>(bitcast<i32>(bits) + (k << 23u));
     }
-    let f = frexp(x);
+    let f = frexp_f32(x);
     let ex = f.exp + k;
     if ex > 100 {
         return select(-LDEXP_SAT, LDEXP_SAT, x > 0.0);
@@ -324,7 +332,7 @@ fn ldexp_sat(x: f32, k: i32) -> f32 {
     if ex < -125 {
         return 0.0;
     }
-    return ldexp(f.fract, ex);
+    return ldexp_f32(f.fract, ex);
 }
 
 fn ldexp2_sat(v: vec2<f32>, k: i32) -> vec2<f32> {
@@ -343,16 +351,16 @@ fn fe_make(v: vec2<f32>, e: i32) -> Fe {
     if a == 0.0 {
         return Fe(vec2<f32>(0.0, 0.0), 0);
     }
-    let k = frexp(a).exp;
+    let k = frexp_f32(a).exp;
     return Fe(ldexp2_sat(v, -k), e + k);
 }
 
 // Reference point X[m] as f32 (points stored normalized flush to 0 here;
 // only deep references have any, see `ref_exp`).
 fn ref_at(m: u32) -> vec2<f32> {
-    let x = ref_orbit[m];
+    let x = ref_point(m);
     if DEEP {
-        let k = ref_exp[m];
+        let k = ref_exp_at(m);
         if k != 0 {
             return ldexp2_sat(x, k);
         }
@@ -362,7 +370,7 @@ fn ref_at(m: u32) -> vec2<f32> {
 
 // X[m] with its full exponent range (deep phase only).
 fn ref_fe(m: u32) -> Fe {
-    return fe_make(ref_orbit[m], ref_exp[m]);
+    return fe_make(ref_point(m), ref_exp_at(m));
 }
 
 // Complex log of m * 2^e (m != 0).
@@ -567,7 +575,7 @@ fn deep_log2(a: vec2<f32>, b: vec2<f32>) -> i32 {
     if m == 0.0 {
         return DEEP_ZERO;
     }
-    return frexp(m).exp;
+    return frexp_f32(m).exp;
 }
 
 // f'(y) at the full value y = X + w * 2^s, as an `Fe`. Plain `fprime` in f32
@@ -639,13 +647,13 @@ fn log2_mag(v: vec2<f32>) -> f32 {
 // invalid level (usually right away: one load per failed attempt).
 fn bla_lookup(m: u32, e_log2: f32, budget: u32) -> vec2<u32> {
     var best = vec2<u32>(0u, 0u);
-    let levels = bla_meta[1];
+    let levels = bla_meta_at(1u);
     if levels == 0u || m == 0u {
         return best;
     }
-    let lmin = bla_meta[0];
+    let lmin = bla_meta_at(0u);
     let j = m - 1u;
-    let tz = countTrailingZeros(j); // 32 when j == 0
+    let tz = ctz_u32(j); // 32 when j == 0
     if tz < lmin {
         return best;
     }
@@ -654,7 +662,7 @@ fn bla_lookup(m: u32, e_log2: f32, budget: u32) -> vec2<u32> {
     // dependent load each): level 0 starts at 0 and each level has half the
     // previous one's nodes, rounded down (`bla::build`).
     var base = 0u;
-    var count = bla_meta[3];
+    var count = bla_meta_at(3u);
     for (var k: u32 = 0u; k <= top; k = k + 1u) {
         let l = lmin + k;
         let steps = 1u << l;
@@ -663,7 +671,7 @@ fn bla_lookup(m: u32, e_log2: f32, budget: u32) -> vec2<u32> {
             break;
         }
         let idx = base + local;
-        if !(e_log2 < bla_nodes[idx].r_log2) {
+        if !(e_log2 < bla_r_log2(idx)) {
             break;
         }
         best = vec2<u32>(idx, steps);
@@ -679,14 +687,14 @@ fn bla_lookup(m: u32, e_log2: f32, budget: u32) -> vec2<u32> {
 // (`seg_i`, starting at `seg_at`); m only grows between rebases, so that
 // only moves forward.
 fn bla_seg_count() -> u32 {
-    return bla_meta[bla_meta[1] + 3u];
+    return bla_meta_at(bla_meta_at(1u) + 3u);
 }
 
 fn bla_seg_start(i: u32) -> u32 {
     if i >= bla_seg_count() {
         return 0xffffffffu;
     }
-    return bla_meta[bla_meta[1] + 4u + i];
+    return bla_meta_at(bla_meta_at(1u) + 4u + i);
 }
 
 // First segment from `lo` on that starts at or after `m` (binary search: a
@@ -696,7 +704,7 @@ fn bla_seg_find(lo: u32, m: u32) -> u32 {
     var b = bla_seg_count();
     while a < b {
         let mid = (a + b) / 2u;
-        if bla_meta[bla_meta[1] + 4u + mid] < m {
+        if bla_meta_at(bla_meta_at(1u) + 4u + mid) < m {
             a = mid + 1u;
         } else {
             b = mid;
@@ -709,9 +717,9 @@ fn bla_seg_find(lo: u32, m: u32) -> u32 {
 // else `bla_lookup`'s: (node index, steps), steps = 0 when there's none.
 fn bla_jump(m: u32, seg_i: u32, seg_at: u32, e_log2: f32, budget: u32) -> vec2<u32> {
     if seg_at == m {
-        let idx = bla_meta[bla_meta[1] + 2u] + seg_i;
-        let steps = bla_nodes[idx].steps;
-        if e_log2 < bla_nodes[idx].r_log2 && steps <= budget {
+        let idx = bla_meta_at(bla_meta_at(1u) + 2u) + seg_i;
+        let steps = bla_steps(idx);
+        if e_log2 < bla_r_log2(idx) && steps <= budget {
             return vec2<u32>(idx, steps);
         }
     }
@@ -826,7 +834,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     // so skip the test once a pixel is smaller than that error (deep zoom),
     // where it could misclassify pixels right at the boundary.
     if KIND == KIND_MANDELBROT && !MORPH && !IS_JULIA && !DEEP && ref_len > 1u && px > 1e-6 {
-        let c = ref_orbit[1] + offset;
+        let c = ref_point(1u) + offset;
         let xq = c.x - 0.25;
         let q = xq * xq + c.y * c.y;
         let in_cardioid = q * (q + xq) <= 0.25 * c.y * c.y;
@@ -956,7 +964,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
                 }
                 let hit = bla_jump(m, seg_i, seg_at, e_log2, min(max_iter - n, ref_len - 1u - m));
                 if hit.y != 0u {
-                    let nd = bla_nodes[hit.x];
+                    let nd = bla_node(hit.x);
                     if DE {
                         var accv = fe_make(mat2v(nd.m, v), nd.m_exp + sv);
                         if !IS_JULIA {
@@ -1187,8 +1195,8 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
     // Level nodes start at 1 + i·2^min_level, so only those steps can jump
     // (tested before `log2_mag` and the lookup: most steps here are plain).
     var bla_align = 0xffffffffu;
-    if BLA && bla_meta[1] != 0u {
-        bla_align = (1u << bla_meta[0]) - 1u;
+    if BLA && bla_meta_at(1u) != 0u {
+        bla_align = (1u << bla_meta_at(0u)) - 1u;
     }
     loop {
         // (`escaped` may already be set by the deep phase.)
@@ -1220,7 +1228,7 @@ fn iterate_sample(offset: vec2<f32>, px: f32) -> Sample {
         if BLA && m != 0u && ((m - 1u) & bla_align) == 0u {
             let hit = bla_lookup(m, log2_mag(e), min(max_iter - n, ref_len - 1u - m));
             if hit.y != 0u {
-                let nd = bla_nodes[hit.x];
+                let nd = bla_node(hit.x);
                 let se = select(0, u.scale_exp, DEEP);
                 if periodic {
                     let det = abs(nd.m.x * nd.m.w - nd.m.y * nd.m.z);
