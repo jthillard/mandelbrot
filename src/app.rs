@@ -2625,12 +2625,18 @@ impl FractalApp {
         ui.add_space(4.);
 
         ui.collapsing("Advanced", |ui| {
+            const LOW_RES_HELP: &str = "Resolution divisor (per axis) while panning/zooming. \
+                Higher gives more FPS at deep zoom but a blurrier image in motion; \
+                full resolution returns once input settles.";
+            // Label on its own line: beside the slider it made the row wider
+            // than the panel, which then grew (or got clipped on a phone).
+            ui.label("Low resolution scale:")
+                .on_hover_text(LOW_RES_HELP);
             ui.add(
                 egui::Slider::new(
                     &mut self.interact_downscale_log2,
                     0..=MAX_INTERACT_DOWNSCALE_LOG2,
                 )
-                .text("low resolution scale")
                 .custom_formatter(|v, _| format!("1/{}", 1u32 << v as u32))
                 .custom_parser(|s| {
                     let s = s.trim();
@@ -2638,11 +2644,7 @@ impl FractalApp {
                     n.is_power_of_two().then(|| n.trailing_zeros() as f64)
                 }),
             )
-            .on_hover_text(
-                "Resolution divisor (per axis) while panning/zooming. Higher gives \
-                 more FPS at deep zoom but a blurrier image in motion; full \
-                 resolution returns once input settles.",
-            );
+            .on_hover_text(LOW_RES_HELP);
             #[cfg(all(target_arch = "wasm32", feature = "webgl"))]
             self.backend_ui(ui);
         });
