@@ -63,14 +63,7 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
         }
         #[cfg(all(target_arch = "wasm32", feature = "webgl"))]
         {
-            // `?backend=webgl` forces the fallback, to test it in a browser
-            // that has WebGPU.
-            let force_gl = web_sys::window()
-                .and_then(|w| w.location().search().ok())
-                .and_then(|q| web_sys::UrlSearchParams::new_with_str(&q).ok())
-                .and_then(|p| p.get("backend"))
-                .is_some_and(|b| b == "webgl");
-            setup.instance_descriptor.backends = if force_gl {
+            setup.instance_descriptor.backends = if web_forced_webgl() {
                 wgpu::Backends::GL
             } else {
                 wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL
@@ -78,6 +71,17 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
         }
     }
     options
+}
+
+/// The page asks for WebGL2 even where WebGPU works (`?backend=webgl`, set
+/// by the "Use WebGPU" toggle in the app's Advanced section).
+#[cfg(all(target_arch = "wasm32", feature = "webgl"))]
+fn web_forced_webgl() -> bool {
+    web_sys::window()
+        .and_then(|w| w.location().search().ok())
+        .and_then(|q| web_sys::UrlSearchParams::new_with_str(&q).ok())
+        .and_then(|p| p.get("backend"))
+        .is_some_and(|b| b == "webgl")
 }
 
 #[cfg(not(target_arch = "wasm32"))]

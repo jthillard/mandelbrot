@@ -409,6 +409,11 @@ is read back and binned on the CPU. Buddhabrot (compute + atomics) is
 disabled on such devices (`FractalApp::buddhabrot_supported`). The `webgl`
 cargo feature only adds `Backends::GL` on wasm32. egui-wgpu still tries
 WebGPU first, and eframe's defaults already compile wgpu's WebGL backend.
+`?backend=webgl` (`web_forced_webgl` in `main.rs`) forces WebGL2. The
+Advanced section's "Use WebGPU" checkbox (`FractalApp::backend_ui`) sets or
+clears it by reloading the page, with the view in the fragment: the backend
+can't change in place, because a canvas with a WebGPU context can't get a
+WebGL2 one.
 `tests/shader_valid.rs` translates every texture-path specialization to
 GLSL ES 3.00 and compiles it with `glslangValidator` when that's on the
 PATH.

@@ -599,6 +599,8 @@ pub struct FractalApp {
     buddha_accumulate: bool,
     /// The device can run Buddhabrot mode's compute pass (not on WebGL2).
     buddhabrot_supported: bool,
+    /// Backend the renderer runs on (`None` without a GPU, i.e. headless).
+    gpu_backend: Option<wgpu::Backend>,
     /// Whether the controls side panel is expanded. Collapsible so the fractal
     /// can take (nearly) the whole screen — important on a phone.
     controls_open: bool,
@@ -766,6 +768,7 @@ impl FractalApp {
 
         let mut app = Self::default_state();
         app.buddhabrot_supported = buddhabrot_supported;
+        app.gpu_backend = Some(adapter_info.backend);
 
         // On the web, restore a shared view from the URL fragment (#...).
         #[cfg(target_arch = "wasm32")]
@@ -826,6 +829,7 @@ impl FractalApp {
             buddha_palette: 0,
             buddha_accumulate: true,
             buddhabrot_supported: true,
+            gpu_backend: None,
             controls_open: true,
             fullscreen: false,
             info_open: false,
@@ -1201,6 +1205,32 @@ impl FractalApp {
             big_from_decimal_str(&s.center_im, bits),
         ) {
             self.view = ViewState::with_center(re, im, s.half_height);
+        }
+    }
+
+    /// Web "Use WebGPU" toggle. The backend is fixed when the page starts (a
+    /// canvas with a WebGPU context can't get a WebGL2 one), so switching
+    /// reloads the page with or without `?backend=webgl`, keeping the view
+    /// in the URL fragment.
+    #[cfg(all(target_arch = "wasm32", feature = "webgl"))]
+    fn backend_ui(&mut self, ui: &mut egui::Ui) {
+        let on_webgpu = self.gpu_backend == Some(wgpu::Backend::BrowserWebGpu);
+        // On WebGL2 without the override, WebGPU was tried and failed.
+        let available = on_webgpu || (crate::web_forced_webgl() && web_has_webgpu());
+        let mut use_webgpu = on_webgpu;
+        let toggled = ui
+            .add_enabled(
+                available,
+                egui::Checkbox::new(&mut use_webgpu, "Use WebGPU"),
+            )
+            .on_hover_text(
+                "WebGPU is faster and supports Buddhabrot mode; WebGL2 is the \
+                 fallback. Switching reloads the page (the view is kept).",
+            )
+            .on_disabled_hover_text("This browser can't run WebGPU here: using WebGL2.")
+            .changed();
+        if toggled {
+            web_reload_with_backend(use_webgpu, &self.share_state().encode());
         }
     }
 
@@ -2613,6 +2643,8 @@ impl FractalApp {
                  more FPS at deep zoom but a blurrier image in motion; full \
                  resolution returns once input settles.",
             );
+            #[cfg(all(target_arch = "wasm32", feature = "webgl"))]
+            self.backend_ui(ui);
         });
 
         ui.collapsing("Animation", |ui| {
@@ -3362,6 +3394,27 @@ fn web_location_hash() -> Option<String> {
     } else {
         Some(hash)
     }
+}
+
+/// The browser exposes WebGPU (`navigator.gpu`); an adapter may still fail.
+#[cfg(all(target_arch = "wasm32", feature = "webgl"))]
+fn web_has_webgpu() -> bool {
+    web_sys::window()
+        .and_then(|w| js_sys::Reflect::get(&w.navigator(), &"gpu".into()).ok())
+        .is_some_and(|gpu| !gpu.is_undefined() && !gpu.is_null())
+}
+
+/// Reload the page on WebGPU (preferred) or forced WebGL2, at the view
+/// `fragment`.
+#[cfg(all(target_arch = "wasm32", feature = "webgl"))]
+fn web_reload_with_backend(webgpu: bool, fragment: &str) {
+    let Some(loc) = web_sys::window().map(|w| w.location()) else {
+        return;
+    };
+    let origin = loc.origin().unwrap_or_default();
+    let path = loc.pathname().unwrap_or_default();
+    let query = if webgpu { "" } else { "?backend=webgl" };
+    let _ = loc.replace(&format!("{origin}{path}{query}#{fragment}"));
 }
 
 #[cfg(target_arch = "wasm32")]
