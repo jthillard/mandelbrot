@@ -3113,10 +3113,8 @@ impl egui_wgpu::CallbackTrait for FractalCallback {
                 let key = PipelineKey::from_uniforms(&self.uniforms);
                 let timing = &mut renderer.timing;
                 if timing.key != Some(key) {
-                    *timing = PassTiming {
-                        key: Some(key),
-                        ..Default::default()
-                    };
+                    *timing = PassTiming::default();
+                    timing.key = Some(key);
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 let timed = {

@@ -707,6 +707,7 @@ pub fn build(
 /// `(0..n).map(f).collect()`, split across cores when there are at least
 /// `min` items, enough work to pay for the threads (a 900k-step table took
 /// ~60 ms on one core).
+#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
 fn par_map<T: Send>(n: usize, min: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     #[cfg(not(target_arch = "wasm32"))]
     if n >= min {

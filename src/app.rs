@@ -772,10 +772,10 @@ impl FractalApp {
 
         // On the web, restore a shared view from the URL fragment (#...).
         #[cfg(target_arch = "wasm32")]
-        if let Some(frag) = web_location_hash() {
-            if let Some(state) = ShareState::decode(&frag) {
-                app.apply_share(&state);
-            }
+        if let Some(frag) = web_location_hash()
+            && let Some(state) = ShareState::decode(&frag)
+        {
+            app.apply_share(&state);
         }
 
         cc.egui_ctx.set_zoom_factor(1.1);
